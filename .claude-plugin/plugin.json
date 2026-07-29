@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "competitive-programming",
-  "version": "0.2.0",
-  "description": "Competitive programming for Codeforces-style judges: single-problem solving, full-contest orchestration, and the bundled Codeforces MCP server",
+  "version": "0.3.0",
+  "description": "Competitive programming: single-problem solving, full-contest orchestration on any judge, and the bundled Codeforces MCP server",
   "author": {
     "name": "LamTer",
     "email": "lamtercqh@gmail.com"

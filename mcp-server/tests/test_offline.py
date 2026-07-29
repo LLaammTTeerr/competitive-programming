@@ -110,6 +110,325 @@ def test_parse_statement_rejects_a_page_without_a_statement():
         parse_statement("<html><body>nope</body></html>", 1, "A", "u")
 
 
+# Mirrors contest 2206 problem A: an interactive problem has no input or output
+# specification at all, only a class-less <div> titled "Interaction".
+INTERACTIVE_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">A. Compare Suffixes</div>
+    <div class="time-limit"><div class="property-title">time limit per test</div>2 seconds</div>
+    <div class="memory-limit"><div class="property-title">memory limit per test</div>1024 megabytes</div>
+    <div class="input-file input-standard"><div class="property-title">input</div>standard input</div>
+    <div class="output-file output-standard"><div class="property-title">output</div>standard output</div>
+  </div>
+  <div><p>The judge hides a string $$$S$$$ of length $$$n$$$.</p></div>
+  <div><div class="section-title">Interaction</div><p>Print <span class="tex-font-style-tt">query i j</span> to compare two suffixes. You may ask at most $$$10^5$$$ queries. Flush after every line.</p></div>
+  <div class="sample-tests"><div class="section-title">Example</div>
+    <div class="sample-test">
+      <div class="input"><div class="title">Input</div><pre>
+4
+first
+</pre></div>
+      <div class="output"><div class="title">Output</div><pre>
+query 2 1
+</pre></div>
+    </div>
+  </div>
+  <div class="note"><div class="section-title">Note</div><p>Sample interaction.</p></div>
+</div>
+"""
+
+
+# A subtask problem puts its scoring rules in the same kind of class-less div.
+SUBTASK_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">C. Subtasks</div>
+  </div>
+  <div><p>Solve it.</p></div>
+  <div class="input-specification"><div class="section-title">Input</div><p>One integer $$$n$$$.</p></div>
+  <div class="output-specification"><div class="section-title">Output</div><p>Print $$$n$$$.</p></div>
+  <div><div class="section-title">Scoring</div><p>Subtask 1 ($$$n \\le 10$$$): 30 points.</p></div>
+  <div class="note"><div class="section-title">Note</div><p>Nothing to add.</p></div>
+</div>
+"""
+
+
+def test_parse_statement_keeps_a_class_less_titled_section():
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    titles = [section.title for section in statement.sections]
+    assert titles == ["Interaction", "Note"]
+    interaction = statement.sections[0].body
+    assert "query i j" in interaction
+    assert "$10^5$ queries" in interaction
+    assert "Flush after every line." in interaction
+
+
+def test_class_less_titled_section_reaches_the_markdown():
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    markdown = statement.to_markdown()
+    assert "## Interaction" in markdown
+    assert "Flush after every line." in markdown
+
+
+def test_parse_statement_keeps_an_unknown_titled_section():
+    statement = parse_statement(
+        SUBTASK_STATEMENT_HTML, 1, "C", "https://example/1/C"
+    )
+    titles = [section.title for section in statement.sections]
+    assert titles == ["Input", "Output", "Scoring", "Note"]
+    assert "30 points" in statement.to_markdown()
+
+
+def test_sections_render_in_page_order_around_the_samples():
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    markdown = statement.to_markdown()
+    positions = [
+        markdown.index("## Input"),
+        markdown.index("## Output"),
+        markdown.index("## Example"),
+        markdown.index("## Note"),
+    ]
+    assert positions == sorted(positions)
+
+
+def test_interaction_section_renders_before_the_samples():
+    """The pre-samples split is what the sections rewrite actually introduced:
+    an untitled section (Interaction has no CF-assigned class) must still land
+    before the sample block it precedes on the page."""
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    markdown = statement.to_markdown()
+    assert markdown.index("## Interaction") < markdown.index("## Example")
+
+
+# Golden: the exact Markdown an ordinary (non-interactive) statement renders
+# to. Pins backward compatibility with the pre-sections parser — a future
+# to_markdown refactor that silently changes ordinary output must fail this,
+# not just the shape-level assertions above.
+ORDINARY_STATEMENT_MARKDOWN = (
+    "# B. Sample Problem\n"
+    "\n"
+    "- **Time limit:** 2 seconds\n"
+    "- **Memory limit:** 256 megabytes\n"
+    "- **Input:** standard input\n"
+    "- **Output:** standard output\n"
+    "- **URL:** https://example/42/B\n"
+    "\n"
+    "Given $n$, print it.\n"
+    "\n"
+    "- first\n"
+    "- second\n"
+    "\n"
+    "## Input\n"
+    "\n"
+    "One integer $n$.\n"
+    "\n"
+    "## Output\n"
+    "\n"
+    "Print $n$.\n"
+    "\n"
+    "## Example\n"
+    "\n"
+    "Input:\n"
+    "```\n"
+    "2\n"
+    "5\n"
+    "```\n"
+    "\n"
+    "Output:\n"
+    "```\n"
+    "5\n"
+    "```\n"
+    "\n"
+    "## Note\n"
+    "\n"
+    "Nothing to add.\n"
+)
+
+
+def test_ordinary_statement_markdown_is_byte_identical_to_the_pinned_golden():
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    assert statement.to_markdown() == ORDINARY_STATEMENT_MARKDOWN
+
+
+def test_to_dict_keeps_the_published_key_set():
+    """`sections` and `interactive` are new; the pre-existing keys are a
+    published contract other callers may already depend on and must stay."""
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    published_keys = {
+        "contest_id",
+        "index",
+        "name",
+        "url",
+        "time_limit",
+        "memory_limit",
+        "input_file",
+        "output_file",
+        "samples",
+        "markdown",
+    }
+    assert published_keys <= statement.to_dict().keys()
+
+
+def test_to_dict_exposes_sections():
+    statement = parse_statement(
+        SUBTASK_STATEMENT_HTML, 1, "C", "https://example/1/C"
+    )
+    scoring = statement.to_dict()["sections"][2]
+    assert scoring["title"] == "Scoring"
+    assert scoring["body"].startswith("Subtask 1")
+
+
+def test_interaction_section_marks_the_problem_interactive():
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    assert statement.interactive is True
+    assert statement.to_dict()["interactive"] is True
+    assert "transcript" in statement.to_markdown()
+
+
+def test_ordinary_statement_is_not_interactive():
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    assert statement.interactive is False
+    assert statement.to_dict()["interactive"] is False
+    assert "transcript" not in statement.to_markdown()
+
+
+def test_legend_wording_alone_marks_the_problem_interactive():
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is an interactive problem. Ask the judge.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is True
+
+
+def test_negated_legend_wording_does_not_mark_the_problem_interactive():
+    """A negated legend contains "interactive problem" but denies it."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is not an interactive problem. Read normally.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_negated_legend_wording_survives_bold_emphasis():
+    """The renderer wraps <b>/<strong> in "**"; the negation guard must see
+    through that markup, not just plain "not"."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is <b>not</b> an interactive problem. Read normally.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_negated_legend_wording_survives_italic_emphasis():
+    """Same guard, but for the single-asterisk <i>/<em> wrapper."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is <i>not</i> an interactive problem. Read normally.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_section_title_containing_interaction_but_not_starting_with_it_is_ignored():
+    """Pins .startswith — a later switch to `in` must fail this test loudly."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Notes</div></div>'
+        "<div><p>Solve it normally.</p></div>"
+        '<div><div class="section-title">Notes on Interaction</div>'
+        "<p>Some notes.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_section_title_case_is_ignored():
+    """Pins the .lower() normalisation on the section-title check."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>The judge hides a string.</p></div>"
+        '<div><div class="section-title">INTERACTION</div>'
+        "<p>Query the judge.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is True
+
+
+# Two class-less untitled divs, both before any titled section: both must
+# merge into the legend, in order, rather than the second one overwriting
+# the first.
+TWO_PARAGRAPH_LEGEND_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">D. Two Paragraphs</div>
+  </div>
+  <div><p>First paragraph of the legend.</p></div>
+  <div><p>Second paragraph of the legend.</p></div>
+  <div class="note"><div class="section-title">Note</div><p>Done.</p></div>
+</div>
+"""
+
+
+# A class-less untitled div sitting after a titled section, e.g. trailing
+# boilerplate below Note — it must render at its real position, not get
+# hoisted to the top with the legend.
+TRAILING_PROSE_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">E. Trailing Notice</div>
+  </div>
+  <div><p>Solve the problem.</p></div>
+  <div class="note"><div class="section-title">Note</div><p>Note text.</p></div>
+  <div><p>This problem was used in the CodeChef Long Challenge.</p></div>
+</div>
+"""
+
+
+def test_multiple_untitled_divs_before_any_section_merge_into_legend():
+    statement = parse_statement(
+        TWO_PARAGRAPH_LEGEND_STATEMENT_HTML, 1, "D", "https://example/1/D"
+    )
+    assert (
+        "First paragraph of the legend.\n\nSecond paragraph of the legend."
+        in statement.legend
+    )
+    markdown = statement.to_markdown()
+    assert "First paragraph of the legend." in markdown
+    assert "Second paragraph of the legend." in markdown
+
+
+def test_untitled_div_after_a_section_stays_in_place():
+    statement = parse_statement(
+        TRAILING_PROSE_STATEMENT_HTML, 1, "E", "https://example/1/E"
+    )
+    titles = [section.title for section in statement.sections]
+    assert titles == ["Note", ""]
+    assert statement.sections[-1].body == (
+        "This problem was used in the CodeChef Long Challenge."
+    )
+    markdown = statement.to_markdown()
+    assert markdown.index("Note text.") < markdown.index(
+        "This problem was used in the CodeChef Long Challenge."
+    )
+
+
 def test_parse_contest_problem_list():
     html = """
     <table class="problems">

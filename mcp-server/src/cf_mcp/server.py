@@ -152,7 +152,11 @@ async def cf_get_problem_statement(
 
     `index` is the problem letter, e.g. "A" or "C1". Returns the statement as
     Markdown plus the sample inputs/outputs as separate strings so they can be
-    fed straight into a local test run.
+    fed straight into a local test run, `sections` as the statement's titled
+    blocks in page order (Input, Output, Interaction, Scoring, Note…), and
+    `interactive` — when true, the problem talks to the judge, so flush after
+    every write and treat the sample as a dialogue transcript rather than a
+    test file.
 
     Pass `group_id` for a problem in a private group contest; see
     `cf_list_contest_problems` for where to find it.

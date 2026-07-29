@@ -1,13 +1,12 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: two skills plus the Codeforces MCP
-server they drive. This repository is also a **marketplace**, so it can be used in
+Claude Code plugin for competitive programming: two skills—one for a single problem, one driving contests on any judge—plus the bundled Codeforces MCP server. This repository is also a **marketplace**, so it can be used in
 place or installed on another machine.
 
 | Component | Invoked as | What it does |
 |---|---|---|
 | Skill `solving-problems` | `competitive-programming:solving-problems` | Algorithm design and C++ for one problem on a stdin/stdout judge — constraints → complexity budget → design → edge cases → clean implementation, with stress testing against a brute-force oracle |
-| Skill `running-contests` | `competitive-programming:running-contests` | Drives a whole contest: pulls the problem set, orders it, delegates each problem to `solving-problems`, submits, reads verdicts, and keeps going until every problem is solved |
+| Skill `running-contests` | `competitive-programming:running-contests` | Drives a whole contest on any judge: binds to whatever judge MCP is installed, pulls the problem set, orders it, delegates each problem to `solving-problems`, submits, reads verdicts, and keeps going until every problem is solved |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 
 ## Layout
@@ -20,7 +19,7 @@ competitive-programming/
 ├── .mcp.json                 # registers the bundled codeforces server
 ├── skills/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
-│   └── running-contests/SKILL.md
+│   └── running-contests/SKILL.md   (+ references/judges.md)
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
     ├── pyproject.toml  uv.lock
     ├── src/cf_mcp/
