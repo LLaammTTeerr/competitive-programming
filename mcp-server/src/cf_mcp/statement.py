@@ -266,6 +266,21 @@ _NAMED_SECTIONS = {
     "note": ("note", "Note"),
 }
 
+# Matches "interactive problem" immediately denied by a preceding negation, e.g.
+# "is not an interactive problem" or "isn't an interactive problem" — a legend
+# using either of those must NOT be flagged interactive.
+_NEGATED_INTERACTIVE_RE = re.compile(
+    r"\b(?:not|isn't)\s+(?:an\s+)?interactive problem"
+)
+
+
+def _legend_claims_interactive(legend: str) -> bool:
+    """True when the legend asserts (not denies) that the problem is interactive."""
+    text = legend.lower()
+    if "interactive problem" not in text:
+        return False
+    return not _NEGATED_INTERACTIVE_RE.search(text)
+
 
 def parse_statement(
     html: str, contest_id: int, index: str, url: str
@@ -344,7 +359,7 @@ def parse_statement(
     statement.interactive = any(
         section.title.strip().lower().startswith("interaction")
         for section in statement.sections
-    ) or "interactive problem" in statement.legend.lower()
+    ) or _legend_claims_interactive(statement.legend)
 
     return statement
 

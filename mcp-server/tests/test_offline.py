@@ -231,6 +231,43 @@ def test_legend_wording_alone_marks_the_problem_interactive():
     assert parse_statement(html, 1, "A", "u").interactive is True
 
 
+def test_negated_legend_wording_does_not_mark_the_problem_interactive():
+    """A negated legend contains "interactive problem" but denies it."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is not an interactive problem. Read normally.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_section_title_containing_interaction_but_not_starting_with_it_is_ignored():
+    """Pins .startswith — a later switch to `in` must fail this test loudly."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Notes</div></div>'
+        "<div><p>Solve it normally.</p></div>"
+        '<div><div class="section-title">Notes on Interaction</div>'
+        "<p>Some notes.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_section_title_case_is_ignored():
+    """Pins the .lower() normalisation on the section-title check."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>The judge hides a string.</p></div>"
+        '<div><div class="section-title">INTERACTION</div>'
+        "<p>Query the judge.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is True
+
+
 # Two class-less untitled divs, both before any titled section: both must
 # merge into the legend, in order, rather than the second one overwriting
 # the first.
