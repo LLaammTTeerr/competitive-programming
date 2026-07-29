@@ -1,7 +1,6 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: two skills plus the Codeforces MCP
-server they drive. This repository is also a **marketplace**, so it can be used in
+Claude Code plugin for competitive programming: two skills—one for a single problem, one driving contests on any judge—plus the bundled Codeforces MCP server. This repository is also a **marketplace**, so it can be used in
 place or installed on another machine.
 
 | Component | Invoked as | What it does |
