@@ -268,6 +268,25 @@ The method finds a minimal failing case automatically:
 4. **Debug against the minimal case.** Shrink the failing input if needed, then
    fix the main solution and re-run the loop until it survives many iterations.
 
+**Keep the generated cases small. This is the point of the method, not a
+detail.** A brute force is slow by construction, usually exponential, so every
+step up in N buys you exponentially fewer iterations. Many tiny cases beat a few
+large ones: ten thousand runs at N ≤ 8 is far stronger evidence than ten runs at
+N = 1000, and a failure at N = 8 is one you can read and reason about, while a
+failure at N = 1000 is a wall of numbers you then have to shrink by hand.
+
+A logic bug that survives every small case and only appears at large N is rare.
+What large N *does* expose — integer overflow, TLE, memory limits, recursion
+depth — a brute-force diff cannot catch anyway, because the oracle is too slow to
+run there at all. Test those separately and cheaply: a timing run at the maximum
+constraints, and a validity checker that verifies the output satisfies the
+problem's conditions without needing a reference answer. Neither needs an oracle.
+
+So: **do not run big cases against a brute force.** It is expensive, it finds
+almost nothing, and the time is better spent on more small cases or on the
+targeted checks above. Reach for larger inputs only when you have a specific
+reason to suspect a size-dependent bug and time to spare.
+
 Deliver these as separate runnable pieces — the main solution, the brute force,
 the generator, and a short driver (a shell loop works, since the programs read
 stdin) — so the user can run the comparison themselves.
