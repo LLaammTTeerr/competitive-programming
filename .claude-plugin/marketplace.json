@@ -1,0 +1,20 @@
+{
+  "name": "competitive-programming",
+  "description": "LamTer's competitive programming skills for Claude Code",
+  "owner": {
+    "name": "LamTer",
+    "email": "lamtercqh@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "competitive-programming",
+      "description": "Competitive programming: single-problem solving and full-contest orchestration for Codeforces-style judges",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "LamTer",
+        "email": "lamtercqh@gmail.com"
+      }
+    }
+  ]
+}
