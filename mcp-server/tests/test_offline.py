@@ -205,6 +205,32 @@ def test_to_dict_exposes_sections():
     assert scoring["body"].startswith("Subtask 1")
 
 
+def test_interaction_section_marks_the_problem_interactive():
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    assert statement.interactive is True
+    assert statement.to_dict()["interactive"] is True
+    assert "transcript" in statement.to_markdown()
+
+
+def test_ordinary_statement_is_not_interactive():
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    assert statement.interactive is False
+    assert statement.to_dict()["interactive"] is False
+    assert "transcript" not in statement.to_markdown()
+
+
+def test_legend_wording_alone_marks_the_problem_interactive():
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is an interactive problem. Ask the judge.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is True
+
+
 # Two class-less untitled divs, both before any titled section: both must
 # merge into the legend, in order, rather than the second one overwriting
 # the first.

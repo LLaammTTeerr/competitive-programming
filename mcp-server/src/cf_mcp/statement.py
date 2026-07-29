@@ -46,6 +46,7 @@ class Statement:
     sections: list[Section] = field(default_factory=list)
     # Where the sample block sat among the sections, so rendering can put it back.
     samples_index: int | None = None
+    interactive: bool = False
 
     def to_markdown(self) -> str:
         parts = [f"# {self.index}. {self.name}", ""]
@@ -57,6 +58,11 @@ class Statement:
         meta.append(f"- **Input:** {self.input_file}")
         meta.append(f"- **Output:** {self.output_file}")
         meta.append(f"- **URL:** {self.url}")
+        if self.interactive:
+            meta.append(
+                "- **Interactive:** yes — flush after every write. The example "
+                "below is a dialogue transcript, not a runnable test file."
+            )
         parts += meta + ["", self.legend.strip()]
 
         split = (
@@ -113,6 +119,7 @@ class Statement:
             "sections": [
                 {"title": s.title, "body": s.body} for s in self.sections
             ],
+            "interactive": self.interactive,
             "markdown": self.to_markdown(),
         }
 
@@ -333,6 +340,11 @@ def parse_statement(
             statement.legend = (
                 f"{statement.legend}\n\n{prose}" if statement.legend else prose
             )
+
+    statement.interactive = any(
+        section.title.strip().lower().startswith("interaction")
+        for section in statement.sections
+    ) or "interactive problem" in statement.legend.lower()
 
     return statement
 
