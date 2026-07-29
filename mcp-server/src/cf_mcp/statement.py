@@ -73,7 +73,10 @@ class Statement:
             body = section.body.strip()
             if not body:
                 continue
-            lines += ["", f"## {section.title}", "", body]
+            if section.title:
+                lines += ["", f"## {section.title}", "", body]
+            else:
+                lines += ["", body]
         return lines
 
     def _sample_lines(self) -> list[str]:
@@ -322,7 +325,14 @@ def parse_statement(
         prose = _clean(_children_text(child))
         if not prose:
             continue
-        statement.legend = f"{statement.legend}\n\n{prose}" if statement.legend else prose
+        if statement.sections:
+            # A titled section already rendered above this point; keep this
+            # prose at its real position instead of hoisting it to the top.
+            statement.sections.append(Section("", prose))
+        else:
+            statement.legend = (
+                f"{statement.legend}\n\n{prose}" if statement.legend else prose
+            )
 
     return statement
 

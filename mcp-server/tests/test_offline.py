@@ -205,6 +205,64 @@ def test_to_dict_exposes_sections():
     assert scoring["body"].startswith("Subtask 1")
 
 
+# Two class-less untitled divs, both before any titled section: both must
+# merge into the legend, in order, rather than the second one overwriting
+# the first.
+TWO_PARAGRAPH_LEGEND_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">D. Two Paragraphs</div>
+  </div>
+  <div><p>First paragraph of the legend.</p></div>
+  <div><p>Second paragraph of the legend.</p></div>
+  <div class="note"><div class="section-title">Note</div><p>Done.</p></div>
+</div>
+"""
+
+
+# A class-less untitled div sitting after a titled section, e.g. trailing
+# boilerplate below Note — it must render at its real position, not get
+# hoisted to the top with the legend.
+TRAILING_PROSE_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">E. Trailing Notice</div>
+  </div>
+  <div><p>Solve the problem.</p></div>
+  <div class="note"><div class="section-title">Note</div><p>Note text.</p></div>
+  <div><p>This problem was used in the CodeChef Long Challenge.</p></div>
+</div>
+"""
+
+
+def test_multiple_untitled_divs_before_any_section_merge_into_legend():
+    statement = parse_statement(
+        TWO_PARAGRAPH_LEGEND_STATEMENT_HTML, 1, "D", "https://example/1/D"
+    )
+    assert (
+        "First paragraph of the legend.\n\nSecond paragraph of the legend."
+        in statement.legend
+    )
+    markdown = statement.to_markdown()
+    assert "First paragraph of the legend." in markdown
+    assert "Second paragraph of the legend." in markdown
+
+
+def test_untitled_div_after_a_section_stays_in_place():
+    statement = parse_statement(
+        TRAILING_PROSE_STATEMENT_HTML, 1, "E", "https://example/1/E"
+    )
+    titles = [section.title for section in statement.sections]
+    assert titles == ["Note", ""]
+    assert statement.sections[-1].body == (
+        "This problem was used in the CodeChef Long Challenge."
+    )
+    markdown = statement.to_markdown()
+    assert markdown.index("Note text.") < markdown.index(
+        "This problem was used in the CodeChef Long Challenge."
+    )
+
+
 def test_parse_contest_problem_list():
     html = """
     <table class="problems">
