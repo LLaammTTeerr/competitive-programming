@@ -59,8 +59,7 @@ Bind them once, before the first problem:
 1. **Read `references/judges.md`** for the judge the user named. An entry there
    gives you the server, the expected bindings, and the judge's quirks — scoring
    rule, language ids, contest URL shapes.
-2. **Discover the tools at runtime.** Use your harness's tool-discovery
-   mechanism — in Claude Code, the `ToolSearch` tool — with the judge name plus
+2. **Discover the tools at runtime.** Call `ToolSearch` with the judge name plus
    capability words ("codeforces contest problems", "atcoder submit",
    "submission verdict") to load the real tool definitions, and read their
    actual parameter names. MCPs vary and a registry entry can go stale — **the
