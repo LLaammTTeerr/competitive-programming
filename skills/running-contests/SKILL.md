@@ -59,8 +59,9 @@ Bind them once, before the first problem:
 1. **Read `references/judges.md`** for the judge the user named. An entry there
    gives you the server, the expected bindings, and the judge's quirks — scoring
    rule, language ids, contest URL shapes.
-2. **Discover the tools at runtime.** Call `tool_search` with the judge name
-   plus capability words ("codeforces contest problems", "atcoder submit",
+2. **Discover the tools at runtime.** Use your harness's tool-discovery
+   mechanism — in Claude Code, the `ToolSearch` tool — with the judge name plus
+   capability words ("codeforces contest problems", "atcoder submit",
    "submission verdict") to load the real tool definitions, and read their
    actual parameter names. MCPs vary and a registry entry can go stale — **the
    loaded schema always wins over anything written down.** Never guess a schema.
@@ -214,7 +215,8 @@ convinced the solution is right before you submit.** How convinced, and how you
 get there, is your judgment per problem — calibrate the verification to the risk:
 
 - **Always**: the solution compiles locally and passes every provided sample
-  exactly.
+  exactly — on an interactive problem, there is no sample file to pass; use the
+  [interactive verification floor](#interactive-problems) instead.
 - **Raise the bar** — add a stress test against a brute-force oracle (per
   the solving-problems stress-testing method) *before* submitting — when the solution is
   the kind that's easy to get subtly wrong: greedy/ad-hoc arguments you can't
@@ -295,7 +297,9 @@ For each problem, in the chosen order:
    [Autonomy model](#autonomy-model--hybrid)). The solving-problems **Code quality**
    rules apply in full to what you submit; the clock does not relax them (see
    [What "suppressed" covers](#what-suppressed-covers--the-approval-checkpoint-nothing-else)).
-   Compile and run it against every sample locally.
+   Compile and run it against every sample locally — on an interactive
+   problem, run the [interactive verification floor](#interactive-problems)
+   instead.
 3. **Verify to the mode's bar.** Apply the [ICPC](#icpc-mode--verify-before-you-submit)
    or [IOI](#ioi-mode--submissions-are-cheap-use-them-to-debug-maximize-score) standard above
    before deciding to submit.
@@ -368,6 +372,15 @@ They break three assumptions the normal loop makes:
   counts them against the budget, and checks your final answer. Write that when
   an interactive problem needs stress testing, and drive your solution through a
   pipe.
+
+**The verification floor.** Since the sample can't be diffed, it can't stand in
+for the ICPC "passes every sample" gate or loop step 2 either — build the mock
+interactor above and use it as the floor: before you submit, run the solution
+against it on the statement's sample instance, then on a few small random
+instances, and check the query count against the budget on each run. That is
+the minimum for *any* interactive submission, independent of the "raise the
+bar" stress-testing call in ICPC mode, which is about how much *more* scrutiny
+a risky solution needs on top of this floor.
 
 Read the query budget as a constraint like any other — it usually names the
 intended algorithm (about n log n queries → sorting or binary search; about 2n →

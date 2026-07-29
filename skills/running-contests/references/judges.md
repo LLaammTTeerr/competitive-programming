@@ -5,7 +5,8 @@ the four capabilities, and the quirks worth knowing before you submit anything.
 
 **The loaded tool schema always wins over this file.** These entries are a
 starting point and a place to record quirks — they are not authoritative about a
-server's current parameters. Discover the real schema with `tool_search`, per
+server's current parameters. Discover the real schema with your harness's
+tool-discovery mechanism (in Claude Code, `ToolSearch`), per
 [the capability contract](../SKILL.md#judge-interface--the-capability-contract).
 
 ---
@@ -52,8 +53,9 @@ Quirks:
 ## Judge not listed
 
 No entry means no recorded quirks — not that the judge is unsupported. Run the
-discovery procedure anyway: if an MCP for that judge is installed, `tool_search`
-finds its tools and you bind them the same way. If nothing turns up, use
+discovery procedure anyway: if an MCP for that judge is installed, your
+harness's tool-discovery mechanism (`ToolSearch` in Claude Code) finds its
+tools and you bind them the same way. If nothing turns up, use
 [degraded mode](../SKILL.md#when-no-mcp-covers-this-judge).
 
 When you learn something durable about a new judge — its scoring rule, its
