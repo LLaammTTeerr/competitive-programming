@@ -1,24 +1,28 @@
 ---
 name: running-contests
 description: >
-  Orchestrate solving an entire Codeforces contest end to end using the
-  Codeforces MCP (fetch problem list, fetch statements, submit, poll verdicts)
-  together with the competitive-programming:solving-problems skill for the actual algorithm design and C++.
-  Use this whenever the user wants to work through a whole contest or problem
-  set rather than a single problem — phrasings like "solve this Codeforces
+  Orchestrate solving an entire competitive programming contest end to end on
+  any judge — Codeforces, AtCoder, CodeChef, Kattis, DMOJ, oj.uz, a gym or a
+  virtual round — binding at runtime to whatever judge MCP is installed (fetch
+  the problem list, fetch statements, submit, poll verdicts) and delegating the
+  algorithm design and C++ to the competitive-programming:solving-problems
+  skill. Use this whenever the user wants to work through a whole contest or
+  problem set rather than a single problem — phrasings like "solve this
   contest", "grind contest 1998", "do the whole round", "solve problems A–F",
   "run through this contest and submit until AC", or any mention of ICPC-style
   or IOI-style contest mode. Trigger even if the user only gives a contest ID
   or URL and says "go". For a single isolated problem with no contest loop and
-  no auto-submission, use competitive-programming:solving-problems directly instead.
+  no auto-submission, use competitive-programming:solving-problems directly
+  instead.
 ---
 
-# Codeforces Contest Orchestrator
+# Contest Orchestrator
 
-Drive a full Codeforces contest: pull the problems, solve them one at a time,
-submit, read the verdict, and iterate to Accepted before moving to the next —
-delegating the actual thinking and C++ to the **competitive-programming:solving-problems** skill and using the
-**Codeforces MCP** for everything that touches the judge.
+Drive a full contest on any competitive programming judge: pull the problems,
+solve them one at a time, submit, read the verdict, and iterate to Accepted
+before moving to the next — delegating the actual thinking and C++ to the
+**competitive-programming:solving-problems** skill and using a **judge MCP** for
+everything that touches the judge.
 
 This skill is the *loop and the judge interface*. It does not re-implement
 algorithm design — solving-problems already does that well. Keep the division clean:
@@ -27,20 +31,71 @@ on, when to submit, how to read the result, and what to do next*.
 
 ## Before you start — establish the run
 
-Confirm these two things (ask only if not already given):
+Settle these three things (ask only for what the user hasn't already given):
 
-1. **Which contest** — a contest ID or URL. Resolve it to the contest's problem
-   set via the MCP.
+1. **Which contest, on which judge.** A contest ID or URL. Infer the judge from
+   the URL's domain — codeforces.com, atcoder.jp, codechef.com, open.kattis.com,
+   dmoj.ca, oj.uz. Ask only when it is genuinely ambiguous, such as a bare
+   number with no judge named.
 2. **Which mode** — `ICPC` or `IOI`. They change submission strategy (see
    [Modes](#modes)). If the user hasn't said, ask which one.
+3. **Which judge interface** — bind the four capabilities below to real tools
+   before you open a single problem.
 
-Then **discover the MCP tools at runtime** rather than assuming their names.
-Call `tool_search` (e.g. "codeforces contest problems", "codeforces submit",
-"codeforces submission status") to load the exact tool definitions and read
-their real parameter names. Codeforces MCPs vary; do not guess a schema. You
-need tools that cover roughly: list problems in a contest, get one problem's
-statement, submit a solution, and poll a submission's verdict. If any of these
-is missing, say so plainly and tell the user which capability the MCP needs.
+## Judge interface — the capability contract
+
+This skill never hardcodes a judge's tool names. It needs four **capabilities**,
+and binds each one to whatever tool the installed MCP actually provides:
+
+| Capability | What it must give you | Used at |
+|---|---|---|
+| **list-problems** | the contest's problem indices and names; ideally solve counts, points or difficulty | [Ordering](#ordering--easiest-first) |
+| **get-statement** | one problem's full statement, limits and samples | loop step 1 |
+| **submit** | send source code and a language for one problem | loop step 4 |
+| **poll-verdict** | a submission's verdict or score | loop step 5 |
+
+Bind them once, before the first problem:
+
+1. **Read `references/judges.md`** for the judge the user named. An entry there
+   gives you the server, the expected bindings, and the judge's quirks — scoring
+   rule, language ids, contest URL shapes.
+2. **Discover the tools at runtime.** Call `tool_search` with the judge name
+   plus capability words ("codeforces contest problems", "atcoder submit",
+   "submission verdict") to load the real tool definitions, and read their
+   actual parameter names. MCPs vary and a registry entry can go stale — **the
+   loaded schema always wins over anything written down.** Never guess a schema.
+3. **Bind each capability to one concrete tool** and write the binding down.
+4. **State the binding in your first status update**, so the user can correct a
+   mis-binding before any submission happens.
+5. **If a capability has no tool**, go to
+   [When no MCP covers this judge](#when-no-mcp-covers-this-judge). Don't
+   improvise a tool name and don't abandon the run.
+
+After this step, reason in capabilities. Concrete tool names live in your
+binding and in `references/judges.md` — not in the loop.
+
+## When no MCP covers this judge
+
+A missing MCP moves the judge I/O to the user; it does not end the contest. Say
+plainly which capabilities you could not bind, then **offer** this mode — don't
+slide into it silently.
+
+| Missing capability | What you do instead |
+|---|---|
+| **list-problems** | Read the problem list off the contest page with WebFetch, or ask the user for it. |
+| **get-statement** | Fetch the problem URL with WebFetch, or ask the user to paste the statement. |
+| **submit** | Hand over the final source file path and the exact language to select, and ask the user to submit it. |
+| **poll-verdict** | Ask the user to report the verdict verbatim — including the failing test number or the per-subtask scores, which you need in order to debug. |
+
+**Check a fetched statement before you solve it.** It is usable only if it
+carries the constraints, the limits, and the samples. If WebFetch returns a
+truncated page, a JavaScript shell, or a login wall, stop and ask for a paste.
+Solving a partial statement burns a full cycle and produces confidently wrong
+code.
+
+Everything else here is unchanged in degraded mode — the ordering, the
+per-problem loop, the verification bar for the mode, the stuck triggers, the
+progress reporting. Only the judge I/O is manual.
 
 ## Autonomy model — hybrid
 
@@ -107,13 +162,22 @@ derivation that exists only in your reasoning and not in the file; the thought
 
 ## Ordering — easiest first
 
-Solve in **increasing difficulty**, not necessarily alphabetical. If the MCP
-exposes solve counts / points / difficulty for the contest, order by that
-(most-solved first). If it doesn't, fall back to problem-index order (A, B, C…),
-which on Codeforces is usually already roughly easy-to-hard. State the order you
-chose in your first status update so the user can override.
+Solve in **increasing difficulty**, not necessarily alphabetical. If the
+**list-problems** capability exposes solve counts, points or difficulty,
+order by that (most-solved, or lowest points/difficulty, first). If it doesn't,
+fall back to problem-index order (A, B, C… or 1, 2, 3…), which on most judges is
+already roughly easy-to-hard. State the order you chose in your first status
+update so the user can override.
 
 ## What you are optimizing
+
+The rule below is the **ICPC/Codeforces penalty model**, the most common one. If
+your judge scores differently — AtCoder's points per problem with penalties only
+separating equal scores, an IOI-style subtask total — read that judge's actual
+rule (`references/judges.md`, or the contest page) and re-derive from it. Two
+consequences survive every scoring system in use, so treat them as fixed: **a
+solve beats no solve**, and **an attempt on a problem you have not solved costs
+almost nothing.**
 
 Get this right before you make a single strategic decision, because the obvious
 reading of "minimize penalty" is wrong and it will cost you problems.
@@ -224,8 +288,8 @@ not hitting 100%:
 
 For each problem, in the chosen order:
 
-1. **Fetch the statement** via the MCP. Read it fully — constraints, time/memory
-   limits, and all samples.
+1. **Fetch the statement** via the **get-statement** capability. Read it fully —
+   constraints, time/memory limits, and all samples.
 2. **Solve it with competitive-programming:solving-problems.** Run its workflow to get correct,
    constraint-fitting C++ — but skip its approval checkpoint (see
    [Autonomy model](#autonomy-model--hybrid)). The solving-problems **Code quality**
@@ -235,13 +299,13 @@ For each problem, in the chosen order:
 3. **Verify to the mode's bar.** Apply the [ICPC](#icpc-mode--verify-before-you-submit)
    or [IOI](#ioi-mode--submissions-are-cheap-use-them-to-debug-maximize-score) standard above
    before deciding to submit.
-4. **Submit** through the MCP. Use the right language ID for C++ (GNU G++17/20/23
-   — pick one the judge accepts; discover valid values from the submit tool if it
-   lists them).
-5. **Poll the verdict.** Submissions judge asynchronously. Poll the submission
-   status tool until the verdict leaves "In queue"/"Running"/"Testing". Poll at a
-   reasonable interval (a few seconds between checks); don't hammer it, and don't
-   assume an immediate result.
+4. **Submit** via the **submit** capability. Pick the C++ language from the ids
+   that tool actually offers — discover them, don't assume a numbering. A
+   judge's language ids mean nothing on another judge.
+5. **Poll the verdict** via the **poll-verdict** capability. Submissions judge
+   asynchronously. Poll until the verdict leaves "In queue"/"Running"/"Testing",
+   at a reasonable interval (a few seconds between checks); don't hammer it, and
+   don't assume an immediate result.
 6. **Act on the verdict** (see the table below).
 7. **Decide done or continue**, by mode and problem type:
    - **ICPC** → done means Accepted. Anything else, debug and resubmit, respecting
@@ -262,6 +326,11 @@ problem before fetching the next.
 Don't interleave.
 
 ### Verdict handling
+
+Judges spell verdicts differently — `AC`/`OK`/`Accepted`, `WA`/`Wrong answer`,
+`TLE`, `MLE`, `RE`, `CE`, `ILE`/`Idleness limit exceeded`. Match on **meaning**,
+not on the exact string. A verdict that maps to no row is surprising: report it
+rather than guessing.
 
 | Verdict | What it means | Response |
 |---|---|---|
@@ -367,7 +436,7 @@ Keep the user oriented without spamming. Report at natural boundaries: after
 each Accepted, and whenever you pause. A good status line is compact:
 
 ```
-Contest 1998 · ICPC mode · order by solves
+Codeforces 1998 · ICPC mode · order by solves · judge MCP: codeforces
 A ✅  B ✅  C 🔁 (WA test 3, fixing)  D–F ⏳
 Attempts: A×1  B×2  C×2
 ```
@@ -376,7 +445,7 @@ In IOI mode, show scores instead of a binary tick so the user sees where points
 stand:
 
 ```
-Contest 1998 · IOI mode · order by index
+Codeforces 1998 · IOI mode · order by index · judge MCP: codeforces
 A 100  B 100  C 60 🔁 (subtask 3 TLE, need faster)  D 0 ⏳  E–F ⏳
 Score: 260  ·  Attempts: A×1  B×1  C×2
 ```
@@ -386,10 +455,11 @@ into every update — the user can ask to see a solution if they want it.
 
 ## Guardrails
 
-- **One contest, the user's contest.** Only operate on the contest the user
-  named. Don't fetch or submit elsewhere.
+- **One contest, one judge, the user's.** Only operate on the contest the user
+  named, on the judge they named. Don't fetch or submit anywhere else.
 - **Respect the judge.** Poll politely, don't spam submissions in ICPC mode, and
-  if the MCP rate-limits or errors in a way you can't parse, pause and report.
+  if a bound tool rate-limits or errors in a way you can't parse, pause and
+  report.
 - **Correctness over speed of loop.** The goal is Accepted problems, not a fast
   wrong pass. In ICPC especially, a considered submission beats a rushed one.
 - **Fair play is the user's call.** Solve the problems on their behalf as asked;
