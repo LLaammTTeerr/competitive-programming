@@ -117,9 +117,9 @@ Pause and ask the user **only** when one of these hybrid triggers fires:
   algorithm that fits the constraints. This trigger asks the user for *help on
   that problem*; it is not permission to retire it. Reading a statement and
   finding it hard does not fire it.
-- **Something surprising or destructive.** The MCP returns errors you can't
-  interpret, rate-limits you, the contest looks already over, or anything that
-  makes continuing feel wrong.
+- **Something surprising or destructive.** A bound tool returns errors you
+  can't interpret, rate-limits you, the contest looks already over, or anything
+  that makes continuing feel wrong.
 
 Outside those triggers, proceed without asking. When you do pause, give a tight
 status snapshot (see [Progress reporting](#progress-reporting)) so the user can
@@ -341,11 +341,37 @@ rather than guessing.
 | **Memory Limit Exceeded** | Too much memory | Shrink data structures / reuse buffers; reconsider the approach if it's structurally heavy. |
 | **Runtime Error on test N** | Crash | Suspect out-of-bounds, overflow, stack overflow from deep recursion, division by zero, bad `assert`. |
 | **Compilation Error** | Didn't build | Read the compiler message; fix and resubmit. Doesn't count as a "fix attempt" toward the stuck threshold — it's mechanical. |
-| **Idleness Limit Exceeded** | Interactive/flush issue, or not reading input | Flush after each output in interactive problems; check the I/O protocol. |
+| **Idleness Limit Exceeded** | Interactive/flush issue, or not reading input | Flush after each write — see [Interactive problems](#interactive-problems). If the problem isn't interactive, you are not reading input to end of stream. |
 
 Count only *distinct algorithmic/logic fix attempts* toward the ~3-attempt stuck
 threshold. Compilation errors, typos, and trivial mechanical corrections don't
 count.
+
+## Interactive problems
+
+Some problems talk to the judge instead of reading a fixed input. The statement
+gives it away: an **Interaction** section, a query format, a query budget, and
+usually no output specification. A judge MCP may flag it too — the Codeforces
+server returns `interactive: true`.
+
+They break three assumptions the normal loop makes:
+
+- **Flush after every write.** Use `cout << … << endl;` or an explicit
+  `cout.flush()` after each query. Buffered output deadlocks against the judge
+  and scores Idleness Limit Exceeded — the fast-I/O habit of avoiding `endl` is
+  exactly wrong here.
+- **The sample is a transcript, not a test file.** Its two blocks are the two
+  sides of a dialogue. Piping the sample input into your program and diffing the
+  output proves nothing; don't report that as verification.
+- **Stress testing needs a mock interactor**, not a brute-force oracle: a
+  program that holds a hidden instance, answers queries by the statement's rule,
+  counts them against the budget, and checks your final answer. Write that when
+  an interactive problem needs stress testing, and drive your solution through a
+  pipe.
+
+Read the query budget as a constraint like any other — it usually names the
+intended algorithm (about n log n queries → sorting or binary search; about 2n →
+a linear scan; about log n → binary search on the answer).
 
 ## When a problem won't fall
 
