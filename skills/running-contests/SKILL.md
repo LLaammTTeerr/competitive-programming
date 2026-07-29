@@ -238,9 +238,10 @@ costs nothing, and an unsubmitted solution scores exactly as well as no solution
 
 IOI-style judging returns a **score**, not a binary pass/fail. Submit freely —
 the judge is your fastest oracle. Make sure a submission compiles and passes
-samples first (don't waste round-trips on trivially broken code), but don't
-stress-test pre-emptively — let the judge point you at what's failing, then
-reproduce and fix it.
+samples first — on an interactive problem, clear the [interactive verification
+floor](#interactive-problems) instead — so you don't waste round-trips on
+trivially broken code. But don't stress-test pre-emptively — let the judge point
+you at what's failing, then reproduce and fix it.
 
 There are two kinds of IOI problem, and they have **different stopping rules**.
 Identify which one you're on from the statement before deciding when a problem is
@@ -373,13 +374,13 @@ They break three assumptions the normal loop makes:
   pipe.
 
 **The verification floor.** Since the sample can't be diffed, it can't stand in
-for the ICPC "passes every sample" gate or loop step 2 either — build the mock
-interactor above and use it as the floor: before you submit, run the solution
-against it on the statement's sample instance, then on a few small random
-instances, and check the query count against the budget on each run. That is
-the minimum for *any* interactive submission, independent of the "raise the
-bar" stress-testing call in ICPC mode, which is about how much *more* scrutiny
-a risky solution needs on top of this floor.
+for the ICPC "passes every sample" gate, IOI's "passes samples first", or loop
+step 2 — build the mock interactor above and use it as the floor instead. Before
+you submit, run the solution against it on the statement's sample instance, then
+on a few small random instances, and check the query count against the budget on
+each run. That is the minimum for *any* interactive submission, independent of
+the "raise the bar" stress-testing call in ICPC mode, which is about how much
+*more* scrutiny a risky solution needs on top of this floor.
 
 Read the query budget as a constraint like any other — it usually names the
 intended algorithm (about n log n queries → sorting or binary search; about 2n →
