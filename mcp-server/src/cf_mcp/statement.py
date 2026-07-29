@@ -267,16 +267,30 @@ _NAMED_SECTIONS = {
 }
 
 # Matches "interactive problem" immediately denied by a preceding negation, e.g.
-# "is not an interactive problem" or "isn't an interactive problem" — a legend
-# using either of those must NOT be flagged interactive.
+# "is not an interactive problem", "isn't an interactive problem" or "never an
+# interactive problem" — a legend using any of those must NOT be flagged
+# interactive. `\W*` tolerates stray punctuation between the negation and the
+# phrase, not just plain whitespace.
 _NEGATED_INTERACTIVE_RE = re.compile(
-    r"\b(?:not|isn't)\s+(?:an\s+)?interactive problem"
+    r"\b(?:not|isn't|never)\W*(?:an\W+)?interactive problem"
 )
+
+# The statement renderer wraps <b>/<strong>/tex-font-style-bf in "**" and
+# <i>/<em>/tex-font-style-it in "*", so a bolded denial like "This is **not**
+# an interactive problem" carries emphasis markers right in front of the word
+# the negation regex looks for.
+_EMPHASIS_RE = re.compile(r"[*_]")
+
+
+def _strip_emphasis(text: str) -> str:
+    """Drop the Markdown emphasis markers this parser emits, so a bolded or
+    italicised word matches the same as its plain-text form."""
+    return _EMPHASIS_RE.sub("", text)
 
 
 def _legend_claims_interactive(legend: str) -> bool:
     """True when the legend asserts (not denies) that the problem is interactive."""
-    text = legend.lower()
+    text = _strip_emphasis(legend.lower())
     if "interactive problem" not in text:
         return False
     return not _NEGATED_INTERACTIVE_RE.search(text)
@@ -347,9 +361,10 @@ def parse_statement(
         prose = _clean(_children_text(child))
         if not prose:
             continue
-        if statement.sections:
-            # A titled section already rendered above this point; keep this
-            # prose at its real position instead of hoisting it to the top.
+        if statement.sections or statement.samples_index is not None:
+            # A titled section or the sample block already rendered above this
+            # point; keep this prose at its real position instead of hoisting
+            # it to the top.
             statement.sections.append(Section("", prose))
         else:
             statement.legend = (

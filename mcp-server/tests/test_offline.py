@@ -196,6 +196,86 @@ def test_sections_render_in_page_order_around_the_samples():
     assert positions == sorted(positions)
 
 
+def test_interaction_section_renders_before_the_samples():
+    """The pre-samples split is what the sections rewrite actually introduced:
+    an untitled section (Interaction has no CF-assigned class) must still land
+    before the sample block it precedes on the page."""
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    markdown = statement.to_markdown()
+    assert markdown.index("## Interaction") < markdown.index("## Example")
+
+
+# Golden: the exact Markdown an ordinary (non-interactive) statement renders
+# to. Pins backward compatibility with the pre-sections parser — a future
+# to_markdown refactor that silently changes ordinary output must fail this,
+# not just the shape-level assertions above.
+ORDINARY_STATEMENT_MARKDOWN = (
+    "# B. Sample Problem\n"
+    "\n"
+    "- **Time limit:** 2 seconds\n"
+    "- **Memory limit:** 256 megabytes\n"
+    "- **Input:** standard input\n"
+    "- **Output:** standard output\n"
+    "- **URL:** https://example/42/B\n"
+    "\n"
+    "Given $n$, print it.\n"
+    "\n"
+    "- first\n"
+    "- second\n"
+    "\n"
+    "## Input\n"
+    "\n"
+    "One integer $n$.\n"
+    "\n"
+    "## Output\n"
+    "\n"
+    "Print $n$.\n"
+    "\n"
+    "## Example\n"
+    "\n"
+    "Input:\n"
+    "```\n"
+    "2\n"
+    "5\n"
+    "```\n"
+    "\n"
+    "Output:\n"
+    "```\n"
+    "5\n"
+    "```\n"
+    "\n"
+    "## Note\n"
+    "\n"
+    "Nothing to add.\n"
+)
+
+
+def test_ordinary_statement_markdown_is_byte_identical_to_the_pinned_golden():
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    assert statement.to_markdown() == ORDINARY_STATEMENT_MARKDOWN
+
+
+def test_to_dict_keeps_the_published_key_set():
+    """`sections` and `interactive` are new; the pre-existing keys are a
+    published contract other callers may already depend on and must stay."""
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    published_keys = {
+        "contest_id",
+        "index",
+        "name",
+        "url",
+        "time_limit",
+        "memory_limit",
+        "input_file",
+        "output_file",
+        "samples",
+        "markdown",
+    }
+    assert published_keys <= statement.to_dict().keys()
+
+
 def test_to_dict_exposes_sections():
     statement = parse_statement(
         SUBTASK_STATEMENT_HTML, 1, "C", "https://example/1/C"
@@ -237,6 +317,29 @@ def test_negated_legend_wording_does_not_mark_the_problem_interactive():
         '<div class="problem-statement">'
         '<div class="header"><div class="title">A. Talk</div></div>'
         "<div><p>This is not an interactive problem. Read normally.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_negated_legend_wording_survives_bold_emphasis():
+    """The renderer wraps <b>/<strong> in "**"; the negation guard must see
+    through that markup, not just plain "not"."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is <b>not</b> an interactive problem. Read normally.</p></div>"
+        "</div>"
+    )
+    assert parse_statement(html, 1, "A", "u").interactive is False
+
+
+def test_negated_legend_wording_survives_italic_emphasis():
+    """Same guard, but for the single-asterisk <i>/<em> wrapper."""
+    html = (
+        '<div class="problem-statement">'
+        '<div class="header"><div class="title">A. Talk</div></div>'
+        "<div><p>This is <i>not</i> an interactive problem. Read normally.</p></div>"
         "</div>"
     )
     assert parse_statement(html, 1, "A", "u").interactive is False

@@ -94,7 +94,11 @@ contest page for gyms, group contests and contests that are still running.
 ### `cf_get_problem_statement(contest_id, index, gym=False, group_id="")`
 Full statement as Markdown (math normalised from `$$$x$$$` to `$x$`), time and
 memory limits, and every sample test as a separate `{input, output}` pair ready
-to pipe into a local run.
+to pipe into a local run. Also returns `sections` — the statement's titled
+blocks (Input, Output, Interaction, Scoring, Note…) in page order — and
+`interactive`, true when the problem talks to the judge instead of reading a
+fixed input; when it is, flush after every write and treat the sample as a
+dialogue transcript, not a runnable test file.
 
 ### `cf_list_languages(contest_id, gym=False, group_id="")`
 The exact `programTypeId` values that contest's submit form offers. Language
@@ -147,7 +151,7 @@ cf_submit_solution(2000, "C", source_file="sol.cpp", language="GNU G++23")
 .venv/bin/python -m pytest -q
 ```
 
-32 tests, no network required: AES against the NIST vectors, statement and
+56 tests, no network required: AES against the NIST vectors, statement and
 status-table parsing, language resolution, and the whole submit flow against a
 fake Codeforces.
 
