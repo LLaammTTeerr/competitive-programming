@@ -227,12 +227,33 @@ Consider each before finalizing:
 - **Off-by-one and indexing.** Be explicit about 0- vs 1-based indexing and keep
   it consistent.
 
-## Stress testing (only when asked)
+## Stress testing — when the samples aren't enough evidence
 
-Do **not** stress-test by default. Run it only when the user asks for it, or
-offers a solution that's getting wrong-answer verdicts and agrees to it. When a
-solution passes the samples but fails hidden tests and the failing case is
-unknown, you may *offer* stress testing — but wait for a yes before doing it.
+Stress testing is how you get evidence about a solution you can't fully argue
+for. It costs three extra programs and a run loop, so it is worth doing exactly
+when passing the samples is weak evidence — and a waste of everyone's time when
+it isn't. Judge that per problem rather than by rule:
+
+- **Skip it** when the logic is transparent and the samples exercise it: a
+  direct simulation, a formula you derived and can check by hand, an
+  implementation problem with no argument in it. Say the samples are sufficient
+  and move on. Don't manufacture ceremony for a problem you understand.
+- **Do it** when correctness rests on something you have *not* proved: a greedy
+  whose exchange argument you can only gesture at, a claim like "the answer is
+  always the median", fiddly modular arithmetic or geometry, a subtle invariant,
+  a solution already getting wrong-answer verdicts on hidden tests. Here
+  "passes the samples" tells you almost nothing — samples are chosen to
+  illustrate the statement, not to break your reasoning.
+
+You don't need permission to check your own work, and asking for it invites the
+user to approve something neither of you has evidence for. This is not the
+approval checkpoint in [Work as a partner](#work-as-a-partner--get-approval-before-implementing):
+that gate exists so the user chooses the *approach*, and verifying an approach
+you already agreed on doesn't change it — it's how you make the plan you present
+worth agreeing to. Do say what you're doing and why — "the exchange argument
+here isn't airtight, so I'm checking it against a brute force before handing it
+over" — because the extra programs and the delay would otherwise be a surprise.
+If time is visibly tight, offer the choice explicitly instead of deciding alone.
 
 The method finds a minimal failing case automatically:
 
