@@ -21,6 +21,14 @@ class Sample:
 
 
 @dataclass
+class Section:
+    """A titled block of the statement — Input, Interaction, Scoring, Note…"""
+
+    title: str
+    body: str
+
+
+@dataclass
 class Statement:
     contest_id: int
     index: str
@@ -35,6 +43,9 @@ class Statement:
     output_spec: str = ""
     note: str = ""
     samples: list[Sample] = field(default_factory=list)
+    sections: list[Section] = field(default_factory=list)
+    # Where the sample block sat among the sections, so rendering can put it back.
+    samples_index: int | None = None
 
     def to_markdown(self) -> str:
         parts = [f"# {self.index}. {self.name}", ""]
@@ -48,13 +59,28 @@ class Statement:
         meta.append(f"- **URL:** {self.url}")
         parts += meta + ["", self.legend.strip()]
 
-        if self.input_spec:
-            parts += ["", "## Input", "", self.input_spec.strip()]
-        if self.output_spec:
-            parts += ["", "## Output", "", self.output_spec.strip()]
+        split = (
+            len(self.sections) if self.samples_index is None else self.samples_index
+        )
+        parts += self._section_lines(self.sections[:split])
+        parts += self._sample_lines()
+        parts += self._section_lines(self.sections[split:])
+        return "\n".join(parts).strip() + "\n"
+
+    def _section_lines(self, sections: list[Section]) -> list[str]:
+        lines: list[str] = []
+        for section in sections:
+            body = section.body.strip()
+            if not body:
+                continue
+            lines += ["", f"## {section.title}", "", body]
+        return lines
+
+    def _sample_lines(self) -> list[str]:
+        lines: list[str] = []
         for i, sample in enumerate(self.samples, 1):
             label = f"## Example {i}" if len(self.samples) > 1 else "## Example"
-            parts += [
+            lines += [
                 "",
                 label,
                 "",
@@ -68,9 +94,7 @@ class Statement:
                 sample.output,
                 "```",
             ]
-        if self.note:
-            parts += ["", "## Note", "", self.note.strip()]
-        return "\n".join(parts).strip() + "\n"
+        return lines
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +107,9 @@ class Statement:
             "input_file": self.input_file,
             "output_file": self.output_file,
             "samples": [{"input": s.input, "output": s.output} for s in self.samples],
+            "sections": [
+                {"title": s.title, "body": s.body} for s in self.sections
+            ],
             "markdown": self.to_markdown(),
         }
 
@@ -177,15 +204,37 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
-def _section(root: Tag, class_name: str) -> str:
-    node = root.find("div", class_=class_name)
-    if not node:
-        return ""
+def _titled(node: Tag) -> str:
+    """The section's heading text, or "" when the div carries no heading."""
+    title = node.find("div", class_="section-title")
+    return title.get_text(" ", strip=True) if title else ""
+
+
+def _body(node: Tag) -> str:
+    """Render a section's contents as Markdown, minus its heading."""
     clone = _soup(str(node)).find("div")
     title = clone.find("div", class_="section-title")
     if title:
         title.decompose()
     return _clean(_children_text(clone))
+
+
+def _parse_samples(samples_root: Tag) -> list[Sample]:
+    samples: list[Sample] = []
+    for test in samples_root.find_all("div", class_="sample-test"):
+        inputs = [
+            _pre_text(div.find("pre"))
+            for div in test.find_all("div", class_="input")
+            if div.find("pre")
+        ]
+        outputs = [
+            _pre_text(div.find("pre"))
+            for div in test.find_all("div", class_="output")
+            if div.find("pre")
+        ]
+        for i, sample_input in enumerate(inputs):
+            samples.append(Sample(sample_input, outputs[i] if i < len(outputs) else ""))
+    return samples
 
 
 def _property(header: Tag, class_name: str, default: str = "") -> str:
@@ -197,6 +246,15 @@ def _property(header: Tag, class_name: str, default: str = "") -> str:
     if title:
         title.decompose()
     return clone.get_text(" ", strip=True) or default
+
+
+# Statement divs whose class names the section; the fallback title is used when
+# the page omits the heading.
+_NAMED_SECTIONS = {
+    "input-specification": ("input_spec", "Input"),
+    "output-specification": ("output_spec", "Output"),
+    "note": ("note", "Note"),
+}
 
 
 def parse_statement(
@@ -232,36 +290,39 @@ def parse_statement(
         output_file=_property(header, "output-file", "standard output")
         if header
         else "standard output",
-        input_spec=_section(root, "input-specification"),
-        output_spec=_section(root, "output-specification"),
-        note=_section(root, "note"),
     )
 
-    # The legend is the first bare <div> after the header, with no class.
     for child in root.find_all("div", recursive=False):
         if child is header:
             continue
-        if child.get("class"):
-            continue
-        statement.legend = _clean(_children_text(child))
-        break
+        classes = child.get("class") or []
 
-    samples_root = root.find("div", class_="sample-tests")
-    if samples_root:
-        for test in samples_root.find_all("div", class_="sample-test"):
-            inputs = [
-                _pre_text(div.find("pre"))
-                for div in test.find_all("div", class_="input")
-                if div.find("pre")
-            ]
-            outputs = [
-                _pre_text(div.find("pre"))
-                for div in test.find_all("div", class_="output")
-                if div.find("pre")
-            ]
-            for i, sample_input in enumerate(inputs):
-                sample_output = outputs[i] if i < len(outputs) else ""
-                statement.samples.append(Sample(sample_input, sample_output))
+        if "sample-tests" in classes:
+            statement.samples_index = len(statement.sections)
+            statement.samples.extend(_parse_samples(child))
+            continue
+
+        named = next((c for c in classes if c in _NAMED_SECTIONS), None)
+        if named:
+            attribute, fallback_title = _NAMED_SECTIONS[named]
+            body = _body(child)
+            setattr(statement, attribute, body)
+            statement.sections.append(Section(_titled(child) or fallback_title, body))
+            continue
+
+        if classes:
+            continue  # A decorated div that is not statement prose.
+
+        # Class-less divs are either the legend or a section Codeforces did not
+        # give a class — Interaction, Scoring. Only the titled ones are sections.
+        title = _titled(child)
+        if title:
+            statement.sections.append(Section(title, _body(child)))
+            continue
+        prose = _clean(_children_text(child))
+        if not prose:
+            continue
+        statement.legend = f"{statement.legend}\n\n{prose}" if statement.legend else prose
 
     return statement
 

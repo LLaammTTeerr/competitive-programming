@@ -110,6 +110,101 @@ def test_parse_statement_rejects_a_page_without_a_statement():
         parse_statement("<html><body>nope</body></html>", 1, "A", "u")
 
 
+# Mirrors contest 2206 problem A: an interactive problem has no input or output
+# specification at all, only a class-less <div> titled "Interaction".
+INTERACTIVE_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">A. Compare Suffixes</div>
+    <div class="time-limit"><div class="property-title">time limit per test</div>2 seconds</div>
+    <div class="memory-limit"><div class="property-title">memory limit per test</div>1024 megabytes</div>
+    <div class="input-file input-standard"><div class="property-title">input</div>standard input</div>
+    <div class="output-file output-standard"><div class="property-title">output</div>standard output</div>
+  </div>
+  <div><p>The judge hides a string $$$S$$$ of length $$$n$$$.</p></div>
+  <div><div class="section-title">Interaction</div><p>Print <span class="tex-font-style-tt">query i j</span> to compare two suffixes. You may ask at most $$$10^5$$$ queries. Flush after every line.</p></div>
+  <div class="sample-tests"><div class="section-title">Example</div>
+    <div class="sample-test">
+      <div class="input"><div class="title">Input</div><pre>
+4
+first
+</pre></div>
+      <div class="output"><div class="title">Output</div><pre>
+query 2 1
+</pre></div>
+    </div>
+  </div>
+  <div class="note"><div class="section-title">Note</div><p>Sample interaction.</p></div>
+</div>
+"""
+
+
+# A subtask problem puts its scoring rules in the same kind of class-less div.
+SUBTASK_STATEMENT_HTML = """
+<div class="problem-statement">
+  <div class="header">
+    <div class="title">C. Subtasks</div>
+  </div>
+  <div><p>Solve it.</p></div>
+  <div class="input-specification"><div class="section-title">Input</div><p>One integer $$$n$$$.</p></div>
+  <div class="output-specification"><div class="section-title">Output</div><p>Print $$$n$$$.</p></div>
+  <div><div class="section-title">Scoring</div><p>Subtask 1 ($$$n \\le 10$$$): 30 points.</p></div>
+  <div class="note"><div class="section-title">Note</div><p>Nothing to add.</p></div>
+</div>
+"""
+
+
+def test_parse_statement_keeps_a_class_less_titled_section():
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    titles = [section.title for section in statement.sections]
+    assert titles == ["Interaction", "Note"]
+    interaction = statement.sections[0].body
+    assert "query i j" in interaction
+    assert "$10^5$ queries" in interaction
+    assert "Flush after every line." in interaction
+
+
+def test_class_less_titled_section_reaches_the_markdown():
+    statement = parse_statement(
+        INTERACTIVE_STATEMENT_HTML, 2206, "A", "https://example/2206/A"
+    )
+    markdown = statement.to_markdown()
+    assert "## Interaction" in markdown
+    assert "Flush after every line." in markdown
+
+
+def test_parse_statement_keeps_an_unknown_titled_section():
+    statement = parse_statement(
+        SUBTASK_STATEMENT_HTML, 1, "C", "https://example/1/C"
+    )
+    titles = [section.title for section in statement.sections]
+    assert titles == ["Input", "Output", "Scoring", "Note"]
+    assert "30 points" in statement.to_markdown()
+
+
+def test_sections_render_in_page_order_around_the_samples():
+    statement = parse_statement(STATEMENT_HTML, 42, "B", "https://example/42/B")
+    markdown = statement.to_markdown()
+    positions = [
+        markdown.index("## Input"),
+        markdown.index("## Output"),
+        markdown.index("## Example"),
+        markdown.index("## Note"),
+    ]
+    assert positions == sorted(positions)
+
+
+def test_to_dict_exposes_sections():
+    statement = parse_statement(
+        SUBTASK_STATEMENT_HTML, 1, "C", "https://example/1/C"
+    )
+    scoring = statement.to_dict()["sections"][2]
+    assert scoring["title"] == "Scoring"
+    assert scoring["body"].startswith("Subtask 1")
+
+
 def test_parse_contest_problem_list():
     html = """
     <table class="problems">
