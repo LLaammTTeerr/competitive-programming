@@ -1,3 +1,6 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# Scratch space for subagent-driven development runs (ledgers, briefs, reviews).
+.superpowers/
