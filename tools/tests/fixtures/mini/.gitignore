@@ -1,0 +1,5 @@
+.build/
+invocation.json
+flags.json
+solutions.json
+*.a
