@@ -78,21 +78,102 @@ class Problem:
         return bound
 
 
+def _type_name(value) -> str:
+    """JSON's name for a Python value's type, so the message a hand-editor
+    reads matches the document they are editing."""
+    return {type(None): "null", bool: "boolean", int: "number",
+            float: "number", str: "string", list: "array",
+            dict: "object"}.get(type(value), type(value).__name__)
+
+
+def _object(value, path: Path, what: str) -> dict:
+    """`value` as a JSON object, or `ProblemMetaError` naming what was found.
+
+    Standing ruling R1 in one place: `problem.json` is hand-authored and is
+    the pipeline's source of truth, so every way it can be *wrong* has to
+    arrive as a `ProblemMetaError` naming the field. Missing keys were
+    already wrapped; wrong *types* were not, and `"limits": null` — an
+    ordinary typo — surfaced as `TypeError: 'NoneType' object is not
+    subscriptable` from somewhere far below the reader's document.
+    """
+    if value is None:
+        raise ProblemMetaError(
+            f"{path}: {what} is null; expected an object (did a key get "
+            "emptied rather than removed?)")
+    if not isinstance(value, dict):
+        raise ProblemMetaError(
+            f"{path}: {what} is a JSON {_type_name(value)}, expected an object")
+    return value
+
+
+def _array(value, path: Path, what: str) -> list:
+    """`value` as a JSON array, or `ProblemMetaError` naming what was found."""
+    if value is None:
+        raise ProblemMetaError(
+            f"{path}: {what} is null; expected an array")
+    if not isinstance(value, list):
+        raise ProblemMetaError(
+            f"{path}: {what} is a JSON {_type_name(value)}, expected an array")
+    return value
+
+
+def _integer(value, path: Path, what: str, *, allow_none: bool = False):
+    """`value` as a Python int, or `ProblemMetaError` naming what was found.
+
+    Non-integer bounds are rejected rather than coerced, and that is the
+    whole point of this function. `gen_constraints_header.py` f-strings a
+    bound straight into `static const long long NAME = <value>;`, so
+    `"max": 2.9` emits `= 2.9;`, which C++ **silently truncates to 2** — and
+    a probability bound `"max": 0.5` becomes `0`, after which the generated
+    header makes the validator reject every legal test. That header exists
+    precisely to make validator/`problem.json` drift impossible; a float
+    bound is a path where they drift silently, so it must not load at all.
+
+    `"points": "100"` is the same class from the other direction: it summed
+    with `+` into a `TypeError` deep inside the points check rather than a
+    message about the subtask that has it.
+
+    `bool` is excluded deliberately: it is an `int` subclass in Python, so
+    `"max": true` would otherwise load as 1.
+    """
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProblemMetaError(
+            f"{path}: {what} is {value!r} (JSON {_type_name(value)}), "
+            "expected an integer. Bounds are emitted verbatim into "
+            "files/constraints.h as `static const long long`, where a "
+            "non-integer is silently truncated by the C++ compiler — 2.9 "
+            "becomes 2 and 0.5 becomes 0.")
+    return value
+
+
 def load(path: str | Path) -> Problem:
+    """Load and validate `problem.json`, raising `ProblemMetaError` for
+    every way it can be wrong — missing, unreadable, not JSON, the wrong
+    shape, or internally inconsistent."""
     path = Path(path)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ProblemMetaError(f"{path}: no such file") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ProblemMetaError(f"{path}: cannot be read: {exc}") from exc
+    try:
+        raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ProblemMetaError(f"{path}: not valid JSON: {exc}") from exc
+
+    raw = _object(raw, path, "the top level of the document")
 
     if raw.get("schema") != SCHEMA:
         raise ProblemMetaError(
             f"{path}: unsupported schema {raw.get('schema')!r}, expected {SCHEMA}"
         )
 
-    limits = raw.get("limits", {})
-    io = raw.get("io", {})
-    checker = raw.get("checker", {})
+    limits = _object(raw.get("limits", {}), path, "'limits'")
+    io = _object(raw.get("io", {}), path, "'io'")
+    checker = _object(raw.get("checker", {}), path, "'checker'")
 
     if checker.get("kind") not in CHECKER_KINDS:
         raise ProblemMetaError(
@@ -101,20 +182,21 @@ def load(path: str | Path) -> Problem:
         )
 
     constraints = []
-    try:
-        for c in raw.get("constraints", []):
-            try:
-                constraints.append(
-                    Constraint(
-                        id=c["id"], expr=c["expr"], min=c.get("min"), max=c.get("max")
-                    )
-                )
-            except KeyError as exc:
-                raise ProblemMetaError(
-                    f"{path}: constraint missing required field {exc}"
-                ) from exc
-    except ProblemMetaError:
-        raise
+    for i, c in enumerate(_array(raw.get("constraints", []), path, "'constraints'")):
+        c = _object(c, path, f"constraints[{i}]")
+        try:
+            cid, expr = c["id"], c["expr"]
+        except KeyError as exc:
+            raise ProblemMetaError(
+                f"{path}: constraint missing required field {exc}"
+            ) from exc
+        constraints.append(Constraint(
+            id=cid, expr=expr,
+            min=_integer(c.get("min"), path, f"constraint {cid!r} min",
+                         allow_none=True),
+            max=_integer(c.get("max"), path, f"constraint {cid!r} max",
+                         allow_none=True),
+        ))
 
     seen_c: set[str] = set()
     for c in constraints:
@@ -123,27 +205,36 @@ def load(path: str | Path) -> Problem:
         seen_c.add(c.id)
 
     subtasks = []
-    try:
-        for s in raw.get("subtasks", []):
-            try:
-                subtasks.append(
-                    Subtask(
-                        id=s["id"],
-                        points=s["points"],
-                        bounds={
-                            k: Bound(v.get("min"), v.get("max"))
-                            for k, v in s.get("bounds", {}).items()
-                        },
-                        constraints_text=list(s.get("constraints_text", [])),
-                        depends_on=list(s.get("depends_on", [])),
-                    )
-                )
-            except KeyError as exc:
-                raise ProblemMetaError(
-                    f"{path}: subtask missing required field {exc}"
-                ) from exc
-    except ProblemMetaError:
-        raise
+    for i, s in enumerate(_array(raw.get("subtasks", []), path, "'subtasks'")):
+        s = _object(s, path, f"subtasks[{i}]")
+        try:
+            sid, points = s["id"], s["points"]
+        except KeyError as exc:
+            raise ProblemMetaError(
+                f"{path}: subtask missing required field {exc}"
+            ) from exc
+        # `except KeyError` around this comprehension could never have
+        # caught the bounds case: a non-object bound raises AttributeError
+        # from `.get`, not KeyError.
+        bounds = {}
+        for k, v in _object(s.get("bounds", {}), path,
+                            f"subtask {sid!r} 'bounds'").items():
+            v = _object(v, path, f"subtask {sid!r} bound {k!r}")
+            bounds[k] = Bound(
+                _integer(v.get("min"), path, f"subtask {sid!r} bound {k!r} min",
+                         allow_none=True),
+                _integer(v.get("max"), path, f"subtask {sid!r} bound {k!r} max",
+                         allow_none=True),
+            )
+        subtasks.append(Subtask(
+            id=sid,
+            points=_integer(points, path, f"subtask {sid!r} points"),
+            bounds=bounds,
+            constraints_text=list(_array(s.get("constraints_text", []), path,
+                                         f"subtask {sid!r} 'constraints_text'")),
+            depends_on=list(_array(s.get("depends_on", []), path,
+                                   f"subtask {sid!r} 'depends_on'")),
+        ))
 
     seen_s: set[str] = set()
     for s in subtasks:
@@ -177,6 +268,9 @@ def load(path: str | Path) -> Problem:
         memory_mb = limits["memory_mb"]
     except KeyError as exc:
         raise ProblemMetaError(f"{path}: missing required field in limits {exc}") from exc
+    time_ms_published = _integer(time_ms_published, path,
+                                 "limits.time_ms_published")
+    memory_mb = _integer(memory_mb, path, "limits.memory_mb")
 
     try:
         checker_kind = checker["kind"]
@@ -186,10 +280,11 @@ def load(path: str | Path) -> Problem:
 
     return Problem(
         name=name,
-        title=raw.get("title", {}),
-        tags=list(raw.get("tags", [])),
+        title=_object(raw.get("title", {}), path, "'title'"),
+        tags=list(_array(raw.get("tags", []), path, "'tags'")),
         time_ms_published=time_ms_published,
-        time_ms_computed=limits.get("time_ms_computed"),
+        time_ms_computed=_integer(limits.get("time_ms_computed"), path,
+                                  "limits.time_ms_computed", allow_none=True),
         memory_mb=memory_mb,
         input=io.get("input", "stdin"),
         output=io.get("output", "stdout"),
@@ -197,5 +292,5 @@ def load(path: str | Path) -> Problem:
         checker_name=checker_name,
         constraints=constraints,
         subtasks=subtasks,
-        examples=list(raw.get("examples", [])),
+        examples=list(_array(raw.get("examples", []), path, "'examples'")),
     )

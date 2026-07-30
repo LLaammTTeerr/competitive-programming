@@ -95,5 +95,115 @@ class TestLoad(unittest.TestCase):
             load(write(bad))
 
 
+class TestLoadWrapsEveryFailure(unittest.TestCase):
+    """Standing ruling R1, applied to *types* and not only missing keys.
+
+    problem.json is hand-authored and is the pipeline's source of truth, so
+    every one of these is an ordinary typo. Each case below was reproduced
+    against the loader before the fix and raised the bare exception named
+    in the comment — not a ProblemMetaError naming the field.
+    """
+
+    def test_null_limits(self):  # TypeError: 'NoneType' is not subscriptable
+        bad = dict(VALID, limits=None)
+        with self.assertRaisesRegex(ProblemMetaError, "limits"):
+            load(write(bad))
+
+    def test_null_checker(self):  # AttributeError: 'NoneType' has no 'get'
+        bad = dict(VALID, checker=None)
+        with self.assertRaisesRegex(ProblemMetaError, "checker"):
+            load(write(bad))
+
+    def test_null_io(self):
+        bad = dict(VALID, io=None)
+        with self.assertRaisesRegex(ProblemMetaError, "io"):
+            load(write(bad))
+
+    def test_points_as_a_string(self):  # TypeError on +, inside the sum
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["points"] = "100"
+        with self.assertRaisesRegex(ProblemMetaError, "points"):
+            load(write(bad))
+
+    def test_scalar_bounds(self):  # AttributeError: 'int' has no 'get'
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["bounds"] = {"len_a": 5}
+        with self.assertRaisesRegex(ProblemMetaError, "len_a"):
+            load(write(bad))
+
+    def test_top_level_array(self):  # AttributeError: 'list' has no 'get'
+        with self.assertRaisesRegex(ProblemMetaError, "top level"):
+            load(write([1, 2, 3]))
+
+    def test_missing_file(self):  # FileNotFoundError
+        missing = Path(tempfile.mkdtemp()) / "problem.json"
+        with self.assertRaisesRegex(ProblemMetaError, "no such file"):
+            load(missing)
+
+    def test_constraints_not_an_array(self):
+        bad = dict(VALID, constraints={"len_a": {"max": 20}})
+        with self.assertRaisesRegex(ProblemMetaError, "constraints"):
+            load(write(bad))
+
+    def test_subtask_entry_not_an_object(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0] = "g1"
+        with self.assertRaisesRegex(ProblemMetaError, r"subtasks\[0\]"):
+            load(write(bad))
+
+
+class TestRejectsNonIntegerBounds(unittest.TestCase):
+    """gen_constraints_header f-strings a bound into
+
+        static const long long N_MAX = <value>;
+
+    so `"max": 2.9` emits `= 2.9;`, which C++ silently truncates to 2, and
+    a probability bound `"max": 0.5` becomes 0 — after which the generated
+    header makes the validator reject every legal test. The header exists
+    to make validator/problem.json drift impossible; this was a path where
+    they drifted silently, so the value must not load at all.
+    """
+
+    def test_float_global_bound(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["constraints"][0]["max"] = 2.9
+        with self.assertRaisesRegex(ProblemMetaError, "len_a"):
+            load(write(bad))
+
+    def test_probability_style_bound_that_would_truncate_to_zero(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["constraints"][0]["min"] = 0.5
+        with self.assertRaisesRegex(ProblemMetaError, "expected an integer"):
+            load(write(bad))
+
+    def test_float_subtask_bound(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["bounds"]["len_a"]["max"] = 6.5
+        with self.assertRaisesRegex(ProblemMetaError, "len_a"):
+            load(write(bad))
+
+    def test_string_bound(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["constraints"][0]["max"] = "20"
+        with self.assertRaisesRegex(ProblemMetaError, "expected an integer"):
+            load(write(bad))
+
+    def test_boolean_bound_is_not_accepted_as_one(self):
+        # bool is an int subclass in Python; `"max": true` must not load as 1.
+        bad = json.loads(json.dumps(VALID))
+        bad["constraints"][0]["max"] = True
+        with self.assertRaisesRegex(ProblemMetaError, "expected an integer"):
+            load(write(bad))
+
+    def test_a_float_valued_integer_is_still_rejected(self):
+        # 20.0 would render as `= 20.0;`, which is a `long long` initialized
+        # from a double — legal C++, but not what the document says, and the
+        # next edit to it is 20.5.
+        bad = json.loads(json.dumps(VALID))
+        bad["constraints"][0]["max"] = 20.0
+        with self.assertRaisesRegex(ProblemMetaError, "expected an integer"):
+            load(write(bad))
+
+
 if __name__ == "__main__":
     unittest.main()
