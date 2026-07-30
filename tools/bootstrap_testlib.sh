@@ -12,10 +12,11 @@ if [ ! -d "$TESTLIB" ]; then
     # Clone aside and move into place. Several problems can be prepared at once,
     # and a bare `[ -d ] || git clone` lets the second caller find a directory
     # that exists but is still half-populated, then build against it.
+    mkdir -p "$(dirname "$TESTLIB")"
     staging="$(mktemp -d "$TESTLIB.XXXXXX")"
+    trap 'rm -rf "$staging"' EXIT
     git clone --depth 1 -q "$REPO" "$staging/testlib"
     mv -T "$staging/testlib" "$TESTLIB" 2>/dev/null || true   # first writer wins
-    rm -rf "$staging"
 fi
 git -C "$TESTLIB" pull --ff-only -q 2>/dev/null || true       # offline, or lost a race
 
