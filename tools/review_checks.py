@@ -90,6 +90,9 @@ def _matrix(problem_dir: Path) -> list[Finding]:
     except (json.JSONDecodeError, OSError) as exc:
         return [Finding("matrix-hole", "low",
                         f"invocation.json unreadable: {exc}", str(path))]
+    # Explicit check for dict type: redundant with the try/except below, but provides
+    # a clearer message naming the type found. Separates structural validation from
+    # operational errors. Kept deliberately for better diagnostics.
     if not isinstance(data, dict):
         return [Finding("matrix-hole", "low",
                         f"invocation.json top level is not an object (got {type(data).__name__})",

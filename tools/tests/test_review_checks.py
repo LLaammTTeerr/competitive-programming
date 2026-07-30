@@ -145,35 +145,33 @@ class TestCleanPackageReturnsNoFindings(unittest.TestCase):
         shutil.copytree(FIXTURE, self.dir,
                         ignore=shutil.ignore_patterns(".build", ".pycache"))
 
-    def test_complete_fixture_produces_no_findings(self):
-        """A complete, clean package should produce zero findings."""
-        # Add examples to problem.json to make it complete
+    def test_fixture_with_legitimate_completions_has_no_findings(self):
+        """Fixture with examples and samples added should produce zero findings.
+
+        The fixture is committed with a valid generated constraints.h and valid
+        invocation.json. We only add the missing examples and sample files that
+        Stage 1 never provided, then verify the audit is clean.
+        """
         import json
+        # Add examples to problem.json (fixture intentionally ships without these)
         problem_path = self.dir / "problem.json"
         problem = json.loads(problem_path.read_text(encoding="utf-8"))
         problem["examples"] = [{"test": "01"}]
         problem_path.write_text(json.dumps(problem, indent=2, ensure_ascii=False) + "\n",
                                encoding="utf-8")
 
-        # Create the sample files
+        # Create the sample files (fixture intentionally ships without these)
         (self.dir / "01.in").write_text("1 2\n", encoding="utf-8")
         (self.dir / "01.a").write_text("3\n", encoding="utf-8")
 
-        # Regenerate constraints.h to match problem.json
-        from tools.gen_constraints_header import render
-        from tools.problem_meta import load
-        problem = load(self.dir / "problem.json")
-        (self.dir / "files" / "constraints.h").write_text(render(problem), encoding="utf-8")
-
-        # Write valid invocation.json with no holes/mismatches
+        # Write valid invocation.json with no holes/mismatches (fixture is incomplete without this)
         (self.dir / "invocation.json").write_text(
             json.dumps({"schema": 1, "holes": [], "mismatches": []}),
             encoding="utf-8")
 
         findings = run(self.dir)
         if findings:
-            # If still findings, report them
-            msg = "Complete fixture has findings:\n"
+            msg = "Fixture with legitimate completions has findings:\n"
             for f in findings:
                 msg += f"  {f.severity.upper()} {f.kind}: {f.what}\n"
             self.fail(msg)
