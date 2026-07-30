@@ -8,8 +8,8 @@
   "plugins": [
     {
       "name": "competitive-programming",
-      "description": "Competitive programming: single-problem solving, full-contest orchestration on any judge, and the bundled Codeforces MCP server",
-      "version": "0.3.0",
+      "description": "Competitive programming: single-problem solving, full-contest orchestration on any judge, authoring Vietnamese problem statements, and the bundled Codeforces MCP server",
+      "version": "0.4.0",
       "source": "./",
       "author": {
         "name": "LamTer",
