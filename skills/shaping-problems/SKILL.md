@@ -103,10 +103,19 @@ a legitimate way to build a problem — as long as the setter knows it and
 decides on purpose, rather than discovering it in review after the tests are
 built. If the search turns up the same operation under the same constraints,
 say so and let the human decide whether to proceed anyway, angle the
-constraints differently, or pick a different idea. This is a flag
-(spec §6), not the blocking gate — it does not stop the skill, but it must
-be raised before the numbers below are chosen, because "already known" can
-change which `N` is even interesting.
+constraints differently, or pick a different idea.
+
+**Raise this in the gate conversation, before the numbers below are chosen —
+it is not something to record in `flags.json`.** `tools/flags.py` is a
+closed set of kinds (`algorithm-choice`, `checker-choice`,
+`constraint-drift`, `review-judgement`, `sample-choice`,
+`statement-ambiguity`, `test-weakness`, `timing-band`) for the *autonomous*
+phases downstream, where nobody is watching and `changes_if_wrong` prices an
+interruption nobody is present to make. Shaping is not autonomous — it
+happens at the one blocking gate, with the human right there — so
+originality doesn't need that machinery. It needs to be said out loud, in
+the conversation, before `N` and the subtask ladder are decided, because
+"already known" can change which `N` is even interesting.
 
 ## Difficulty and the separation constraint
 
@@ -118,7 +127,7 @@ Work the numbers at roughly 10⁸ operations/second. If the intended solution
 is `O(n log n)` and the naive one is `O(n²)`, then at `n = 2·10⁵`:
 
 - naive: `n² ≈ 4·10¹⁰` operations — around 400 s, wildly over any sane limit
-- intended: `n log₂ n ≈ 2·10⁵ × 18 ≈ 3.6·10⁶` operations — a few milliseconds
+- intended: `n log₂ n ≈ 2·10⁵ × 18 ≈ 3.6·10⁶` operations — tens of milliseconds (≈36 ms at 10⁸ ops/s)
 
 That gap is the whole point of the constraint. Compare it against a
 constraint that fails to separate: `n ≤ 2000` puts the same naive `O(n²)` at
@@ -168,14 +177,18 @@ it from the decisions made above. Changing a decision later means
 **re-opening this gate, not editing the file directly**, because the file is
 the record of the decision, not just its encoding.
 
-Required shape (schema 1, validated by `tools/problem_meta.py`):
+Required shape (schema 1, validated by `tools/problem_meta.py`). This is a
+transcript of the real, on-disk `~/Projects/my_cp_problems/flight/problem.json`
+— not the spec's illustrative shorthand — so it is safe to cross-check
+byte-for-byte against the shipped package rather than treated as a rounded
+example:
 
 ```jsonc
 {
   "schema": 1,
   "name": "flight",
   "title": { "vi": "Chuyến bay đầu tiên" },
-  "tags": ["probability", "strings", "automaton"],
+  "tags": ["probability", "automaton", "linear-algebra"],
   "limits": { "time_ms_published": 1000, "memory_mb": 256 },
   "io": { "input": "stdin", "output": "stdout" },
   "checker": { "kind": "stock", "name": "rcmp6" },
@@ -186,16 +199,27 @@ Required shape (schema 1, validated by `tools/problem_meta.py`):
   "subtasks": [
     { "id": "g1", "points": 40,
       "bounds": { "len_a": {"max": 6}, "len_b": {"max": 6} },
-      "constraints_text": ["|A|, |B| \\le 6"],
+      "constraints_text": ["$|A| \\le 6$ và $|B| \\le 6$"],
       "depends_on": [] },
     { "id": "g2", "points": 60,
       "bounds": {},
       "constraints_text": ["Không có ràng buộc gì thêm"],
-      "depends_on": ["g1"] }
+      "depends_on": [] }
   ],
-  "examples": []
+  "examples": [
+    { "test": "tests/samples/01",
+      "note": "Hai xâu cùng độ dài và khác nhau nên không thể hoà; p_A = 2/3." },
+    { "test": "tests/samples/02",
+      "note": "B là phần đuôi của A, nên A không bao giờ thắng: p_A = 0, hoà = 1/2." }
+  ]
 }
 ```
+
+Note `g2.depends_on` is `[]`, not `["g1"]` — the ladder's *logical* shape
+(§ above: `g2` is the unconstrained superset of `g1`) is not the same thing
+as a `depends_on` edge, which only affects Polygon's subtask dependency
+graph. `flight` doesn't declare one; a problem where a later subtask's
+scoring genuinely requires an earlier one to pass first would.
 
 Field notes, since a wrong shape here fails to load rather than fails
 quietly:
@@ -230,7 +254,8 @@ quietly:
 python3 -m tools.package_status "$PROBLEM"
 ```
 
-Run for real against the `flight` example above, starting from `/tmp` (not
+Run for real with `$PROBLEM` set to the on-disk `flight` package quoted
+above (`~/Projects/my_cp_problems/flight`), starting from `/tmp` (not
 `$PLUGIN_ROOT`) and following Bootstrap's `BASE` → `PLUGIN_ROOT` → `cd`
 exactly as written, to confirm the relative arithmetic resolves rather than
 only reads correctly. First line of output:
