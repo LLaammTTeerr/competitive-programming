@@ -85,11 +85,15 @@ with what you observe, `tools/matrix_core.py`'s `compute_limits` and
 `classify` are the single source of truth, not this paragraph:
 
 - **Timing is CPU time**, not wall clock. `TL = max(2 x t_main, 1000 ms)`,
-  rounded up to the nearest 500 ms; the sandbox kills at `2 x TL`. A result
-  landing in `[TL, 2xTL]` is **flagged, never given a verdict** — it is the
-  honest home for a result too close to call on different hardware, and it
-  is why the zoo has a `time-limit-exceeded-or-accepted` tag: a solution you
-  expect to time out but only barely goes there, not into a flat `TL`.
+  rounded up to the nearest 500 ms; the sandbox kills at `2 x TL`. The band
+  is **open on the left, closed on the right: `(TL, 2xTL]`** — a solution
+  landing exactly on `TL` is accepted outright (`classify()` only bands a
+  time strictly greater than `TL`), and the band begins one millisecond
+  above it, not at it. Anything in that open-below range is **flagged, never
+  given a verdict** — it is the honest home for a result too close to call
+  on different hardware, and it is why the zoo has a
+  `time-limit-exceeded-or-accepted` tag: a solution you expect to time out
+  but only barely goes there, not into a flat `TL`.
 - **Memory is kernel-enforced.** `--cg-mem` plus `cg-oom-killed` in isolate's
   own meta file *is* the ML signal — not a polled RSS reading compared
   against a limit after the fact.
@@ -122,19 +126,18 @@ The zoo itself is nine rows, each with a job — not just a name:
 | `wrong-answer`, overflow | `int` where `long long` is needed — kills any suite that never reaches the value bound |
 | `wrong-answer`, misread statement | e.g. start- vs end-index, off-by-one on an inclusive range |
 | `time-limit-exceeded` | correct, wrong complexity class |
-| `time-limit-exceeded-or-accepted` | the honest home for a solution expected to land in `[TL, 2xTL]` — a result too close to call on other hardware, tagged that way rather than as a flat `TL` |
+| `time-limit-exceeded-or-accepted` | the honest home for a solution expected to land in the band `(TL, 2xTL]` — strictly over `TL`, since exactly on `TL` is accepted, and too close to call on other hardware, tagged that way rather than as a flat `TL` |
 | `memory-limit-exceeded` | correct, allocates too much |
 
 `scan_solutions.py` accepts eight `@tag` values in total (confirm with
 `python3 -c "from tools.scan_solutions import TAGS; print(TAGS)"`):
 `main`, `accepted`, `wrong-answer`, `time-limit-exceeded`,
 `time-limit-exceeded-or-accepted`, `memory-limit-exceeded`,
-`presentation-error`, `failed`. The nine zoo rows above map onto six of
-those tags (`accepted` and `wrong-answer` each cover several rows); `main`
-is the reference, not a row; `presentation-error` and `failed` are
-Polygon's remaining two and are rarely needed in this pipeline (a stock
-checker never emits PE, and `failed` is for a checker/package bug, not a
-deliberately-wrong solution).
+`presentation-error`, `failed`. `accepted` and `wrong-answer` each cover
+several rows above; `main` is the reference, not a row; `presentation-error`
+and `failed` are Polygon's remaining two and are rarely needed in this
+pipeline (a stock checker never emits PE, and `failed` is for a
+checker/package bug, not a deliberately-wrong solution).
 
 Two rules make the zoo worth writing:
 
