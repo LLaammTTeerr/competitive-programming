@@ -326,5 +326,5 @@ def load(path: str | Path) -> Problem:
         checker_name=checker_name,
         constraints=constraints,
         subtasks=subtasks,
-        examples=list(_array(raw.get("examples", []), path, "'examples'")),
+        examples=[_object(e, path, f"examples[{i}]") for i, e in enumerate(_array(raw.get("examples", []), path, "'examples'"))],
     )

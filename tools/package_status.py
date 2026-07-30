@@ -67,7 +67,17 @@ def _matrix(problem_dir: Path) -> Phase:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         return Phase("matrix", False, f"invocation.json unreadable: {exc}")
-    holes, mismatches = data.get("holes", []), data.get("mismatches", [])
+    if not isinstance(data, dict):
+        return Phase("matrix", False, "invocation.json top level is not an object")
+    try:
+        holes = data.get("holes", [])
+        mismatches = data.get("mismatches", [])
+        if not isinstance(holes, list):
+            return Phase("matrix", False, "holes field is not an array")
+        if not isinstance(mismatches, list):
+            return Phase("matrix", False, "mismatches field is not an array")
+    except (TypeError, AttributeError) as exc:
+        return Phase("matrix", False, f"invocation.json malformed: {exc}")
     if holes or mismatches:
         return Phase("matrix", False,
                      f"{len(holes)} hole(s), {len(mismatches)} mismatch(es)")
