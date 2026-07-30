@@ -29,14 +29,43 @@ the fix rather than silently reverting to something unsandboxed — see
 isolate 2.x box-access model, and the trap it sets: after `--init` the box
 directory is owned by the mapped subuid at mode 0700, so files cannot be
 copied into it directly. This driver never touches that directory at all —
-every run instead bind-mounts host directories we already own straight into
-the sandbox (`--dir=<in>=<out>[:rw]`), which is unaffected by that ownership
-and is the documented way to get files in and out. The one consequence: the
-bind-mounted directory must itself be writable by *any* user (the sandboxed
-process runs as a mapped subuid that is neither our uid nor our group), so
-`.build/` is chmod'd world-writable for the run — an acceptable trade on a
-single-user jury machine, not a multi-tenant one; see the report for this
-being called out as a concern rather than silently assumed safe.
+every run instead bind-mounts host directories straight into the sandbox
+(`--dir=<in>=<out>[:rw]`), which is unaffected by that ownership and is the
+documented way to get files in and out.
+
+Task 9b's own review found and this driver now avoids a second trap in the
+same neighbourhood: an *earlier* version of this module bind-mounted real
+repository directories (`tests/<group>/`, `.build/`) as the `:rw` target so
+the sandboxed process could write its stdout (the regenerated `.a` answer
+file, a solution's `.out`) directly into them. That "worked" but was wrong
+in a way `git status` cannot see, because both paths are gitignored: the
+sandboxed process runs as a mapped subuid that is neither our uid nor our
+group, so making a directory writable to it meant granting the repo
+directory an `o+w` bit that was never restored, and every file the sandbox
+created inside it came back owned by that subuid — not us, not writable or
+even `chmod`-able by us afterward. That is permanent, silent damage to the
+user's working tree: `chmod -R`, `rsync -p`, `tar --same-owner`, or a
+CI rewrite of the checkout would all fail on those files, and — worse —
+`tests/<group>/` at `o+rwx` on a shared jury machine means any local
+account could substitute test inputs or answer keys for a problem still
+under preparation. This driver instead gives every `--run` a *private*
+staging directory (`IsolateHandle.stage_dir`, one `mkdtemp` per `run()`,
+world-writable — which is harmless there, since it is ours, ephemeral, and
+outside the repository entirely) as the only `:rw` mount; the binary's and
+the test input's directories are mounted read-only. After each run, the
+staged output is copied back into the repository with an ordinary
+`Path.write_bytes()` call from *this* (unprivileged) process — never
+bind-mounted — so every artifact that lands in the user's tree keeps its
+normal ownership and the repo directory's own mode is never touched. The
+copy always unlinks the destination first (`stdout_dest.unlink(missing_ok=
+True)`, relying only on directory-write permission, which this process
+already has as the owner), which doubles as a self-heal for a repo already
+damaged by the old behaviour: a stale, foreign-owned `.a`/`.out` left over
+from a previous run of this driver is simply replaced, not fought with.
+`_ensure_dir_traversable()` similarly self-heals the directory-mode half of
+that damage — it strips any stray `o+w` bit left on `tests/<group>/` or
+`.build/` while granting the `o+x` (traverse) bit these read-only mounts
+still need, every time `run()` starts.
 
 Meta-file contract this module parses (all four cases verified against the
 isolate 2.6 build on this machine, not read off documentation):
@@ -63,6 +92,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -145,6 +175,12 @@ class IsolateHandle:
     mount view fresh on each `--run`, so this is safe — verified by
     running two different test groups through one inited box with no
     `--cleanup`/`--init` between them).
+
+    `stage_dir` is a private `mkdtemp()` directory, outside the repository,
+    that is the *only* `:rw` mount any `--run` ever uses — see the module
+    docstring for why a real repo directory must never be the write target
+    again. It lives and dies with the box: created in `open_isolate_box()`,
+    removed in `close_isolate_box()`.
     """
 
     binary: str
@@ -152,6 +188,7 @@ class IsolateHandle:
     version: str
     cg: bool
     meta_path: Path
+    stage_dir: Path
 
 
 def _isolate_binary_name() -> str:
@@ -176,6 +213,17 @@ def _select_box_id() -> int:
     concurrently-running run_matrix invocation whose pid happens to differ
     by an exact multiple of 65536 — vanishingly unlikely at the scale this
     pipeline runs at, and far simpler than a lockfile/allocator.
+
+    And even that unlikely collision cannot produce a *wrong verdict*, only
+    a loud one: `--init` on a box id that is already open is idempotent (it
+    returns 0, reusing/reinitializing the same box) rather than failing, so
+    two colliding invocations don't fail here — they fail later, when their
+    concurrent `--run`s and `--cleanup`s race on the same box directory.
+    The worst case observed for that kind of collision is isolate itself
+    reporting an internal error for one side (e.g. "Box not found" /
+    `status:XX`), which `_run_once` already turns into a `MatrixError`
+    naming isolate's own failure (see its docstring) — never a misreported
+    verdict on a solution.
     """
     return os.getpid() % 65536
 
@@ -227,8 +275,16 @@ def open_isolate_box() -> IsolateHandle:
 
     meta_fd, meta_name = tempfile.mkstemp(prefix="run_matrix_isolate_meta_")
     os.close(meta_fd)
+
+    # The only `:rw` mount any `--run` will ever use (see module docstring:
+    # a real repo directory must never be the write target again). Private,
+    # ours, outside the repository, and deleted whole in `close_isolate_box`
+    # — world-writable is harmless on a directory with that lifetime.
+    stage_dir = Path(tempfile.mkdtemp(prefix="run_matrix_isolate_stage_"))
+    os.chmod(stage_dir, 0o777)
+
     return IsolateHandle(binary=binary, box_id=box_id, version=version, cg=True,
-                         meta_path=Path(meta_name))
+                         meta_path=Path(meta_name), stage_dir=stage_dir)
 
 
 def close_isolate_box(handle: IsolateHandle) -> None:
@@ -236,8 +292,9 @@ def close_isolate_box(handle: IsolateHandle) -> None:
 
     Always called from a `finally`, so a cleanup failure here must not mask
     whatever real error (or real result) is already propagating — the
-    concern this guards is a leaked box under `/var/local/lib/isolate/`,
-    not a crash in the cleanup call itself.
+    concern this guards is a leaked box under `/var/local/lib/isolate/` (or
+    a leaked staging directory under `/tmp`), not a crash in the cleanup
+    call itself.
     """
     subprocess.run([handle.binary, "--cg", f"--box-id={handle.box_id}", "--cleanup"],
                     capture_output=True, text=True)
@@ -245,6 +302,11 @@ def close_isolate_box(handle: IsolateHandle) -> None:
         handle.meta_path.unlink(missing_ok=True)
     except OSError:
         pass
+    # stage_dir may contain files the sandboxed subuid created — deletable
+    # regardless of who owns them, because we own the directory itself
+    # (verified: see module docstring / task report). ignore_errors so a
+    # teardown problem here still cannot mask a real error propagating.
+    shutil.rmtree(handle.stage_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +333,17 @@ class RunResult:
     this ratio-based model); `wall_ms` (`time-wall`) is carried alongside
     purely so `invocation.json` records both and is never ambiguous about
     which clock produced a reading.
+
+    `status` (the raw meta field, `""` when absent — i.e. OK) and `message`
+    (isolate's own prose, e.g. "Time limit exceeded (wall clock)") are kept
+    verbatim rather than boiled down further, specifically so a *diagnostic*
+    built from a `RunResult` (a crash report, a kill report) can quote
+    isolate's own account of what happened instead of reconstructing it —
+    review found two ways reconstructing it from `killed`/`crashed`/
+    `exit_code` alone went wrong: a signal death has no `exitcode` line, so
+    defaulting to 0 read as "exited 0" (looks like success); and `killed`
+    alone can't tell a CPU-time kill from a wall-time kill, which matters
+    for pass 1's diagnostic naming the *right* limit it tripped.
     """
 
     cpu_ms: int
@@ -280,6 +353,8 @@ class RunResult:
     crashed: bool
     exit_code: int
     peak_kb: int
+    status: str
+    message: str
 
 
 def _parse_meta(text: str) -> dict[str, str]:
@@ -292,34 +367,57 @@ def _parse_meta(text: str) -> dict[str, str]:
     return meta
 
 
+# isolate's default without `--processes` is already a single process — but
+# an *inherited* default is not the same as a *chosen* one. A judge that
+# limits CPU time and memory almost always limits process/thread count too
+# (most stock judges reject a std::thread solution outright), so pinning
+# this to 1 explicitly makes "this driver does not sandbox multi-process
+# solutions" a documented decision with a name attached, rather than
+# something a reader has to know isolate's own default to discover. A
+# solution that spawns a second thread now dies (pthread_create fails,
+# typically an uncaught exception or abort) and is recorded as RE — a
+# real behaviour change from the old posix_spawn driver, which imposed no
+# such limit; flagged in the task report rather than left undisclosed.
+ISOLATE_PROCESSES = 1
+
+
 def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
-              stdout_path: Path, cpu_limit_s: float, wall_limit_s: float,
+              stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
               mem_limit_kb: int) -> RunResult:
     """Run one process inside `isolate`'s sandbox and return its verdict.
 
-    `binary`, `stdin_path`, and `stdout_path` may live in up to three
-    distinct directories — pass 1 in particular reads from and writes to
-    `tests/<group>/` directly (regenerating the `.a` answer file there),
-    while pass 2 reads from `tests/<group>/` but writes into `.build/`
-    alongside the binaries. Each distinct parent directory gets its own
-    bind mount (isolate supports repeated `--dir=<in>=<out>` rules, verified
-    manually); directories that coincide (e.g. binary and stdout both under
-    `.build/` in pass 2) are only mounted once. Only the directory holding
-    `stdout_path` needs `:rw` — the sandboxed process only ever *creates* a
-    file there, never in the binary's or stdin's directory.
+    `binary`'s and `stdin_path`'s directories are mounted **read-only**
+    (deduplicated by resolved path when they coincide, e.g. pass 2's
+    binary and the checker's binary both under `.build/`) — the sandboxed
+    process never needs to write anywhere inside them. The *only* `:rw`
+    mount is `isolate.stage_dir`, a private staging directory that lives
+    outside the repository for the whole `run()` invocation (see
+    `IsolateHandle`); every `--run` writes its stdout there under a fixed
+    name, and this function copies the result back to `stdout_dest` itself,
+    as this (unprivileged) process, immediately afterward.
 
-    Before running, `stdout_path` is unlinked if it already exists. isolate
-    2.x's box-access model hands files it creates to a *mapped subuid*
-    (`200000 + box_id`, not our own uid), so a stale file left over from an
-    earlier invocation — possibly created under a different box_id, hence a
-    different subuid, hence not writable by this run's subuid even under a
-    world-writable directory — could otherwise make an ordinary re-run of
-    this driver fail with a permission error. Unlinking depends only on the
-    *directory's* write permission, which we do own, so this is safe
-    regardless of who owns the stale file.
+    This is the fix for a real bug an earlier version of this module had:
+    bind-mounting a real `tests/<group>/` or `.build/` directory as the
+    `:rw` target meant the sandboxed subuid — not us — created the file
+    that ended up in the user's working tree, which is permanent,
+    `git status`-invisible damage (both paths are gitignored) that
+    `chmod -R`/`rsync -p`/`tar --same-owner` all trip over afterward. See
+    the module docstring and the task report for the measured before/after.
+
+    The copy-back always unlinks `stdout_dest` first
+    (`stdout_dest.unlink(missing_ok=True)` then `write_bytes`), which needs
+    only *directory* write permission — something this process already has,
+    as the owner — never the target file's own permission bits. That also
+    means this call self-heals a `stdout_dest` left over from the old,
+    buggy behaviour (foreign-owned, possibly not writable by us at all): it
+    is simply replaced, not fought with.
+
+    The staged file itself is unlinked before the sandboxed run (in case a
+    previous call left stale content there) and after the copy-back (so
+    `isolate.stage_dir` doesn't accumulate one file per call across a whole
+    `run()`); both unlinks rely only on `stage_dir`'s own permissions,
+    which this process set to 0o777 when it created it.
     """
-    stdout_path.unlink(missing_ok=True)
-
     mounts: dict[Path, str] = {}
 
     def _label(path: Path) -> str:
@@ -330,22 +428,25 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
 
     bin_label = _label(binary.parent)
     stdin_label = _label(stdin_path.parent)
-    stdout_label = _label(stdout_path.parent)
-    write_dir = stdout_path.parent.resolve()
+    stage_label = _label(isolate.stage_dir)
+    stage_dir_resolved = isolate.stage_dir.resolve()
+
+    staged_out = isolate.stage_dir / "run.out"
+    staged_out.unlink(missing_ok=True)
 
     cmd = [
         isolate.binary, "--cg", f"--box-id={isolate.box_id}", "--run",
-        f"--meta={isolate.meta_path}",
+        f"--meta={isolate.meta_path}", f"--processes={ISOLATE_PROCESSES}",
         f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
         f"--cg-mem={mem_limit_kb}",
     ]
     for resolved, label in mounts.items():
-        opt = ":rw" if resolved == write_dir else ""
+        opt = ":rw" if resolved == stage_dir_resolved else ""
         cmd.append(f"--dir={label}={resolved}{opt}")
     cmd += [
         f"--chdir={bin_label}",
         f"--stdin={stdin_label}/{stdin_path.name}",
-        f"--stdout={stdout_label}/{stdout_path.name}",
+        f"--stdout={stage_label}/{staged_out.name}",
         "--", f"{bin_label}/{binary.name}",
     ]
 
@@ -369,7 +470,7 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         )
     meta = _parse_meta(meta_text)
 
-    status = meta.get("status")  # absent -> OK; see module docstring trap 1
+    status = meta.get("status", "")  # absent -> OK; see module docstring trap 1
     if status == "XX":
         raise MatrixError(
             f"isolate reported an internal error (status XX) running "
@@ -380,6 +481,7 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     oom = meta.get("cg-oom-killed") == "1"  # must be tested before treating
     killed = status == "TO"                 # SG as a plain crash (trap 2)
     crashed = (not oom) and status in ("RE", "SG")
+    message = meta.get("message", "")
 
     try:
         cpu_ms = int(round(float(meta.get("time", "0")) * 1000))
@@ -392,27 +494,41 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             f"{meta!r} ({exc})"
         ) from exc
 
+    # Copy the sandboxed output back into the repository as *this* process
+    # — never write it through a bind mount again (see docstring above).
+    try:
+        data = staged_out.read_bytes()
+    except FileNotFoundError:
+        data = b""
+    stdout_dest.unlink(missing_ok=True)
+    stdout_dest.write_bytes(data)
+    staged_out.unlink(missing_ok=True)
+
     return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
-                      crashed=crashed, exit_code=exit_code, peak_kb=peak_kb)
+                      crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
+                      status=status, message=message)
 
 
 def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
-                  stdout_path: Path, cpu_limit_s: float, wall_limit_s: float,
+                  stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
                   mem_limit_kb: int, runs: int) -> RunResult:
     """Median the CPU/wall time over `runs` runs; any bad outcome wins.
 
     `killed`/`oom`/`crashed` are all sticky-OR (never cleared once True) and
-    `exit_code` is sticky-first-nonzero — mirroring the old driver's
-    reasoning for the model solution specifically: a run that fails once
-    and happens to succeed on a later retry must not have that failure
-    silently overwritten, or a flaky answer file could pass as jury truth.
+    `exit_code`/`status`/`message` are sticky-first-nonempty — mirroring the
+    old driver's reasoning for the model solution specifically: a run that
+    fails once and happens to succeed on a later retry must not have that
+    failure silently overwritten, or a flaky answer file could pass as jury
+    truth, and the diagnostic for that failure must survive to be reported
+    even though it happened on an earlier iteration than the last one.
     """
     cpu_samples, wall_samples = [], []
     killed = oom = crashed = False
     exit_code = 0
+    status = message = ""
     peak = 0
     for _ in range(runs):
-        r = _run_once(isolate, binary, stdin_path, stdout_path,
+        r = _run_once(isolate, binary, stdin_path, stdout_dest,
                       cpu_limit_s, wall_limit_s, mem_limit_kb)
         cpu_samples.append(r.cpu_ms)
         wall_samples.append(r.wall_ms)
@@ -420,12 +536,15 @@ def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         oom = oom or r.oom
         crashed = crashed or r.crashed
         exit_code = exit_code or r.exit_code
+        status = status or r.status
+        message = message or r.message
         peak = max(peak, r.peak_kb)
     return RunResult(
         cpu_ms=int(statistics.median(cpu_samples)),
         wall_ms=int(statistics.median(wall_samples)),
         killed=killed, oom=oom, crashed=crashed,
         exit_code=exit_code, peak_kb=peak,
+        status=status, message=message,
     )
 
 
@@ -471,22 +590,51 @@ def _ensure_sandbox_readable(path: Path) -> None:
     umask a real problem package happened to be created under. This
     matters beyond the checked-in fixture (which already satisfies it by
     luck of the default 022 umask): a stricter umask must not turn into a
-    silent, spurious sandbox permission failure.
+    silent, spurious sandbox permission failure. Never grants write — every
+    directory this driver hands to the sandbox is now read-only (see
+    `_ensure_dir_traversable` and the module docstring); the only `:rw`
+    mount is the private staging directory in `IsolateHandle`.
     """
     os.chmod(path, path.stat().st_mode | 0o004)
 
 
-def _ensure_sandbox_writable_dir(path: Path) -> None:
-    """Make a directory fully open to the sandbox: traverse, read, create.
+def _ensure_sandbox_executable(path: Path) -> None:
+    """Grant "other" read+execute on a compiled binary the sandbox must run.
 
-    `tests/<group>/` is not just read from — pass 1 writes the model
-    solution's stdout straight into `<test>.a` there (regenerating the
-    answer key), so the sandboxed subuid needs to be able to create files
-    in it, the same way `.build/` needs to be world-writable for pass 2's
-    outputs (see `run()`). Same trade-off, same acceptance: fine on a
-    single-user jury machine, not something to assume safe on a shared one.
+    Defensive, for the same reason as `_ensure_sandbox_readable`: a
+    stricter umask than this machine's could otherwise produce a binary
+    without the "other" bits g++'s default output happens to carry, and
+    that must be a granted permission, not a silent, spurious exec failure.
     """
-    os.chmod(path, path.stat().st_mode | 0o007)
+    os.chmod(path, path.stat().st_mode | 0o005)
+
+
+def _ensure_dir_traversable(path: Path) -> None:
+    """Grant "other" traverse (search) access to a directory the sandbox
+    reads through — and, just as importantly, strip any stray "other"
+    write bit already sitting on it.
+
+    Every directory this driver bind-mounts is read-only now (see the
+    module docstring): the sandboxed subuid only ever needs to look up a
+    file by exact name inside it (`os.execve`/`open` by path), which is
+    what the directory's own *execute* bit controls on Linux — not its
+    read bit (that only gates directory *listing*, e.g. `ls`), and
+    certainly not its write bit, which this driver never has a reason to
+    grant to a real repository directory again.
+
+    The `& ~stat.S_IWOTH` half of this is a deliberate self-heal, not just
+    a guard: an earlier version of this module *did* grant that bit (to
+    bind-mount `tests/<group>/` and `.build/` read-write, so the sandboxed
+    process could write its own stdout there) and never restored it,
+    leaving real problem directories at `o+w` permanently. Every `run()`
+    from here on strips that bit back off its own accord, so a problem
+    directory that was damaged by the old behaviour heals the next time
+    this tool touches it — no separate migration step required.
+    """
+    mode = path.stat().st_mode
+    healed = (mode | stat.S_IXOTH) & ~stat.S_IWOTH
+    if healed != mode:
+        path.chmod(healed)
 
 
 def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
@@ -528,42 +676,63 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
             "wrong verdict instead of failing loudly. Supporting file IO "
             "is a later feature, not something to run silently-wrong now.)"
         )
-    manifest = scan(problem_dir, problem)
-
-    build = problem_dir / ".build"
-    build.mkdir(exist_ok=True)
-    # World-writable: the sandboxed process creates its stdout file (and any
-    # scratch it likes) here, and it runs as a mapped subuid that is neither
-    # our uid nor our group (see module docstring) — 0700/0755 would give it
-    # nowhere to write. Acceptable on a single-user jury machine; called out
-    # as a concern in the task report rather than assumed safe silently.
-    os.chmod(build, 0o777)
-
-    if problem.checker_kind == "stock":
-        checker_src = testlib_dir / "checkers" / f"{problem.checker_name}.cpp"
-    else:
-        checker_src = problem_dir / "files" / problem.checker_name
-    checker = build / "checker"
-    _compile(checker_src, checker, ["-Wpedantic", "-Werror", f"-I{testlib_dir}"],
-             context=f"checker ({problem.checker_name})")
-
-    binaries = {}
-    for entry in manifest["solutions"]:
-        binary = build / Path(entry["file"]).stem
-        _compile(problem_dir / "solutions" / entry["file"], binary,
-                  context=f"solution {entry['file']}")
-        binaries[entry["file"]] = binary
-
-    main_file = next(e["file"] for e in manifest["solutions"] if e["tag"] == "main")
-    tests = _tests_by_group(problem_dir, problem)
-    for paths in tests.values():
-        _ensure_sandbox_writable_dir(paths[0].parent)
-        for test in paths:
-            _ensure_sandbox_readable(test)
-
-    mem_limit_kb = problem.memory_mb * 1024
+    # Task 9b review, aggravating detail: an earlier version of this
+    # function only discovered whether isolate was even usable *after*
+    # already compiling every solution and touching the tree — so a
+    # refuse-to-run (isolate missing or unconfigured) still left `.build/`
+    # and its binaries behind, on a path that was never going to reach the
+    # sandbox at all. Opening the box first means a refusal here is a true
+    # no-op on the tree: nothing is compiled, nothing is chmod'd, nothing
+    # is created. (`--init`/`--cleanup` themselves only touch
+    # `/var/local/lib/isolate/`, never this problem's directory.)
     isolate = open_isolate_box()
     try:
+        manifest = scan(problem_dir, problem)
+
+        build = problem_dir / ".build"
+        build.mkdir(exist_ok=True)
+        # Read-only from the sandbox's perspective — it only ever needs to
+        # look up and exec a binary here by name, never write.
+        # `_ensure_dir_traversable` also self-heals a `.build/` left `o+w`
+        # by an earlier version of this module that bind-mounted it
+        # read-write (see module docstring); this driver never grants that
+        # bit to a real repo directory again.
+        _ensure_dir_traversable(build)
+
+        if problem.checker_kind == "stock":
+            checker_src = testlib_dir / "checkers" / f"{problem.checker_name}.cpp"
+        else:
+            checker_src = problem_dir / "files" / problem.checker_name
+        checker = build / "checker"
+        _compile(checker_src, checker, ["-Wpedantic", "-Werror", f"-I{testlib_dir}"],
+                 context=f"checker ({problem.checker_name})")
+        # The checker itself is never sandboxed (`_check` runs it directly,
+        # as this process, per ruling 5) — no permission grant needed.
+
+        binaries = {}
+        for entry in manifest["solutions"]:
+            binary = build / Path(entry["file"]).stem
+            _compile(problem_dir / "solutions" / entry["file"], binary,
+                      context=f"solution {entry['file']}")
+            _ensure_sandbox_executable(binary)
+            binaries[entry["file"]] = binary
+
+        main_file = next(e["file"] for e in manifest["solutions"] if e["tag"] == "main")
+        tests = _tests_by_group(problem_dir, problem)
+        for paths in tests.values():
+            # Read-only for the same reason as `.build/` above: pass 1's
+            # regenerated `.a` answer file is no longer written through
+            # this bind mount (see `_run_once` and the module docstring) —
+            # it is copied back by this process afterward, so the
+            # directory itself never needs an `o+w` bit, and this call
+            # self-heals one left by the earlier, buggy version of this
+            # module.
+            _ensure_dir_traversable(paths[0].parent)
+            for test in paths:
+                _ensure_sandbox_readable(test)
+
+        mem_limit_kb = problem.memory_mb * 1024
+
         # Pass 1 — the model solution defines both the answers and the
         # limits. The 60s/90s CPU/wall ceiling here is a hard safety cap,
         # not a real limit: the real TL/kill only exist once this pass has
@@ -585,18 +754,43 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                                  MODEL_SAFETY_CPU_S, MODEL_SAFETY_WALL_S,
                                  mem_limit_kb, runs)
                 if r.killed:
+                    # isolate's own `status:TO` fires for either a CPU-time
+                    # kill or a wall-time kill, and this pass has two
+                    # different safety ceilings for them — the message
+                    # text is what tells them apart ("Time limit exceeded"
+                    # vs "Time limit exceeded (wall clock)", verified
+                    # against a real sleep()-bound run; see the task
+                    # report), so it, not a hardcoded guess, picks which
+                    # limit to name here.
+                    if "wall clock" in r.message.lower():
+                        kind, limit_ms = "wall-clock", int(MODEL_SAFETY_WALL_S * 1000)
+                    else:
+                        kind, limit_ms = "CPU", int(MODEL_SAFETY_CPU_S * 1000)
                     raise MatrixError(
-                        f"model solution did not finish within "
-                        f"{int(MODEL_SAFETY_CPU_S * 1000)} ms CPU time on "
-                        f"{test} (hard safety kill during pass 1, before "
-                        "real limits exist)")
+                        f"model solution did not finish within {limit_ms} ms "
+                        f"{kind} time on {test} (hard safety kill during "
+                        "pass 1, before real limits exist; isolate reported: "
+                        f"{r.message or '(no message)'})")
                 if r.oom:
                     raise MatrixError(
                         f"model solution exceeded the memory limit "
                         f"({problem.memory_mb} MB) on {test}")
                 if r.crashed or r.exit_code != 0:
+                    # A signal death (status SG, a real segfault/abort, not
+                    # an OOM — that's handled above) carries no `exitcode`
+                    # line at all, so defaulting it to 0 and reporting
+                    # "exited 0" would read as a bug in this check rather
+                    # than a crashing model solution. Quote isolate's own
+                    # status/message instead of reconstructing one.
+                    detail = f"status {r.status or 'RE'}"
+                    if r.message:
+                        detail += f", {r.message}"
+                    elif r.status != "SG":
+                        detail += f", exitcode {r.exit_code}"
                     raise MatrixError(
-                        f"model solution exited {r.exit_code} on {test}")
+                        f"model solution crashed on {test} ({detail}) — a "
+                        "solution that exits abnormally cannot define the "
+                        "jury's expected timing or answers")
                 t_main[f"{group}/{test.stem}"] = r.cpu_ms
 
         limits = compute_limits(t_main)

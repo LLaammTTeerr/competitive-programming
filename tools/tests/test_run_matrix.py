@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -39,6 +40,19 @@ from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
 BOOTSTRAP_SCRIPT = Path(__file__).resolve().parents[1] / "bootstrap_testlib.sh"
+
+# scan_solutions requires every solution file to carry this metadata block
+# (@tag/@expect/...); tests that overwrite sol-main.cpp's body with a
+# throwaway misbehaving program must keep it, or scan() fails before
+# run_matrix ever gets to compile anything.
+_MAIN_HEADER = (
+    "/**\n"
+    " * @tag        main\n"
+    " * @expect     g1=OK\n"
+    " * @algorithm  Deliberately misbehaving stand-in for a test.\n"
+    " * @complexity O(1)\n"
+    " */\n"
+)
 
 
 def _compile(src_text: str, out_path: Path, tmp_dir: Path) -> Path:
@@ -317,8 +331,13 @@ class TestRunMatrixFixture(unittest.TestCase):
     def test_boxes_are_cleaned_up_after_a_real_run(self):
         # A box leaked under /var/local/lib/isolate/<id> is exactly the
         # failure mode a `finally`-guarded `--cleanup` exists to prevent —
-        # confirm it is actually gone after a real fixture run, including
-        # the exception path (this run raises via the hole-firing input).
+        # confirm it is actually gone after a clean run and after a
+        # hole-firing one. Neither of these actually *raises* out of
+        # run() (the hole-firing input still returns a payload, it just
+        # reports a hole) — see
+        # test_boxes_are_cleaned_up_after_run_raises below for the path
+        # that does raise, which review found this test's old comment
+        # claimed to cover but did not.
         box_dir = Path("/var/local/lib/isolate/54321")
         with mock.patch.object(run_matrix, "_select_box_id", return_value=54321):
             run_matrix.run(self.problem_dir, self.testlib_dir)
@@ -331,6 +350,109 @@ class TestRunMatrixFixture(unittest.TestCase):
             self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
             self.assertFalse(box_dir.exists(),
                              f"{box_dir} still present after a hole-firing run")
+
+    def test_boxes_are_cleaned_up_after_run_raises(self):
+        # Task 9b review finding D: the test above never actually drives
+        # run() through its exception path (`finally: close_isolate_box`
+        # in run()) — both of its calls return normally. Force a genuine
+        # raise by replacing the model solution with a source that
+        # segfaults, so pass 1's `r.crashed` branch raises MatrixError
+        # out of the middle of the `try`, and confirm cleanup still fired.
+        (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
+            _MAIN_HEADER + "int main(){ int *p = nullptr; *p = 1; return 0; }\n",
+            encoding="utf-8")
+        box_dir = Path("/var/local/lib/isolate/54322")
+        with mock.patch.object(run_matrix, "_select_box_id", return_value=54322):
+            with self.assertRaises(run_matrix.MatrixError):
+                run_matrix.run(self.problem_dir, self.testlib_dir)
+            self.assertFalse(box_dir.exists(),
+                             f"{box_dir} still present after run() raised")
+
+    def test_crashing_model_solution_is_diagnosed_as_crashed_not_exited_0(self):
+        # Task 9b review finding A: a signal death (status SG) carries no
+        # `exitcode` line in isolate's meta file, so defaulting exit_code
+        # to 0 and reporting "exited 0" reads like a bug in the check
+        # itself rather than a crashing model solution. The message must
+        # name the crash, not claim a clean exit.
+        (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
+            _MAIN_HEADER + "int main(){ int *p = nullptr; *p = 1; return 0; }\n",
+            encoding="utf-8")
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+        message = str(ctx.exception)
+        self.assertIn("crashed", message)
+        self.assertNotIn("exited 0", message)
+
+    def test_pass1_wall_clock_kill_names_the_wall_limit_not_cpu(self):
+        # Task 9b review finding B: isolate reports status:TO for both a
+        # CPU-time kill and a wall-time kill, and the old diagnostic
+        # always blamed MODEL_SAFETY_CPU_S regardless of which one
+        # actually fired. A model solution that sleeps (near-zero CPU
+        # time, real wall time) must be blamed for the wall-clock ceiling,
+        # not told it burned 60 seconds of CPU it never used. Patches the
+        # wall ceiling down to make this fast and deterministic rather
+        # than sleeping for the real 90s default.
+        (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
+            _MAIN_HEADER + "#include <unistd.h>\nint main(){ sleep(3); return 0; }\n",
+            encoding="utf-8")
+        with mock.patch.object(run_matrix, "MODEL_SAFETY_WALL_S", 1.0):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.run(self.problem_dir, self.testlib_dir)
+        message = str(ctx.exception)
+        self.assertIn("wall-clock", message)
+        self.assertNotIn("CPU time", message)
+
+    def test_solution_output_lands_in_repo_owned_by_us_not_a_subuid(self):
+        # Task 9b review's Critical finding: an earlier version of this
+        # driver bind-mounted tests/<group>/ and .build/ read-write, so
+        # every file the sandbox created there (the regenerated .a answer
+        # file, a solution's .out) came back owned by the mapped subuid —
+        # not us, not writable or chmod-able by us afterward — and the
+        # directory itself was left permanently o+w. Confirm both halves
+        # are fixed: ownership and mode.
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertTrue(payload["results"])
+
+        my_uid = os.getuid()
+        answer_files = list((self.problem_dir / "tests" / "g1").glob("*.a"))
+        self.assertTrue(answer_files)
+        for answer in answer_files:
+            st = answer.stat()
+            self.assertEqual(st.st_uid, my_uid,
+                             f"{answer} is owned by uid {st.st_uid}, not ours "
+                             f"({my_uid}) — the ownership-transfer bug")
+            self.assertTrue(os.access(answer, os.W_OK),
+                            f"{answer} is not writable by us")
+
+        out_files = list((self.problem_dir / ".build").glob("*.out"))
+        self.assertTrue(out_files)
+        for out in out_files:
+            st = out.stat()
+            self.assertEqual(st.st_uid, my_uid,
+                             f"{out} is owned by uid {st.st_uid}, not ours")
+
+        tests_mode = stat.S_IMODE((self.problem_dir / "tests" / "g1").stat().st_mode)
+        self.assertFalse(tests_mode & stat.S_IWOTH,
+                         "tests/g1 was left world-writable by run()")
+        build_mode = stat.S_IMODE((self.problem_dir / ".build").stat().st_mode)
+        self.assertFalse(build_mode & stat.S_IWOTH,
+                         ".build was left world-writable by run()")
+
+    def test_run_heals_a_directory_damaged_by_the_old_read_write_mount(self):
+        # Simulate exactly the damage the old behaviour left behind (a
+        # stray o+w bit on tests/<group>/, verified for real on this
+        # machine's own fixture prior to this fix — see the task report)
+        # and confirm a fresh run() strips it back off rather than
+        # perpetuating or ignoring it.
+        group_dir = self.problem_dir / "tests" / "g1"
+        group_dir.chmod(stat.S_IMODE(group_dir.stat().st_mode) | stat.S_IWOTH)
+        self.assertTrue(stat.S_IMODE(group_dir.stat().st_mode) & stat.S_IWOTH)
+
+        run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        healed_mode = stat.S_IMODE(group_dir.stat().st_mode)
+        self.assertFalse(healed_mode & stat.S_IWOTH,
+                         "run() did not heal a pre-existing o+w directory")
 
 
 if __name__ == "__main__":
