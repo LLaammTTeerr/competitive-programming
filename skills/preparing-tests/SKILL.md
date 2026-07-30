@@ -49,6 +49,7 @@ Substitute that literal path for `BASE` below:
 ```bash
 BASE="<the path from this skill's own 'Base directory for this skill' line>"
 PLUGIN_ROOT="$BASE/../.."
+PROBLEM="<absolute path to the problem directory you are preparing>"
 TESTLIB="$(bash "$PLUGIN_ROOT/tools/bootstrap_testlib.sh")"
 cd "$PLUGIN_ROOT"
 ```
@@ -57,6 +58,15 @@ Every `python3 -m tools.*` command below is a module inside `tools/`, which
 is only importable with `PLUGIN_ROOT` as the working directory — `cd` there
 first, or every invocation fails with `ModuleNotFoundError: No module named
 'tools'` before it does anything.
+
+Two different directories matter from here on, and neither is implicit:
+`python3 -m tools.*` always runs from `$PLUGIN_ROOT` and takes `$PROBLEM` as
+an argument, so it is unaffected by where the problem lives. Everything
+problem-relative — compiling `validator.cpp` and `gen-*.cpp`, running the
+validator over test files, writing `files/` and `tests/` — happens **inside
+`$PROBLEM`**. Keep `$PROBLEM` set and pass it explicitly in every command
+below rather than relying on whatever directory the previous command left
+you in.
 
 Then **read `$TESTLIB/docs/usage-guide.md` for the API and `$TESTLIB/plan.md`
 for known defects** before writing a line of `validator.cpp`, `check.cpp`, or
@@ -146,7 +156,7 @@ Two rules regardless of stock or custom:
 `files/constraints.h` is generated, not written:
 
 ```bash
-python3 -m tools.gen_constraints_header <problem-dir>
+python3 -m tools.gen_constraints_header "$PROBLEM"
 ```
 
 It reads `problem.json`'s `constraints` (global bounds) and each subtask's
@@ -204,7 +214,7 @@ int main(int argc, char* argv[]) {
 Once the validator exists, drift-check the statement against it:
 
 ```bash
-python3 -m tools.drift_check <problem-dir> <statement.tex>
+python3 -m tools.drift_check "$PROBLEM" <statement.tex>
 ```
 
 This catches `problem.json`'s limits, IO mode, or subtask point totals
