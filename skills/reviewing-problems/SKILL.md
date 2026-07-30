@@ -22,7 +22,8 @@ never redoes it by hand. The judgement half — is any sentence in the
 statement readable two ways, does a term get used as though the reader
 already knows it, does an `@algorithm` comment claim an invariant with no
 argument behind it, does the checker actually match what the statement
-promises — is what this skill exists for, because no tool can do it.
+promises, is every declared bound actually attained by some test — is what
+this skill exists for, because no tool can do it.
 
 ## Am I the right skill?
 
@@ -92,7 +93,7 @@ attention for the half a tool genuinely cannot do.
 
 ## The judgement half — this is what the skill is for
 
-Four classes. None of them can be answered by a diff, a schema check, or a
+Five classes. None of them can be answered by a diff, a schema check, or a
 string comparison — each one requires reading the prose or the code the way
 a contestant, or the compiler, actually will.
 
@@ -151,20 +152,62 @@ other (`drift_check` compares `problem.json` to the `.tex`); it does not
 read English or Vietnamese prose to see whether `wcmp` is the wrong stock
 checker for a problem that promises a numeric tolerance.
 
+### 5. Unreached bounds
+
+A declared bound that no test actually attains — the suite claims a limit it
+never tests. `review_checks` does not check this; it is a hole in an
+*earlier* phase (`preparing-tests`'s own reaching check) that this audit
+re-verifies rather than trusting was done. Re-run the same mechanism
+`preparing-tests` documents, per group, instead of assuming it was run
+correctly the first time:
+
+```bash
+"$PROBLEM/validator" --testset tests --group g1 \
+    --testOverviewLogFileName "$PROBLEM/g1-overview.log" < "$PROBLEM/tests/g1/01.in"
+# repeat for every test in the group (or loop over the group), then read
+# the log for any declared bound whose min-value-hit / max-value-hit line
+# never appears
+```
+
+**Known limitation, inherited from `preparing-tests`'s own dogfood
+finding:** this only sees bounds read as *numbers* — `readInt`/`readLong`/
+`readDouble` with an explicit min/max register a hit line; a length bound
+expressed via `readToken(pattern, "A")` (`flight`'s own `1 <= |A| <= 20`
+shape) registers only a bare `variable "A"` line with no hit tracking at
+all, so a clean log for that variable means "this mechanism cannot see this
+bound," not "nothing to report." For any such bound, inspect the tests
+directly instead:
+
+```bash
+awk 'FNR==1{print length($1)}' "$PROBLEM"/tests/g1/*.in | sort -n | sed -n '1p;$p'
+# first line is the shortest value in the group, second the longest;
+# compare both against the declared bound by hand
+```
+
+A bound that turns out unreached is a `test-weakness` flag — hand it back to
+`preparing-tests` for a test that closes it; this audit records the gap, it
+does not grow the test suite itself.
+
 ## Run as a subagent with fresh context, not inline
 
-**Invoke `superpowers:requesting-code-review`** to dispatch this half: hand
-a fresh subagent the problem directory and the four classes above, and let
-it read the package the way a contestant would, with none of the context
-that produced the package in the first place. This is not optional
-convenience — it is the whole reason this skill exists as a separate step
-rather than a final read-through by whoever just finished writing the
-statement. A reviewer that inherited the assumptions of the agent that wrote
-the statement **cannot see the assumed definition**: the `xâu con` example
-above survived exactly this — its own author's verification pass — because
-the author already knew which reading was meant and read the sentence
-through that knowledge rather than against it. Dispatching with fresh
-context is what makes the difference between a rubber-stamp and a review.
+**Invoke `superpowers:requesting-code-review`** for the *principle*, not its
+mechanism: that skill's own protocol starts from `BASE_SHA`/`HEAD_SHA` and a
+`git diff`, which this skill has nothing to supply — a problem package may
+never have touched git at all, and `## Am I the right skill?` above says so
+directly. Take from it only what actually transfers: **dispatch a fresh
+subagent rather than reviewing inline.** The dispatch this skill needs has
+no diff range in it at all — hand the subagent the problem directory path,
+the statement path, and the five judgement classes above, and let it read
+the package the way a contestant would,
+with none of the context that produced it. This is not optional convenience
+— it is the whole reason this skill exists as a separate step rather than a
+final read-through by whoever just finished writing the statement. A
+reviewer that inherited the assumptions of the agent that wrote the
+statement **cannot see the assumed definition**: the `xâu con` example above
+survived exactly this — its own author's verification pass — because the
+author already knew which reading was meant and read the sentence through
+that knowledge rather than against it. Dispatching with fresh context is
+what makes the difference between a rubber-stamp and a review.
 
 ## Recording findings
 
@@ -190,8 +233,10 @@ flags.append(
 )
 ```
 
-Equivalently from the shell: `python3 -m tools.flags` exposes the same
-`append` — either form writes the identical record.
+`flags.py` has no CLI — `python3 -m tools.flags` builds and exits with no
+output and nothing written. The Python snippet above is the only documented
+way to record a flag; do not invoke the module directly and assume it did
+anything.
 
 **The valid kinds are a closed set of eight**, confirmed against the source
 rather than paraphrased — `flags.append` raises `FlagError` on anything
@@ -205,12 +250,13 @@ python3 -c "from tools.flags import KIND_PREFIX; print(sorted(KIND_PREFIX))"
 ['algorithm-choice', 'checker-choice', 'constraint-drift', 'review-judgement', 'sample-choice', 'statement-ambiguity', 'test-weakness', 'timing-band']
 ```
 
-The two this skill reaches for most are `statement-ambiguity` (classes 1
-and 2 above) and `review-judgement` (classes 3 and 4, and anything that
-doesn't fit one of the other seven kinds more precisely) — but use whichever
-kind actually names the finding; `checker-choice` fits class 4 better than
-`review-judgement` when the disagreement is specifically about which stock
-checker was picked, for instance.
+The two this skill reaches for most are `statement-ambiguity` (classes 1 and
+2 above) and `review-judgement` (class 3, and anything else that doesn't fit
+one of the other seven kinds more precisely) — but pick whichever kind
+actually names the finding rather than defaulting to these two on reflex:
+class 4's checker/validator disagreement is usually `checker-choice`, and
+class 5's unreached bound is `test-weakness`, the same kind
+`preparing-tests` itself uses for the identical finding.
 
 **Every flag needs `changes_if_wrong` filled in** — `flags.append` rejects a
 blank one. That field is what prices an interruption: it is the answer to
@@ -236,7 +282,7 @@ disagreement — none of those blocks the audit from finishing; they go in
 
 - `python3 -m tools.review_checks "$PROBLEM" "$PROBLEM/<name>.tex" "$TESTLIB"`
   exits 0 — no mechanical findings remain.
-- Every judgement finding from the four classes above is either fixed
+- Every judgement finding from the five classes above is either fixed
   directly (and the mechanical check re-run to confirm nothing regressed)
   or recorded in `flags.json` with `changes_if_wrong` populated.
 - No unresolved HIGH statement ambiguity remains — either it was resolved,
