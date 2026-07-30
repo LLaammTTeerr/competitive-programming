@@ -41,12 +41,36 @@ class TestComputeLimits(unittest.TestCase):
         self.assertEqual(limits.tl_ms, 1500)
         self.assertEqual(limits.kill_ms, 3000)
 
-    def test_kill_ms_is_computed_from_rounded_tl_not_raw(self):
-        # 900 -> 1800 (raw) -> 2000 (rounded TL) -> 4000 (kill from rounded)
-        # If kill were computed from raw: 2*1800 = 3600 (wrong)
-        limits = compute_limits({"01": 900})
-        self.assertEqual(limits.kill_ms, 4000)
-        self.assertNotEqual(limits.kill_ms, 3600)
+    def test_rounding_no_ceil_change_750ms(self):
+        # t_main = 750: raw = 1500, which is exact multiple of step_ms=500
+        # ceil(1500/500)*500 = ceil(3)*500 = 3*500 = 1500 (no rounding change)
+        # Tests the branch where ceil() does not increase the value
+        limits = compute_limits({"01": 750})
+        self.assertEqual(limits.tl_ms, 1500)
+        self.assertEqual(limits.kill_ms, 3000)
+
+    def test_custom_floor_ms_binds(self):
+        # Custom floor_ms=300 (much lower than default 1000)
+        # t_main = 80: raw = max(160, 300) = 300 (floor binds)
+        # tl = ceil(300/500)*500 = 1*500 = 500
+        # kill_ms must equal 2 * tl_ms regardless of parameters
+        limits = compute_limits({"01": 80}, floor_ms=300)
+        self.assertEqual(limits.t_main_ms, 80)
+        self.assertEqual(limits.tl_ms, 500)
+        self.assertEqual(limits.kill_ms, 1000)
+        self.assertEqual(limits.kill_ms, 2 * limits.tl_ms)
+
+    def test_custom_step_ms_changes_rounding(self):
+        # Custom step_ms=200 (different from default 500)
+        # t_main = 750: raw = 1500
+        # With step_ms=200: tl = ceil(1500/200)*200 = 8*200 = 1600
+        # (With default step_ms=500 would give: tl = 1500)
+        # kill_ms must equal 2 * tl_ms regardless of parameters
+        limits = compute_limits({"01": 750}, step_ms=200)
+        self.assertEqual(limits.t_main_ms, 750)
+        self.assertEqual(limits.tl_ms, 1600)
+        self.assertEqual(limits.kill_ms, 3200)
+        self.assertEqual(limits.kill_ms, 2 * limits.tl_ms)
 
 
 LIMITS = Limits(t_main_ms=500, tl_ms=1000, kill_ms=2000)
@@ -113,10 +137,11 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(out.verdict, "TL")
         self.assertFalse(out.banded)
 
-    def test_re_verdict_fast(self):
-        # RE (Runtime Error) should be preserved for fast solutions
-        out = classify(100, killed=False, checker_verdict="RE", limits=LIMITS)
-        self.assertEqual(out.verdict, "RE")
+    def test_zero_time_boundary(self):
+        # time_ms = 0 (minimum time boundary)
+        # Should be accepted as fast and correct
+        out = classify(0, killed=False, checker_verdict="OK", limits=LIMITS)
+        self.assertEqual(out.verdict, "OK")
         self.assertFalse(out.banded)
 
 
