@@ -41,14 +41,21 @@ the hole yet. When in doubt, ask which.
 
 ## Bootstrap
 
+`$BASE` is not an environment variable the harness sets — it is not exported
+into a shell, only into MCP config. What you actually have is the line **"Base
+directory for this skill: `<path>`"** printed in this skill's own invocation
+preamble. Substitute that literal path for `BASE` below; do not leave it as a
+bare `$BASE` reference, or the command fails with "No such file or directory"
+before it does anything:
+
 ```bash
+BASE="<the path from this skill's own 'Base directory for this skill' line>"
 TESTLIB="$(bash "$BASE/../../tools/bootstrap_testlib.sh")"
 ```
 
 Then **read `$TESTLIB/docs/usage-guide.md` for the API and `$TESTLIB/plan.md`
 for known defects** before writing a line of `validator.cpp`, `check.cpp`, or
-any `gen-*.cpp`. `$BASE` is this skill's own base directory, supplied at
-invocation.
+any `gen-*.cpp`.
 
 No testlib API is reproduced in this file, and that is deliberate: the guide
 is 902 lines and versioned against the exact header the pipeline compiles
@@ -202,12 +209,16 @@ two documents and silent disagreement.
 
 ### 3. Generators — only after the validator can reject bad input
 
-- **`registerGen(argc, argv, 2)`, always.** Versions 0 and 1 are frozen
-  for compatibility and share a defect: `rnd.next(0, 1)` repeats with period
-  65536 (R-01, fixed behind version 2; R-02 documents why versions 0/1 stay
-  byte-identical rather than being patched in place). A large random test
-  built on version 0 or 1 is quietly less random than it looks — every
-  65536th draw of a boolean is the same bit.
+- **`registerGen(argc, argv, 2)`, always.** Versions 0 and 1 are frozen for
+  compatibility and each carries its own measured `rnd` defect rather than
+  sharing one: under version 1, `rnd.next(0, 1)` repeats with period 65536
+  (R-01, fixed only behind version 2 — versions 0/1 themselves stay
+  byte-identical forever, never patched in place); under version 0, bit 31 of
+  the underlying 63-bit draw is never set at all (R-02), which biases any
+  `next(long long)` call over a range wider than 2^31 rather than just
+  repeating a small one. A large random test built on version 0 or 1 is
+  quietly less random than it looks, for two different reasons depending on
+  which one was used — version 2 is the only one without a known `rnd` defect.
 - **`opt<bool>("f", false)`, never `has_opt("f")`.** `has_opt` arms testlib's
   unused-opts check but — per O-02 — never marks the opt as used, so the
   generator writes a complete, plausible-looking test to stdout and *then*
