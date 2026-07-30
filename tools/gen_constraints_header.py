@@ -23,11 +23,25 @@ HEADER = """\
 
 
 def identifier(raw: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_").upper()
+    """Convert a constraint or subtask ID to a legal C++ identifier.
+
+    Replaces non-alphanumeric characters with underscores, strips leading/trailing
+    underscores, and converts to uppercase. If the result starts with a digit,
+    prefixes it with 'C_' to ensure it is a legal identifier.
+    """
+    normalized = re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_").upper()
+    if normalized and normalized[0].isdigit():
+        normalized = "C_" + normalized
+    return normalized
 
 
 def _emit(name: str, value: int) -> str:
     return f"static const long long {name} = {value};"
+
+
+def _has_bounds(bound) -> bool:
+    """Check if a Bound has any constraint (min or max)."""
+    return bound.min is not None or bound.max is not None
 
 
 def render(problem: Problem) -> str:
@@ -49,9 +63,9 @@ def render(problem: Problem) -> str:
         for text in sub.constraints_text:
             lines.append(f"//   {text}")
         for c in problem.constraints:
-            if c.min is None and c.max is None:
-                continue
             bound = problem.effective_bound(sub.id, c.id)
+            if not _has_bounds(bound):
+                continue
             prefix = f"{identifier(sub.id)}_{identifier(c.id)}"
             if bound.min is not None:
                 lines.append(_emit(f"{prefix}_MIN", bound.min))

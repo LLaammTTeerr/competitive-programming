@@ -1,4 +1,7 @@
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 from tools.gen_constraints_header import identifier, render
 from tools.problem_meta import Bound, Constraint, Problem, Subtask
@@ -32,6 +35,12 @@ class TestIdentifier(unittest.TestCase):
         self.assertEqual(identifier("len_a"), "LEN_A")
         self.assertEqual(identifier("sum-n"), "SUM_N")
 
+    def test_prefixes_numeric_ids_to_make_legal_identifier(self):
+        self.assertEqual(identifier("1"), "C_1")
+        self.assertEqual(identifier("2abc"), "C_2ABC")
+        self.assertEqual(identifier("a1"), "A1")
+        self.assertEqual(identifier("0"), "C_0")
+
 
 class TestRender(unittest.TestCase):
     def setUp(self):
@@ -59,6 +68,91 @@ class TestRender(unittest.TestCase):
 
     def test_carries_the_expression_as_a_comment(self):
         self.assertIn("1 \\le |A| \\le 20", self.header)
+
+    def test_subtask_only_bounds_are_emitted(self):
+        """Regression: subtask-only bounds (no global min/max) must be emitted."""
+        problem = Problem(
+            name="test",
+            title={},
+            tags=[],
+            time_ms_published=1000,
+            time_ms_computed=None,
+            memory_mb=256,
+            input="stdin",
+            output="stdout",
+            checker_kind="stock",
+            checker_name="cmp",
+            constraints=[
+                Constraint(id="special", expr="..."),  # no global min/max
+            ],
+            subtasks=[
+                Subtask(id="g1", points=100,
+                        bounds={"special": Bound(min=1, max=5)},
+                        constraints_text=[], depends_on=[]),
+            ],
+            examples=[],
+        )
+        header = render(problem)
+        self.assertIn("static const long long G1_SPECIAL_MIN = 1;", header)
+        self.assertIn("static const long long G1_SPECIAL_MAX = 5;", header)
+
+    def test_empty_problem_renders_valid_header(self):
+        """Zero constraints and zero subtasks should still render a valid header."""
+        problem = Problem(
+            name="empty",
+            title={},
+            tags=[],
+            time_ms_published=1000,
+            time_ms_computed=None,
+            memory_mb=256,
+            input="stdin",
+            output="stdout",
+            checker_kind="stock",
+            checker_name="cmp",
+            constraints=[],
+            subtasks=[],
+            examples=[],
+        )
+        header = render(problem)
+        self.assertIn("#pragma once", header)
+        self.assertIn("do not edit", header.lower())
+        self.assertIn("gen_constraints_header.py", header)
+
+    def test_generated_header_compiles(self):
+        """Verify the emitted header is syntactically valid C++."""
+        try:
+            result = subprocess.run(
+                ["g++", "--version"],
+                capture_output=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                raise unittest.SkipTest("g++ not available")
+        except FileNotFoundError:
+            raise unittest.SkipTest("g++ not on PATH")
+
+        header = render(PROBLEM)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".h", delete=False
+        ) as f:
+            f.write(header)
+            temp_path = f.name
+
+        try:
+            result = subprocess.run(
+                ["g++", "-std=c++17", "-Wno-pragma-once-outside-header", "-Wpedantic",
+                 "-Werror", "-fsyntax-only", temp_path],
+                capture_output=True,
+                timeout=5,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"g++ failed to parse header: {result.stderr}",
+            )
+        finally:
+            Path(temp_path).unlink()
 
 
 if __name__ == "__main__":
