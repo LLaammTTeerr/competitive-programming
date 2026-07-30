@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from tools.gen_constraints_header import identifier, render
-from tools.problem_meta import Bound, Constraint, Problem, Subtask
+from tools.problem_meta import Bound, Constraint, Problem, ProblemMetaError, Subtask
 
 PROBLEM = Problem(
     name="flight",
@@ -153,6 +153,84 @@ class TestRender(unittest.TestCase):
             )
         finally:
             Path(temp_path).unlink()
+
+    def test_collision_via_digit_prefix(self):
+        """IDs that collide via digit prefix rule raise ProblemMetaError."""
+        problem = Problem(
+            name="collision",
+            title={},
+            tags=[],
+            time_ms_published=1000,
+            time_ms_computed=None,
+            memory_mb=256,
+            input="stdin",
+            output="stdout",
+            checker_kind="stock",
+            checker_name="cmp",
+            constraints=[
+                Constraint(id="1", expr="...", min=1, max=5),
+                Constraint(id="c_1", expr="...", min=1, max=5),
+            ],
+            subtasks=[],
+            examples=[],
+        )
+        with self.assertRaises(ProblemMetaError) as ctx:
+            render(problem)
+        self.assertIn("Identifier collision", str(ctx.exception))
+        self.assertIn("C_1", str(ctx.exception))
+
+    def test_collision_via_punctuation_collapse(self):
+        """IDs that collide via punctuation normalization raise ProblemMetaError."""
+        problem = Problem(
+            name="collision",
+            title={},
+            tags=[],
+            time_ms_published=1000,
+            time_ms_computed=None,
+            memory_mb=256,
+            input="stdin",
+            output="stdout",
+            checker_kind="stock",
+            checker_name="cmp",
+            constraints=[
+                Constraint(id="len-a", expr="...", min=1, max=20),
+                Constraint(id="len_a", expr="...", min=1, max=20),
+            ],
+            subtasks=[],
+            examples=[],
+        )
+        with self.assertRaises(ProblemMetaError) as ctx:
+            render(problem)
+        self.assertIn("Identifier collision", str(ctx.exception))
+        self.assertIn("LEN_A", str(ctx.exception))
+
+    def test_distinct_ids_no_collision(self):
+        """Normal problems with distinct IDs should render without error."""
+        problem = Problem(
+            name="normal",
+            title={},
+            tags=[],
+            time_ms_published=1000,
+            time_ms_computed=None,
+            memory_mb=256,
+            input="stdin",
+            output="stdout",
+            checker_kind="stock",
+            checker_name="cmp",
+            constraints=[
+                Constraint(id="len_a", expr="...", min=1, max=20),
+                Constraint(id="len_b", expr="...", min=1, max=30),
+            ],
+            subtasks=[
+                Subtask(id="g1", points=100,
+                        bounds={},
+                        constraints_text=[], depends_on=[]),
+            ],
+            examples=[],
+        )
+        header = render(problem)
+        self.assertIn("LEN_A_MIN", header)
+        self.assertIn("LEN_B_MAX", header)
 
 
 if __name__ == "__main__":
