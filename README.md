@@ -1,8 +1,9 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: five skills — two for solving
-(one problem, one whole contest), three for setting one (test data, solution
-validation, statement) — plus the bundled Codeforces MCP server. This repository
+Claude Code plugin for competitive programming: eight skills — two for solving
+(one problem, one whole contest), six for setting one (shaping the constraints,
+test data, solution validation, statement, package review, and end-to-end
+orchestration) — plus the bundled Codeforces MCP server. This repository
 is also a **marketplace**, so it can be used in place or installed on another
 machine.
 
@@ -10,9 +11,12 @@ machine.
 |---|---|---|
 | Skill `solving-problems` | `competitive-programming:solving-problems` | Algorithm design and C++ for one problem on a stdin/stdout judge — constraints → complexity budget → design → edge cases → clean implementation, with stress testing against a brute-force oracle |
 | Skill `running-contests` | `competitive-programming:running-contests` | Drives a whole contest on any judge: binds to whatever judge MCP is installed, pulls the problem set, orders it, delegates each problem to `solving-problems`, submits, reads verdicts, and keeps going until every problem is solved |
+| Skill `shaping-problems` | `competitive-programming:shaping-problems` | Turns a problem idea into numbers: a novelty check, the intended difficulty, the N that separates the intended solution from the naive one, and a subtask ladder that pays for real partial insight |
 | Skill `preparing-tests` | `competitive-programming:preparing-tests` | Builds the test-data contract for a problem being set: checker, validator, generators (random / max-size / boundary / structured-adversarial / hand-written), and sample selection, driven by testlib and `tools/gen_constraints_header.py` / `tools/drift_check.py` |
 | Skill `validating-solutions` | `competitive-programming:validating-solutions` | Attacks a problem's test suite with a zoo of deliberately-wrong solutions plus alternative and exhaustive-arbiter `accepted` solutions, runs the invocation matrix (`tools/run_matrix.py`) under `ioi/isolate`, and reports holes and mismatches |
 | Skill `writing-statements` | `competitive-programming:writing-statements` | Authors, translates, and reviews problem statements for the vnolymp LaTeX template — the Vietnamese statement package for problems prepared on Polygon |
+| Skill `reviewing-problems` | `competitive-programming:reviewing-problems` | Audits a finished problem package before it ships: mechanical checks (drift, unreached bounds, holes, checker/validator disagreement) via `tools/review_checks.py`, plus judgement checks (ambiguity, assumed definitions, unproven invariants) run fresh from the statement, recorded to `flags.json` |
+| Skill `creating-problems` | `competitive-programming:creating-problems` | The umbrella over the other five setting skills: drives a problem from an idea, finished or half-formed, to a Polygon-ready package end to end, gated phase by phase with machine-readable evidence from `tools/package_status.py` |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 
 ## Layout
@@ -26,12 +30,16 @@ competitive-programming/
 ├── skills/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
 │   ├── running-contests/SKILL.md   (+ references/judges.md)
+│   ├── shaping-problems/SKILL.md
 │   ├── preparing-tests/SKILL.md
 │   ├── validating-solutions/SKILL.md
-│   └── writing-statements/SKILL.md
-├── tools/                    # Python pipeline the two test-authoring skills drive
+│   ├── writing-statements/SKILL.md
+│   ├── reviewing-problems/SKILL.md
+│   └── creating-problems/SKILL.md
+├── tools/                    # Python pipeline the setting skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  bootstrap_testlib.sh
+│   ├── package_status.py  review_checks.py
 │   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
     ├── pyproject.toml  uv.lock
@@ -131,7 +139,7 @@ directory is not importable`.
 ```bash
 cd <this repo>
 claude plugin validate . --strict                 # manifests
-claude plugin details competitive-programming     # inventory: 5 skills, 1 MCP server
+claude plugin details competitive-programming     # inventory: 8 skills, 1 MCP server
 
 python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
 (cd mcp-server && uv run --extra dev pytest -q)        # server suite (subshell)
