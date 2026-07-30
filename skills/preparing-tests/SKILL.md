@@ -167,7 +167,12 @@ below depends on the previous one existing first.
 Unique answer for every valid input → reach for a **stock checker** before
 writing anything: 21 ship in `$TESTLIB/checkers/`, most usefully `ncmp`
 (sequences of ints/longs), `wcmp` (tokens, any whitespace), `rcmp6` (real
-numbers to 6 significant digits — the natural choice for a float answer),
+numbers within `1e-6` **absolute *or* relative** error — its own `setName`
+says "max absolute or relative error", and `testlib.h`'s `doubleCompare`
+accepts a value that clears *either* test, not both; it is emphatically not
+"6 significant digits", which would be a relative-only rule. The natural
+choice for a float answer, and the one to name in the statement verbatim so
+the promised tolerance matches the enforced one),
 `yesno`, and `lcmp` (line-by-line). Multiple valid answers → a custom
 checker, only then.
 
@@ -367,11 +372,18 @@ genuinely weak suite.
 ```bash
 rm -rf "$PROBLEM/.reach-g1" && mkdir -p "$PROBLEM/.reach-g1"
 i=0
+ok=1
 for f in "$PROBLEM"/tests/g1/*.in; do
     i=$((i+1))
     "$PROBLEM/files/validator" --testset tests --group g1 \
-        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f"
+        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f" \
+        || { echo "validator REJECTED $f" >&2; ok=0; }
 done
+# A rejected test leaves an EMPTY log, and an empty log contributes nothing to
+# the union below — which reads back as "that bound is unreached". Skipping
+# this check manufactures the exact false finding this section exists to
+# prevent, so fix every rejection before reading the union at all.
+[ "$ok" = 1 ] || echo "UNION IS NOT EVIDENCE — fix the rejections first" >&2
 # union across every per-test log, not just the last one written
 cat "$PROBLEM"/.reach-g1/*.log | grep -E '": (min|max)-value-hit' | sort -u
 rm -rf "$PROBLEM/.reach-g1"   # scratch output, not a package artifact
@@ -416,7 +428,7 @@ adjust the field/line selector to match your own format):
 
 ```bash
 awk 'FNR==1{print length($1)}' "$PROBLEM"/tests/g1/*.in | sort -n | sed -n '1p;$p'
-# first number is the shortest A in the group, second the longest;
+# first line is the shortest value in the group, second the longest;
 # compare both against the declared bound by hand
 ```
 

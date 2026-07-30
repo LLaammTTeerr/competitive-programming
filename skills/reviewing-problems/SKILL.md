@@ -116,12 +116,23 @@ real defect, not a hypothetical:** `flight`'s own constraint line says
 
 `xâu con` reads as *substring* (contiguous) to most Vietnamese contestants
 and as *subsequence* (not necessarily contiguous) to some — the two
-readings disagree on whether `"101"` is a `xâu con` of `"1a0a1"`-shaped
-inputs in the general sense, and the unambiguous phrasing is `xâu con liên
-tiếp`. It is **not fatal** in `flight`'s case — the body of the statement
-defines the win condition precisely via `t_A`, the first index at which `A`
-occurs, so a careful reader resolves the ambiguity from context even though
-the constraint line alone does not settle it. But it **survived its own
+readings disagree on whether `"101"` is a `xâu con` of `"10011"`, which is
+contiguous under neither reading but is a subsequence under one. (Reach for
+an illustration built from the problem's own alphabet: `flight.tex`'s
+constraint block restricts `A` and `B` to `0` and `1`, so a
+`"1a0a1"`-shaped example is not an input this problem can have, and an
+off-alphabet illustration invites the reader to dismiss the whole finding as
+hypothetical.) The unambiguous phrasing is `xâu con liên tiếp`. It is **not
+fatal** in `flight`'s case — the body of the statement defines the win
+condition precisely via `t_A`, which it defines not as "the first index at
+which `A` occurs" but as the smallest index such that the `|A|` consecutive
+characters **ending at** `t_A` spell `A`, i.e. `c_{t_A-|A|+1} … c_{t_A} = A`.
+Start-versus-end is exactly the defect `sol-start-index.cpp` in the zoo
+encodes, so paraphrase it from the `.tex` rather than from memory — a review
+that restates `t_A` loosely as a "first occurrence" index has reproduced the
+wrong solution's reading inside the audit that is supposed to catch it. A
+careful reader resolves the ambiguity from that definition even though the
+constraint line alone does not settle it. But it **survived its own
 author's verification pass and would have shipped** unflagged. State this
 plainly when reviewing: this class of defect is invisible to whoever wrote
 the statement, because they already know which reading they meant and
@@ -171,11 +182,18 @@ reviewing hazard rather than a loud failure:
 ```bash
 rm -rf "$PROBLEM/.reach-g1" && mkdir -p "$PROBLEM/.reach-g1"
 i=0
+ok=1
 for f in "$PROBLEM"/tests/g1/*.in; do
     i=$((i+1))
     "$PROBLEM/files/validator" --testset tests --group g1 \
-        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f"
+        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f" \
+        || { echo "validator REJECTED $f" >&2; ok=0; }
 done
+# A rejected test leaves an EMPTY log, and an empty log contributes nothing to
+# the union below — which reads back as "that bound is unreached". Skipping
+# this check manufactures the exact false finding this section exists to
+# prevent, so fix every rejection before reading the union at all.
+[ "$ok" = 1 ] || echo "UNION IS NOT EVIDENCE — fix the rejections first" >&2
 # union across every per-test log, not just the last one written
 cat "$PROBLEM"/.reach-g1/*.log | grep -E '": (min|max)-value-hit' | sort -u
 rm -rf "$PROBLEM/.reach-g1"   # scratch output, not a package artifact
@@ -227,9 +245,13 @@ classes above, only its **number, name, and generic definition** — the
 opening sentence or two that says what the class *is* — and let it read the
 package the way a contestant would, with none of the context that produced
 it. **Stop before any worked example.** A worked example that names the
-package under review — class 2's `xâu con` paragraph, class 5's `readToken`
-paragraph — exists to convince the *operator reading this file* that fresh
-context matters; relaying it to the subagent instead hands over that
+package under review — everything under class 2's **"Operator-facing
+rationale"** marker, and class 5's **"Operator-facing rationale"** block,
+which is the one that names `flight`'s `1 <= |A| <= 20` (class 5's
+`readToken` limitation *itself*, and the `awk` fallback beside it, are
+generic and **do** belong in the payload) — exists to convince the *operator
+reading this file* that fresh context matters; relaying it to the subagent
+instead hands over that
 package's own answer before the subagent has read a line of the statement,
 which is self-defeating on the one package (`flight`) this file is written
 against, and would be equally self-defeating on any future worked example

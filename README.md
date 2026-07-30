@@ -149,6 +149,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
   | uvx --from ./mcp-server cf-mcp
 ```
 
+**The tools suite is not parallel-safe: run it alone.** `run_matrix.py`
+derives its `isolate` box ids from the process pid, so a second concurrent
+run of the suite (or any other `run_matrix` invocation) collides on the same
+sandbox boxes and produces failures that belong to neither run — spurious,
+irreproducible, and convincing enough to have already misled several
+debugging attempts. One suite at a time on a machine.
+
 The tools suite **fails** rather than skips when `g++`, `isolate`, or the
 testlib cache is missing: `run_matrix.py` is the one module with no fallback
 runner, so gating its tests on the presence of that same dependency meant a

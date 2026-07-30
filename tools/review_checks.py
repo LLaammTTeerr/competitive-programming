@@ -3,8 +3,8 @@
 
 Everything here is a question a program can answer: does the statement agree
 with problem.json, is a phase missing, is a solution file absent from the scan,
-did the matrix leave a hole, is the generated header older than the source it
-was generated from.
+did the matrix leave a hole, does files/constraints.h still match what
+problem.json renders to right now.
 
 Deliberately *not* here: statement ambiguity, assumed definitions, and unproven
 solution steps. Those are judgement, they belong to `reviewing-problems`, and a
@@ -130,6 +130,16 @@ def _stale_header(problem_dir: Path, problem: Problem | None) -> list[Finding]:
         return [Finding("stale-constraints-header", "high",
                         "constraints.h does not match problem.json; regenerate it "
                         "with `python3 -m tools.gen_constraints_header`", str(header))]
+    except ProblemMetaError as exc:
+        # `render()` raises this, not just `load()`: two constraint ids that
+        # `load` accepts as distinct — `"n"` and `"N"` — collide once
+        # `identifier()` uppercases them into the same `N_MIN`. `load` cannot
+        # catch that, because the collision is a property of the C++ name the
+        # header generator derives, not of the document. Catching it here is
+        # what keeps `run()`'s never-raises contract true.
+        return [Finding("stale-constraints-header", "low",
+                        f"constraints.h cannot be regenerated for comparison: "
+                        f"{exc}", str(header))]
     except (OSError, UnicodeDecodeError) as exc:
         return [Finding("stale-constraints-header", "low",
                         f"constraints.h unreadable: {exc}", str(header))]

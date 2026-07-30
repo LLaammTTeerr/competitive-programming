@@ -117,6 +117,35 @@ def _array(value, path: Path, what: str) -> list:
     return value
 
 
+def _string(value, path: Path, what: str) -> str:
+    """`value` as a Python str, or `ProblemMetaError` naming what was found.
+
+    The ids and names in this document are not decoration: consumers put them
+    straight into filesystem paths and set membership. `subtasks[].id` becomes
+    `problem_dir / "tests" / s.id` in `package_status._tests`, and a JSON
+    number there raises `TypeError: argument should be a str or an os.PathLike`
+    from a module whose contract is that it never raises. `checker.name`
+    becomes `files / problem.checker_name` the same way. A `depends_on` entry
+    is tested with `in seen_s` and any unhashable entry — `[{"a": 1}]`, an
+    ordinary hand-edit slip — raises `TypeError: unhashable type: 'dict'` from
+    inside `load` itself, bypassing the `ProblemMetaError` contract that is
+    supposed to describe every way this file can be wrong.
+
+    `constraints[].id` is the third: `gen_constraints_header.identifier()`
+    calls `re.sub` on it, which rejects a non-str with `TypeError`.
+
+    Standing ruling R1 again — every way `problem.json` can be wrong arrives
+    as a `ProblemMetaError` naming the field, so the two modules that promise
+    never to raise can keep that promise without guarding defensively at
+    every use site.
+    """
+    if not isinstance(value, str):
+        raise ProblemMetaError(
+            f"{path}: {what} is {value!r} (JSON {_type_name(value)}), "
+            "expected a string")
+    return value
+
+
 def _integer(value, path: Path, what: str, *, allow_none: bool = False):
     """`value` as a Python int, or `ProblemMetaError` naming what was found.
 
@@ -190,6 +219,7 @@ def load(path: str | Path) -> Problem:
             raise ProblemMetaError(
                 f"{path}: constraint missing required field {exc}"
             ) from exc
+        cid = _string(cid, path, f"constraints[{i}].id")
         constraints.append(Constraint(
             id=cid, expr=expr,
             min=_integer(c.get("min"), path, f"constraint {cid!r} min",
@@ -213,6 +243,7 @@ def load(path: str | Path) -> Problem:
             raise ProblemMetaError(
                 f"{path}: subtask missing required field {exc}"
             ) from exc
+        sid = _string(sid, path, f"subtasks[{i}].id")
         # `except KeyError` around this comprehension could never have
         # caught the bounds case: a non-object bound raises AttributeError
         # from `.get`, not KeyError.
@@ -232,8 +263,12 @@ def load(path: str | Path) -> Problem:
             bounds=bounds,
             constraints_text=list(_array(s.get("constraints_text", []), path,
                                          f"subtask {sid!r} 'constraints_text'")),
-            depends_on=list(_array(s.get("depends_on", []), path,
-                                   f"subtask {sid!r} 'depends_on'")),
+            depends_on=[
+                _string(dep, path, f"subtask {sid!r} depends_on[{j}]")
+                for j, dep in enumerate(
+                    _array(s.get("depends_on", []), path,
+                           f"subtask {sid!r} 'depends_on'"))
+            ],
         ))
 
     seen_s: set[str] = set()
@@ -311,6 +346,7 @@ def load(path: str | Path) -> Problem:
         checker_name = checker["name"]
     except KeyError as exc:
         raise ProblemMetaError(f"{path}: missing required field in checker {exc}") from exc
+    checker_name = _string(checker_name, path, "checker.name")
 
     return Problem(
         name=name,

@@ -324,9 +324,22 @@ Runs only when two `accepted`-class solutions disagree on some input X:
 2. Run the tiny-N exhaustive brute (the `accepted`, exhaustive, tiny-N zoo
    entry) on the shrunk case. Whichever solution it agrees with is right.
 3. If the brute cannot decide — or cannot even be written, because the
-   behaviour genuinely is not defined anywhere in the statement — that is
-   **statement ambiguity**, and the exit is `writing-statements`. Never
-   silently pick a side because one solution "looks more careful."
+   behaviour genuinely is not defined anywhere in the statement — that is an
+   **unresolvable HIGH `statement-ambiguity`**, and it is a **STOP, not a
+   route**. Record the flag with `changes_if_wrong` populated, halt here, and
+   surface the reading decision to the human through `creating-problems`,
+   which is what enforces the stop. Do **not** hand off to
+   `writing-statements` and carry on validating, and do not pick a reading
+   yourself because one solution "looks more careful": every artifact
+   downstream — validator, checker, model solution, tests — is built against
+   whichever reading gets picked, so continuing past this point risks all of
+   it on a coin flip. This is spec §7's one exception, the same hard stop
+   `reviewing-problems` reaches under "The one hard stop" and
+   `creating-problems` draws as `STOP` in its phase diagram; all three must
+   agree, because this single edge is what the whole gate model hangs on.
+   (An ambiguity the arbiter *can* settle is not this case — the statement
+   does define the behaviour, one solution simply misread it, and that is
+   step 2's route back to `solving-problems`.)
 4. **Hard stop after 3 rounds regardless of outcome**, escalating with the
    minimal case reached so far — an arbiter that can run forever is not an
    arbiter, it's a stall.

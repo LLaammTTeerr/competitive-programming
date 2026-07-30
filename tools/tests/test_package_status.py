@@ -1,10 +1,16 @@
-import json, shutil, sys, tempfile, unittest
+import contextlib
+import json, shutil, tempfile, unittest
 from io import StringIO
 from pathlib import Path
 
 from tools.package_status import PHASE_ORDER, main, next_phase, status
 
-FIXTURE = Path("tools/tests/fixtures/mini")
+# Anchored to this file, not to the process's working directory: the suite is
+# documented to run from the repository root, but a fixture path that only
+# resolves from there makes `cd` part of the contract for no reason, and the
+# same suite run from anywhere else fails in `setUp` with FileNotFoundError
+# rather than in the code under test. `test_run_matrix.py` already does this.
+FIXTURE = Path(__file__).parent / "fixtures" / "mini"
 
 
 class TestStatus(unittest.TestCase):
@@ -144,6 +150,46 @@ class TestStatus(unittest.TestCase):
         self.assertFalse(phases["matrix"].done)
         self.assertIn("object", phases["matrix"].detail.lower())
 
+    # --- hand-edit typos that used to escape `load` as a bare TypeError ------
+    #
+    # Each of the four below reached a consumer that does something a string
+    # can do and a number cannot — a path join, a set membership test — and
+    # raised from a module whose module docstring promises `status()` never
+    # raises. `problem_meta._string()` turns each into a `ProblemMetaError`
+    # at the boundary, which `_problem()` already wraps into a `[ ]` row.
+
+    def _mutate(self, mutate):
+        problem = json.loads((self.dir / "problem.json").read_text(encoding="utf-8"))
+        mutate(problem)
+        (self.dir / "problem.json").write_text(json.dumps(problem), encoding="utf-8")
+
+    def test_hostile_subtask_id_is_a_number_does_not_raise(self):
+        # `problem_dir / "tests" / s.id` -> TypeError before the loader fix.
+        self._mutate(lambda p: p["subtasks"][0].__setitem__("id", 5))
+        phases = self.phases()
+        self.assertFalse(phases["problem_json"].done)
+        self.assertIn("subtasks[0].id", phases["problem_json"].detail)
+
+    def test_hostile_depends_on_entry_is_an_object_does_not_raise(self):
+        # `dep not in seen_s` -> TypeError: unhashable type: 'dict'.
+        self._mutate(lambda p: p["subtasks"][0].__setitem__("depends_on", [{"a": 1}]))
+        phases = self.phases()
+        self.assertFalse(phases["problem_json"].done)
+        self.assertIn("depends_on[0]", phases["problem_json"].detail)
+
+    def test_hostile_checker_name_is_null_does_not_raise(self):
+        # `files / problem.checker_name` -> TypeError on None.
+        self._mutate(lambda p: p["checker"].__setitem__("name", None))
+        phases = self.phases()
+        self.assertFalse(phases["problem_json"].done)
+        self.assertIn("checker.name", phases["problem_json"].detail)
+
+    def test_hostile_checker_name_is_a_number_does_not_raise(self):
+        self._mutate(lambda p: p["checker"].__setitem__("name", 7))
+        phases = self.phases()
+        self.assertFalse(phases["problem_json"].done)
+        self.assertIn("checker.name", phases["problem_json"].detail)
+
 
 class TestMain(unittest.TestCase):
     def setUp(self):
@@ -153,9 +199,20 @@ class TestMain(unittest.TestCase):
                             ".build", "invocation.json", "solutions.json",
                             "flags.json", "*.a"))
 
+    def main(self, argv):
+        """`main` prints the whole phase table; four of these tests together
+        dumped 26 lines into the suite's own output, where they read as
+        failures scrolling past. Capture it and return it, so the assertions
+        can look at it instead of the operator having to."""
+        buf = StringIO()
+        with contextlib.redirect_stdout(buf):
+            exit_code = main(argv)
+        return exit_code, buf.getvalue()
+
     def test_main_exits_1_when_phases_incomplete(self):
-        exit_code = main([None, str(self.dir)])
+        exit_code, out = self.main([None, str(self.dir)])
         self.assertEqual(exit_code, 1)
+        self.assertIn("next: matrix", out)
 
     def test_main_exits_0_when_all_phases_complete(self):
         # Add invocation.json to make matrix complete
@@ -169,13 +226,15 @@ class TestMain(unittest.TestCase):
         samples_dir = self.dir / "tests" / "samples"
         samples_dir.mkdir(exist_ok=True)
         (samples_dir / "01.in").write_text("test\n")
-        exit_code = main([None, str(self.dir)])
+        exit_code, out = self.main([None, str(self.dir)])
         self.assertEqual(exit_code, 0)
+        self.assertIn("complete", out)
+        self.assertNotIn("next:", out)
 
     def test_main_exits_2_on_invalid_arguments(self):
-        exit_code = main([None])  # Missing problem_dir
+        exit_code, _ = self.main([None])  # Missing problem_dir
         self.assertEqual(exit_code, 2)
 
     def test_main_exits_2_on_too_many_arguments(self):
-        exit_code = main([None, str(self.dir), "testlib", "extra"])
+        exit_code, _ = self.main([None, str(self.dir), "testlib", "extra"])
         self.assertEqual(exit_code, 2)

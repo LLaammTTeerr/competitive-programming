@@ -154,15 +154,28 @@ find the probability `A` wins):
 
 | Subtask | Bound | What it actually admits |
 |---|---|---|
-| `g1` (40%) | `\|A\|, \|B\| ≤ 6` | Brute-force enumeration over coin sequences up to the point one pattern completes — at most `2^12` prefixes, trivial to enumerate directly. No automaton needed. |
-| `g2` (60%) | `\|A\|, \|B\| ≤ 20` | The brute force's state space is now astronomically larger. Requires building the Aho–Corasick automaton over `{A, B}` and solving a linear system over its states for absorption probabilities. |
+| `g1` (40%) | `\|A\|, \|B\| ≤ 6` | An absorbing Markov chain over the **raw**, uncompressed window of the last `max(\|A\|,\|B\|) − 1` coins — at most `2^5 = 32` states at this bound — discovered by BFS and solved by power iteration. No fail links, no automaton compression. This is exactly what the package's own g1-passing solution, `flight/solutions/sol-exhaustive-tinyn.cpp`, does. |
+| `g2` (60%) | `\|A\|, \|B\| ≤ 20` | That raw state space is now `2^19`, far too large to enumerate. Requires building the Aho–Corasick automaton over `{A, B}` — `O(\|A\| + \|B\|)` states instead of exponentially many — and solving a linear system over its states for absorption probabilities. |
+
+**Note what `g1` does *not* admit: enumerating coin sequences.** A coin
+stream is infinite — nothing bounds its length — so there is no prefix
+length at which enumeration is allowed to stop and no `2^k` figure that
+covers it. With `A = 000000` and `B = 111111`, both legal at `|A|, |B| ≤ 6`,
+**3586 of the 4096** length-12 streams have completed neither pattern, and
+padding to any longer fixed length only shrinks that fraction without
+reaching zero. The cheap solution at `g1` is a *smaller state space*, not a
+*finite enumeration*; this is the difference between "brute force" meaning
+"try everything" and "brute force" meaning "solve it exactly without the
+clever data structure", and only the second one terminates here.
 
 This ladder has **exactly one real rung** — `g1` rewards recognizing the
-brute-force path exists at all, `g2` rewards building the automaton. That is
-the right shape for a two-subtask problem, not a deficiency: a ladder is not
-obligated to have more rungs than the problem has distinct insights, and
-inventing a third rung here (say, `|A|, |B| ≤ 12`) would only interpolate
-between the same two algorithms without rewarding anything new.
+problem is an absorbing chain at all and that a raw, uncompressed state
+space is affordable at that size, `g2` rewards compressing it into the
+automaton. That is the right shape for a two-subtask problem, not a
+deficiency: a ladder is not obligated to have more rungs than the problem
+has distinct insights, and inventing a third rung here (say, `|A|, |B| ≤ 12`)
+would only interpolate between the same two algorithms without rewarding
+anything new.
 
 ## What it hands over
 
@@ -235,7 +248,10 @@ quietly:
   required, not either-or.
 - **`points`** across all subtasks must sum to exactly 100.
 - **`checker.kind`** is `"stock"` (name one of testlib's 21, e.g. `rcmp6` for
-  a real-valued answer to 6 significant digits) unless the problem has
+  a real-valued answer — that is `1e-6` **absolute *or* relative** error,
+  whichever the submission clears, per `rcmp6.cpp`'s own `setName` and
+  `testlib.h`'s `doubleCompare`; not "6 significant digits", which would be
+  the relative half alone) unless the problem has
   multiple valid outputs, in which case `"custom"` — but that decision, and
   writing the custom checker, belongs to `preparing-tests`, not here; this
   skill only records which kind was chosen.
@@ -248,22 +264,29 @@ quietly:
 python3 -m tools.package_status "$PROBLEM"
 ```
 
-Run for real with `$PROBLEM` set to the on-disk `flight` package quoted
-above (`~/Projects/my_cp_problems/flight`), starting from `/tmp` (not
-`$PLUGIN_ROOT`) and following Bootstrap's `BASE` → `PLUGIN_ROOT` → `cd`
-exactly as written, to confirm the relative arithmetic resolves rather than
-only reads correctly. First line of output:
+`$PROBLEM` is **the package you are shaping** — the one Bootstrap set, not
+some other package on this machine. The gate is a claim about your own work;
+running it against a finished package tells you nothing about yours. First
+line of output:
 
 ```
 [x] problem_json         loaded
 ```
 
-The command's overall exit code is nonzero and `next:` names a later phase
-(`statement`, then `model_solution`, and on) — expected, since this skill's
-job ends at `problem_json`; everything after that line belongs to
-`preparing-tests`, `validating-solutions`, and `writing-statements`'s second
-pass, sequenced by `creating-problems`. Only the `problem_json` row is this
-skill's own claim.
+On a package that has only just been shaped, the command's overall exit code
+is **nonzero** and `next:` names the phase immediately after this one —
+`statement`, then `constraints_header`, then `model_solution`, in
+`PHASE_ORDER`. That is expected, not a failure: this skill's job ends at
+`problem_json`, and everything below that row belongs to
+`writing-statements`, `preparing-tests` and `validating-solutions`, sequenced
+by `creating-problems`. Only the `problem_json` row is this skill's own
+claim. A package that is genuinely finished prints `complete` and exits 0
+with no `next:` line at all — which is why a finished package cannot stand in
+for this check.
+
+Run it starting from `/tmp` (not `$PLUGIN_ROOT`), following Bootstrap's
+`BASE` → `PLUGIN_ROOT` → `cd` exactly as written, so the relative arithmetic
+is confirmed to resolve rather than merely to read correctly.
 
 A `problem_json` phase of `[ ]` means `problem.json` failed to parse or
 failed validation — read `tools/problem_meta.py`'s `ProblemMetaError`
