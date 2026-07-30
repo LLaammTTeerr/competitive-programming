@@ -56,19 +56,21 @@ class TestRun(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn("sol-orphan.cpp", findings[0].what)
 
-    def test_a_constraints_header_older_than_problem_json_is_stale(self):
+    def test_a_stale_constraints_header_is_reported(self):
+        # Write a header that doesn't match render(problem)
         header = self.dir / "files" / "constraints.h"
         header.parent.mkdir(exist_ok=True)
-        header.write_text("#pragma once\n", encoding="utf-8")
-        import os, time
-        old = time.time() - 3600
-        os.utime(header, (old, old))
+        header.write_text("// wrong content\n", encoding="utf-8")
         self.assertIn("stale-constraints-header", self.kinds())
 
-    def test_a_fresh_constraints_header_is_not_reported(self):
+    def test_a_matching_constraints_header_is_not_reported(self):
+        # Write the correct rendered header
+        from tools.gen_constraints_header import render
+        from tools.problem_meta import load
+        problem = load(self.dir / "problem.json")
         header = self.dir / "files" / "constraints.h"
         header.parent.mkdir(exist_ok=True)
-        header.write_text("#pragma once\n", encoding="utf-8")
+        header.write_text(render(problem), encoding="utf-8")
         self.assertNotIn("stale-constraints-header", self.kinds())
 
     def test_statement_drift_is_reported_when_a_tex_is_given(self):
@@ -100,3 +102,79 @@ class TestRun(unittest.TestCase):
             [{"holes": []}]), encoding="utf-8")
         result = run(self.dir)
         self.assertTrue(result)  # Should have findings, not raise
+
+    def test_nonexistent_problem_directory_does_not_raise(self):
+        nonexistent = Path(tempfile.mkdtemp()) / "nonexistent"
+        result = run(nonexistent)
+        self.assertTrue(result)  # Should have findings, not raise
+
+    def test_solutions_as_file_not_directory_does_not_raise(self):
+        # Remove the solutions directory and replace with a file
+        import shutil
+        shutil.rmtree(self.dir / "solutions")
+        (self.dir / "solutions").write_text("not a directory", encoding="utf-8")
+        result = run(self.dir)
+        self.assertTrue(result)  # Should have findings, not raise
+
+    def test_tex_path_as_directory_does_not_raise(self):
+        tex_dir = self.dir / "tex_dir"
+        tex_dir.mkdir(parents=True, exist_ok=True)
+        result = run(self.dir, tex_path=tex_dir)
+        self.assertTrue(result)  # Should have findings, not raise
+
+    def test_tex_path_with_invalid_utf8_does_not_raise(self):
+        tex_path = self.dir / "bad.tex"
+        tex_path.write_bytes(b"\xff\xfe")
+        result = run(self.dir, tex_path=tex_path)
+        self.assertTrue(result)  # Should have findings, not raise
+
+    def test_constraints_h_without_problem_json_does_not_raise(self):
+        (self.dir / "files").mkdir(exist_ok=True)
+        (self.dir / "files" / "constraints.h").write_text("test", encoding="utf-8")
+        # problem.json was not copied, so problem is None
+        result = run(self.dir)
+        self.assertTrue(result)  # Should have findings, not raise
+
+
+class TestCleanPackageReturnsNoFindings(unittest.TestCase):
+    """A known-good, complete package should produce zero findings."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp()) / "p"
+        # Copy the fixture, excluding incomplete phases
+        shutil.copytree(FIXTURE, self.dir,
+                        ignore=shutil.ignore_patterns(".build", ".pycache"))
+
+    def test_complete_fixture_produces_no_findings(self):
+        """A complete, clean package should produce zero findings."""
+        # Add examples to problem.json to make it complete
+        import json
+        problem_path = self.dir / "problem.json"
+        problem = json.loads(problem_path.read_text(encoding="utf-8"))
+        problem["examples"] = [{"test": "01"}]
+        problem_path.write_text(json.dumps(problem, indent=2, ensure_ascii=False) + "\n",
+                               encoding="utf-8")
+
+        # Create the sample files
+        (self.dir / "01.in").write_text("1 2\n", encoding="utf-8")
+        (self.dir / "01.a").write_text("3\n", encoding="utf-8")
+
+        # Regenerate constraints.h to match problem.json
+        from tools.gen_constraints_header import render
+        from tools.problem_meta import load
+        problem = load(self.dir / "problem.json")
+        (self.dir / "files" / "constraints.h").write_text(render(problem), encoding="utf-8")
+
+        # Write valid invocation.json with no holes/mismatches
+        (self.dir / "invocation.json").write_text(
+            json.dumps({"schema": 1, "holes": [], "mismatches": []}),
+            encoding="utf-8")
+
+        findings = run(self.dir)
+        if findings:
+            # If still findings, report them
+            msg = "Complete fixture has findings:\n"
+            for f in findings:
+                msg += f"  {f.severity.upper()} {f.kind}: {f.what}\n"
+            self.fail(msg)
+        self.assertEqual(findings, [])

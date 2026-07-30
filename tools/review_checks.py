@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tools.drift_check import check as drift
+from tools.gen_constraints_header import render
 from tools.package_status import next_phase, status
 from tools.problem_meta import Problem, ProblemMetaError, load
 from tools.scan_solutions import ScanError, scan
@@ -112,16 +113,23 @@ def _matrix(problem_dir: Path) -> list[Finding]:
                         f"invocation.json is malformed: {exc}", str(path))]
 
 
-def _stale_header(problem_dir: Path) -> list[Finding]:
+def _stale_header(problem_dir: Path, problem: Problem | None) -> list[Finding]:
     header = problem_dir / "files" / "constraints.h"
-    source = problem_dir / "problem.json"
-    if not header.exists() or not source.exists():
+    if not header.exists():
         return []
-    if header.stat().st_mtime >= source.stat().st_mtime:
+    if problem is None:
         return []
-    return [Finding("stale-constraints-header", "high",
-                    "constraints.h is older than problem.json; regenerate it "
-                    "with `python3 -m tools.gen_constraints_header`", str(header))]
+    try:
+        expected = render(problem)
+        actual = header.read_text(encoding="utf-8")
+        if expected == actual:
+            return []
+        return [Finding("stale-constraints-header", "high",
+                        "constraints.h does not match problem.json; regenerate it "
+                        "with `python3 -m tools.gen_constraints_header`", str(header))]
+    except (OSError, UnicodeDecodeError) as exc:
+        return [Finding("stale-constraints-header", "low",
+                        f"constraints.h unreadable: {exc}", str(header))]
 
 
 def _samples(problem_dir: Path, problem: Problem | None) -> list[Finding]:
@@ -151,7 +159,7 @@ def run(problem_dir, tex_path=None, testlib_dir=None) -> list[Finding]:
     findings += _incomplete(problem_dir, testlib_dir)
     findings += _orphans(problem_dir, problem)
     findings += _matrix(problem_dir)
-    findings += _stale_header(problem_dir)
+    findings += _stale_header(problem_dir, problem)
     findings += _samples(problem_dir, problem)
     rank = {"high": 0, "medium": 1, "low": 2}
     return sorted(findings, key=lambda f: (rank[f.severity], f.kind, f.what))
