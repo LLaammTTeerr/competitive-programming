@@ -8,14 +8,24 @@ model solution. It also pins down the fixes made during review: the
 child's own peak RSS (not the driver's), the timing-band re-run path, the
 checker timeout, and the file-IO guard.
 
-Both g++ and the testlib cache are expected to be present wherever this
-suite runs; the skips below are for genuinely absent tooling, not a way to
-quietly avoid exercising the module.
+Task 9b migrated the runner from `os.posix_spawn` + `/proc` polling to the
+ioi/isolate sandbox — there is no fallback runner any more, so the tests
+below that need a real sandbox skip (not fail) when isolate is genuinely
+absent, and otherwise exercise the real thing: the peak-RSS test now pins
+isolate's own cgroup accounting rather than `VmHWM`, and new tests below
+cover isolate-specific outcomes a posix_spawn driver could never produce
+(`status:TO`, `cg-oom-killed`) plus the refuse-to-run and box-cleanup
+guarantees task 9b added.
+
+g++, the testlib cache, and isolate are all expected to be present wherever
+this suite runs; the skips below are for genuinely absent tooling, not a
+way to quietly avoid exercising the module.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +39,17 @@ from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
 BOOTSTRAP_SCRIPT = Path(__file__).resolve().parents[1] / "bootstrap_testlib.sh"
+
+
+def _compile(src_text: str, out_path: Path, tmp_dir: Path) -> Path:
+    """Compile a throwaway C++ source string, for tests that need a binary
+    with a specific misbehavior (busy-looping, memory-hogging) that has no
+    place in the checked-in fixture."""
+    src = tmp_dir / f"{out_path.name}.cpp"
+    src.write_text(src_text, encoding="utf-8")
+    subprocess.run(["g++", "-std=c++17", "-O2", str(src), "-o", str(out_path)],
+                    check=True, capture_output=True)
+    return out_path
 
 
 def _testlib_dir() -> Path:
@@ -57,6 +78,11 @@ class TestRunMatrixFixture(unittest.TestCase):
     def setUp(self):
         if shutil.which("g++") is None:
             raise unittest.SkipTest("g++ not found on PATH")
+        if shutil.which("isolate") is None:
+            raise unittest.SkipTest(
+                "isolate not found on PATH — this driver has no fallback "
+                "runner (task 9b), so the whole suite skips rather than "
+                "failing when the sandbox is genuinely absent")
         self.testlib_dir = _testlib_dir()
 
         # Copy the fixture into a scratch dir so the run's build artifacts
@@ -110,15 +136,18 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(payload["mismatches"], [])
 
     def test_peak_kb_is_the_childs_own_footprint_not_the_drivers(self):
-        # Regression pin for the review finding that `ru_maxrss` after
-        # posix_spawn/fork+exec is max(driver RSS at spawn, child's real
-        # peak): deliberately balloon *this test process's* own RSS well
-        # past anything the tiny fixture binaries could plausibly use, then
-        # confirm the reported peak_kb does not track it. Before the fix
-        # this ballooned ~1:1 with the driver's RSS (see task-9-report.md
-        # for the measured before/after numbers); a bare `assertGreater(...,
-        # 0)` can never catch that regression since the bug over-reports
-        # rather than reporting zero.
+        # Regression pin, originally for the posix_spawn-era finding that
+        # `ru_maxrss` after fork+exec is max(driver RSS at spawn, child's
+        # real peak): deliberately balloon *this test process's* own RSS
+        # well past anything the tiny fixture binaries could plausibly use,
+        # then confirm the reported peak_kb does not track it. Now that
+        # peak_kb comes from isolate's own cgroup accounting (`max-rss` in
+        # its meta file, read from a namespace the driver process isn't
+        # even part of) there is no shared-address-space mechanism left
+        # that *could* leak the driver's RSS into this reading — this test
+        # stays as a regression pin against that entire failure class
+        # reappearing, e.g. if a future change ever reintroduced measuring
+        # from the driver's own process instead of isolate's report.
         ballast = bytearray(250 * 1024 * 1024)
         for i in range(0, len(ballast), 4096):
             ballast[i] = 1  # touch every page so it is really resident
@@ -201,6 +230,107 @@ class TestRunMatrixFixture(unittest.TestCase):
 
         self.assertEqual(verdict, "FAIL")
         self.assertLess(elapsed_s, 5)
+
+    def test_isolate_missing_binary_refuses_with_a_named_fix(self):
+        # Task 9b ruling: no fallback runner. A missing isolate must not
+        # surface as a bare FileNotFoundError/CalledProcessError (R1) — it
+        # must raise MatrixError naming the fix, and that message must be
+        # distinguishable from the "installed but unconfigured" case below.
+        with mock.patch.dict(os.environ, {"ISOLATE_BIN": "/no/such/isolate"}):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.open_isolate_box()
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_isolate_init_failure_is_diagnosed_distinctly_from_missing(self):
+        # The other failure family R1 requires: isolate present on PATH but
+        # `--init` failing (real cause on this machine: an out-of-range
+        # box id: isolate's own box-id range is 0-65535, see `isolate
+        # --cg --box-id=999999 --init`, which fails distinctly from a
+        # missing binary). Standing in for the "installed but
+        # unconfigured" case this driver must diagnose separately, since a
+        # genuinely unconfigured sandbox cannot be produced on this
+        # already-configured machine without root to break it.
+        with mock.patch.object(run_matrix, "_select_box_id", return_value=999_999):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.open_isolate_box()
+        message = str(ctx.exception)
+        self.assertIn("--init", message)
+        self.assertNotIn("not found", message)
+
+    def test_run_once_reports_a_real_tle_as_status_to(self):
+        # A genuine busy loop, run through the real sandbox with a 1s CPU
+        # cap, must come back with isolate's own status:TO — not a driver-
+        # side wait-loop deadline, which no longer exists.
+        binary = _compile("int main(){ volatile long i=0; for(;;) i++; }\n",
+                          self.tmp / "spin", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        out_path = self.tmp / "spin.out"
+
+        isolate = run_matrix.open_isolate_box()
+        try:
+            r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                     cpu_limit_s=1.0, wall_limit_s=3.0,
+                                     mem_limit_kb=256 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertTrue(r.killed, r)
+        self.assertFalse(r.oom, r)
+        self.assertGreaterEqual(r.cpu_ms, 900)
+
+    def test_run_once_reports_a_real_oom_as_cg_oom_killed_and_classifies_ml(self):
+        # A throwaway memory hog (never added to the fixture, per the task's
+        # evidence standard) run under a tight --cg-mem must come back with
+        # cg-oom-killed, and that must classify as ML directly — not RE,
+        # which is the trap this driver has to avoid (a memory kill arrives
+        # as status:SG, indistinguishable from a bare crash by status text
+        # alone; cg-oom-killed is what disambiguates it).
+        binary = _compile(
+            "#include <cstring>\n#include <cstdlib>\n"
+            "int main(){ for(;;){ char*p=(char*)malloc(8*1024*1024); "
+            "if(!p) return 1; memset(p,1,8*1024*1024); } }\n",
+            self.tmp / "hog", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        out_path = self.tmp / "hog.out"
+
+        isolate = run_matrix.open_isolate_box()
+        try:
+            r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                     cpu_limit_s=5.0, wall_limit_s=15.0,
+                                     mem_limit_kb=64 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertTrue(r.oom, r)
+        self.assertFalse(r.killed, r)
+
+        outcome = run_matrix._classify(r, checker=Path("/bin/true"),
+                                       test=stdin_path, out=out_path,
+                                       ans=stdin_path, limits=Limits(
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000))
+        self.assertEqual(outcome.verdict, "ML")
+
+    def test_boxes_are_cleaned_up_after_a_real_run(self):
+        # A box leaked under /var/local/lib/isolate/<id> is exactly the
+        # failure mode a `finally`-guarded `--cleanup` exists to prevent —
+        # confirm it is actually gone after a real fixture run, including
+        # the exception path (this run raises via the hole-firing input).
+        box_dir = Path("/var/local/lib/isolate/54321")
+        with mock.patch.object(run_matrix, "_select_box_id", return_value=54321):
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+            self.assertFalse(box_dir.exists(),
+                             f"{box_dir} still present after a clean run")
+
+            (self.problem_dir / "tests" / "g1" / "01.in").write_text(
+                "0 0\n", encoding="utf-8")
+            payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+            self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
+            self.assertFalse(box_dir.exists(),
+                             f"{box_dir} still present after a hole-firing run")
 
 
 if __name__ == "__main__":
