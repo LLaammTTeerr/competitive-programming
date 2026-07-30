@@ -84,11 +84,35 @@ and a memory kill arrives as `status:SG` — indistinguishable from a bare
 segfault by the status text alone — so `cg-oom-killed` must be tested
 *before* treating an `SG` status as a plain crash, or every OOM misreports
 as RE.
+
+Task 9c: a fresh box per `--run`, not one box reused for the whole
+invocation. The `flight` dogfood found what neither the 9b migration nor
+its review did: isolate's cgroup counters are **not reset between `--run`s
+in the same box**. `cg-mem` is a box-lifetime high-water mark, and
+`cg-oom-killed` is sticky — reproduced with bare isolate, no involvement
+from this module: a memory hog OOMing at 400 MB in box N, followed by
+`int main(){return 0;}` in the *same* box N, reports the hog's `cg-mem`
+*and* the hog's `cg-oom-killed:1` for the trivial program. Since ML
+outranks WA in `_SEVERITY` (`matrix_core`), one OOM used to silently
+overwrite every later solution's verdict in that run — not merely add a
+wrong row, replace correct ones — and `peak_kb` was inflated for every
+solution after the largest memory user, OOM or not, regardless of solution
+order. This is the same class of defect the 9b migration was fixing
+(memory accounting contaminated by something other than the process being
+measured); it had just relocated from the parent process's address space
+into the box's cgroup. The fix: `_run_once` now owns a full
+`--init`/`--run`/`--cleanup` cycle for its own box id, so no run can ever
+observe another run's counters. `open_isolate_box()` still does one
+probe `--init`/`--cleanup` at startup (to fail fast, before any
+compilation, if isolate is missing or unconfigured) but no longer holds a
+box open across the whole invocation — see `IsolateHandle.box_id_counter`
+for how each call gets its own id.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import os
 import platform
@@ -167,29 +191,47 @@ _ISOLATE_HOME = "https://github.com/ioi/isolate"
 
 @dataclasses.dataclass(frozen=True)
 class IsolateHandle:
-    """One open isolate sandbox, reused for every run in this invocation.
+    """The isolate environment for one `run()` invocation — no box is held
+    open across calls any more (Task 9c).
 
-    A box is expensive to set up relative to how cheap it is to reuse: this
-    driver calls `--init` exactly once per `run()` and issues every
-    `--run` for every solution/test through the same box id, varying only
-    the bind-mounted directories per call (isolate reconstructs the box's
-    mount view fresh on each `--run`, so this is safe — verified by
-    running two different test groups through one inited box with no
-    `--cleanup`/`--init` between them).
+    A single box reused for every `--run` was the original design, on the
+    theory that a box is expensive to set up relative to how cheap it is to
+    reuse. That theory was wrong in a way neither the 9b migration nor its
+    review caught: isolate's cgroup counters (`cg-mem`, `cg-oom-killed`) are
+    **not reset between `--run`s in the same box** — reproduced with bare
+    isolate, no involvement from this module (see the module docstring).
+    So every `--run` now gets a brand-new box id, `--init`ed immediately
+    before it and `--cleanup`ed immediately after (see `_run_once`), and
+    this handle carries only what is shared safely across that churn:
+
+    `box_id_counter` hands out a fresh id for each call. It starts from
+    this process's own pid-derived base (`_select_box_id()` — unique among
+    *concurrently running* `run_matrix` invocations, isolate's own
+    contract for box ids) and increments by one per call, wrapping at
+    isolate's box-id range (0-65535). Advancing rather than reusing the
+    same id every time isn't needed for correctness — a fully torn-down
+    box (`--cleanup` completed) has no state left to leak into the next
+    `--init` at the same id — but it costs nothing and further shrinks an
+    already-tiny collision window: a box now exists only for the duration
+    of one `--run`, not this whole invocation, so two processes would have
+    to land the exact same id at the exact same instant, not merely during
+    overlapping lifetimes.
 
     `stage_dir` is a private `mkdtemp()` directory, outside the repository,
-    that is the *only* `:rw` mount any `--run` ever uses — see the module
-    docstring for why a real repo directory must never be the write target
-    again. It lives and dies with the box: created in `open_isolate_box()`,
-    removed in `close_isolate_box()`.
+    that is the *only* `:rw` mount any `--run` ever uses (unrelated to box
+    identity — a plain host directory, shared across every box this
+    invocation opens) — see the module docstring for why a real repo
+    directory must never be the write target again. It lives for the
+    whole `run()` invocation: created in `open_isolate_box()`, removed in
+    `close_isolate_box()`.
     """
 
     binary: str
-    box_id: int
     version: str
     cg: bool
     meta_path: Path
     stage_dir: Path
+    box_id_counter: itertools.count
 
 
 def _isolate_binary_name() -> str:
@@ -229,8 +271,39 @@ def _select_box_id() -> int:
     return os.getpid() % 65536
 
 
+def _init_box(binary: str, box_id: int) -> None:
+    """`isolate --init` for one box id, raising `MatrixError` on failure."""
+    init = subprocess.run([binary, "--cg", f"--box-id={box_id}", "--init"],
+                          capture_output=True, text=True)
+    if init.returncode != 0:
+        raise MatrixError(
+            f"isolate is installed at {binary} but `--init` failed for box "
+            f"{box_id} (exit {init.returncode}): "
+            f"{(init.stderr or init.stdout).strip()}\n"
+            "A missing binary would have failed with a different message "
+            "(see open_isolate_box); this looks instead like an "
+            "installed-but-unconfigured sandbox — isolate needs cgroup v2 "
+            "delegation, the isolate-cg-keeper service (isolate.service) "
+            "enabled and running, and the 'isolate' system user's range "
+            f"registered in /etc/subuid and /etc/subgid. See {_ISOLATE_HOME}."
+        )
+
+
+def _cleanup_box(binary: str, box_id: int) -> None:
+    """`isolate --cleanup` for one box id; best-effort, never raises.
+
+    Called from a `finally` around every single `--run` (Task 9c: a box is
+    now this short-lived, not held for the whole invocation), so a cleanup
+    failure here must not mask whatever real error or result is already
+    propagating out of that call.
+    """
+    subprocess.run([binary, "--cg", f"--box-id={box_id}", "--cleanup"],
+                    capture_output=True, text=True)
+
+
 def open_isolate_box() -> IsolateHandle:
-    """Verify isolate is installed and usable, then open one sandbox.
+    """Verify isolate is installed and usable, then prepare this
+    invocation's isolate environment.
 
     Raises `MatrixError` — naming the fix — for two distinct failure
     families rather than letting a bare `FileNotFoundError` or
@@ -245,6 +318,13 @@ def open_isolate_box() -> IsolateHandle:
        user). This is diagnosed as a *different* message from case 1 so a
        reader is not sent chasing a reinstall when the real problem is
        configuration.
+
+    This still does one `--init`/`--cleanup` probe cycle up front — so a
+    missing/unconfigured sandbox is diagnosed here, before any compilation
+    touches the tree — but does not hold that box open: Task 9c found
+    isolate's cgroup counters persist across `--run`s in the same box, so
+    every actual sandboxed execution (`_run_once`) now opens and tears down
+    its own box instead (see `IsolateHandle.box_id_counter`).
     """
     name = _isolate_binary_name()
     binary = shutil.which(name)
@@ -259,20 +339,11 @@ def open_isolate_box() -> IsolateHandle:
     version_done = subprocess.run([binary, "--version"], capture_output=True, text=True)
     version = version_done.stdout.splitlines()[0] if version_done.stdout else "unknown"
 
-    box_id = _select_box_id()
-    init = subprocess.run([binary, "--cg", f"--box-id={box_id}", "--init"],
-                          capture_output=True, text=True)
-    if init.returncode != 0:
-        raise MatrixError(
-            f"isolate is installed at {binary} but `--init` failed "
-            f"(exit {init.returncode}): {(init.stderr or init.stdout).strip()}\n"
-            "A missing binary would have failed above with a different "
-            "message; this is the installed-but-unconfigured case instead — "
-            "isolate needs cgroup v2 delegation, the isolate-cg-keeper "
-            "service (isolate.service) enabled and running, and the "
-            "'isolate' system user's range registered in /etc/subuid and "
-            f"/etc/subgid. See {_ISOLATE_HOME}."
-        )
+    probe_box_id = _select_box_id()
+    _init_box(binary, probe_box_id)
+    # Immediately torn down: this was only a usability probe. Every real
+    # sandboxed execution opens and closes its own box (see _run_once).
+    _cleanup_box(binary, probe_box_id)
 
     meta_fd, meta_name = tempfile.mkstemp(prefix="run_matrix_isolate_meta_")
     os.close(meta_fd)
@@ -280,25 +351,29 @@ def open_isolate_box() -> IsolateHandle:
     # The only `:rw` mount any `--run` will ever use (see module docstring:
     # a real repo directory must never be the write target again). Private,
     # ours, outside the repository, and deleted whole in `close_isolate_box`
-    # — world-writable is harmless on a directory with that lifetime.
+    # — world-writable is harmless on a directory with that lifetime, and
+    # it is unrelated to box identity: every box this invocation opens and
+    # closes shares this same plain host directory.
     stage_dir = Path(tempfile.mkdtemp(prefix="run_matrix_isolate_stage_"))
     os.chmod(stage_dir, 0o777)
 
-    return IsolateHandle(binary=binary, box_id=box_id, version=version, cg=True,
-                         meta_path=Path(meta_name), stage_dir=stage_dir)
+    return IsolateHandle(binary=binary, version=version, cg=True,
+                         meta_path=Path(meta_name), stage_dir=stage_dir,
+                         box_id_counter=itertools.count(probe_box_id))
 
 
 def close_isolate_box(handle: IsolateHandle) -> None:
-    """Best-effort teardown; never raises.
+    """Best-effort teardown of this invocation's isolate environment; never
+    raises.
 
-    Always called from a `finally`, so a cleanup failure here must not mask
-    whatever real error (or real result) is already propagating — the
-    concern this guards is a leaked box under `/var/local/lib/isolate/` (or
-    a leaked staging directory under `/tmp`), not a crash in the cleanup
-    call itself.
+    No box needs cleaning up here any more (Task 9c): every box `_run_once`
+    opens is torn down in its own `finally` before this function is ever
+    reached, so there is nothing left to leak at the box level regardless
+    of how `run()` exited. This only tears down what *is* shared across
+    the whole invocation — the meta-file path and the staging directory —
+    and, like the old box cleanup, must not raise and mask whatever real
+    error or result is already propagating.
     """
-    subprocess.run([handle.binary, "--cg", f"--box-id={handle.box_id}", "--cleanup"],
-                    capture_output=True, text=True)
     try:
         handle.meta_path.unlink(missing_ok=True)
     except OSError:
@@ -418,96 +493,114 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     `isolate.stage_dir` doesn't accumulate one file per call across a whole
     `run()`); both unlinks rely only on `stage_dir`'s own permissions,
     which this process set to 0o777 when it created it.
+
+    Task 9c: every call gets its **own, freshly-`--init`ed box** — one is
+    claimed from `isolate.box_id_counter`, `--init`ed before the sandboxed
+    execution, and `--cleanup`ed in a `finally` regardless of how this
+    function returns or raises. isolate's cgroup counters (`cg-mem`,
+    `cg-oom-killed`) persist across `--run`s in the same box — verified
+    with bare isolate, no involvement from this module (see module
+    docstring) — so reusing a box across calls let one solution's memory
+    reading contaminate every later one in the same box, exactly the class
+    of defect this sandbox migration was meant to eliminate. A box that
+    lives only from just before this one `--run` to just after it can never
+    observe another call's counters.
     """
-    mounts: dict[Path, str] = {}
-
-    def _label(path: Path) -> str:
-        resolved = path.resolve()
-        if resolved not in mounts:
-            mounts[resolved] = f"/host{len(mounts)}"
-        return mounts[resolved]
-
-    bin_label = _label(binary.parent)
-    stdin_label = _label(stdin_path.parent)
-    stage_label = _label(isolate.stage_dir)
-    stage_dir_resolved = isolate.stage_dir.resolve()
-
-    staged_out = isolate.stage_dir / "run.out"
-    staged_out.unlink(missing_ok=True)
-
-    cmd = [
-        isolate.binary, "--cg", f"--box-id={isolate.box_id}", "--run",
-        f"--meta={isolate.meta_path}", f"--processes={ISOLATE_PROCESSES}",
-        f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
-        f"--cg-mem={mem_limit_kb}",
-    ]
-    for resolved, label in mounts.items():
-        opt = ":rw" if resolved == stage_dir_resolved else ""
-        cmd.append(f"--dir={label}={resolved}{opt}")
-    cmd += [
-        f"--chdir={bin_label}",
-        f"--stdin={stdin_label}/{stdin_path.name}",
-        f"--stdout={stage_label}/{staged_out.name}",
-        "--", f"{bin_label}/{binary.name}",
-    ]
-
-    subprocess.run(cmd, capture_output=True, text=True)
-    # isolate's own process exit code is not the contract here — 0 means OK
-    # but 1 covers TO/SG/RE alike, so it cannot distinguish them. The meta
-    # file is the actual contract (verified against this exact isolate
-    # build; see the module docstring and the task report for pasted
-    # output from all four cases).
+    box_id = next(isolate.box_id_counter) % 65536
+    _init_box(isolate.binary, box_id)
     try:
-        meta_text = isolate.meta_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise MatrixError(
-            f"isolate produced no readable meta file for {binary} on "
-            f"{stdin_path}: {exc}"
-        ) from exc
-    if not meta_text.strip():
-        raise MatrixError(
-            f"isolate produced an empty meta file for {binary} on "
-            f"{stdin_path} — the sandboxed run did not report any outcome"
-        )
-    meta = _parse_meta(meta_text)
+        mounts: dict[Path, str] = {}
 
-    status = meta.get("status", "")  # absent -> OK; see module docstring trap 1
-    if status == "XX":
-        raise MatrixError(
-            f"isolate reported an internal error (status XX) running "
-            f"{binary} on {stdin_path}: {meta.get('message', '(no message)')} "
-            "— this is isolate's own failure, not a verdict on the solution."
-        )
+        def _label(path: Path) -> str:
+            resolved = path.resolve()
+            if resolved not in mounts:
+                mounts[resolved] = f"/host{len(mounts)}"
+            return mounts[resolved]
 
-    oom = meta.get("cg-oom-killed") == "1"  # must be tested before treating
-    killed = status == "TO"                 # SG as a plain crash (trap 2)
-    crashed = (not oom) and status in ("RE", "SG")
-    message = meta.get("message", "")
+        bin_label = _label(binary.parent)
+        stdin_label = _label(stdin_path.parent)
+        stage_label = _label(isolate.stage_dir)
+        stage_dir_resolved = isolate.stage_dir.resolve()
 
-    try:
-        cpu_ms = int(round(float(meta.get("time", "0")) * 1000))
-        wall_ms = int(round(float(meta.get("time-wall", "0")) * 1000))
-        peak_kb = int(meta.get("max-rss", "0"))
-        exit_code = int(meta.get("exitcode", "0"))
-    except ValueError as exc:
-        raise MatrixError(
-            f"isolate meta file malformed for {binary} on {stdin_path}: "
-            f"{meta!r} ({exc})"
-        ) from exc
+        staged_out = isolate.stage_dir / "run.out"
+        staged_out.unlink(missing_ok=True)
 
-    # Copy the sandboxed output back into the repository as *this* process
-    # — never write it through a bind mount again (see docstring above).
-    try:
-        data = staged_out.read_bytes()
-    except FileNotFoundError:
-        data = b""
-    stdout_dest.unlink(missing_ok=True)
-    stdout_dest.write_bytes(data)
-    staged_out.unlink(missing_ok=True)
+        cmd = [
+            isolate.binary, "--cg", f"--box-id={box_id}", "--run",
+            f"--meta={isolate.meta_path}", f"--processes={ISOLATE_PROCESSES}",
+            f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
+            f"--cg-mem={mem_limit_kb}",
+        ]
+        for resolved, label in mounts.items():
+            opt = ":rw" if resolved == stage_dir_resolved else ""
+            cmd.append(f"--dir={label}={resolved}{opt}")
+        cmd += [
+            f"--chdir={bin_label}",
+            f"--stdin={stdin_label}/{stdin_path.name}",
+            f"--stdout={stage_label}/{staged_out.name}",
+            "--", f"{bin_label}/{binary.name}",
+        ]
 
-    return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
-                      crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
-                      status=status, message=message)
+        subprocess.run(cmd, capture_output=True, text=True)
+        # isolate's own process exit code is not the contract here — 0 means
+        # OK but 1 covers TO/SG/RE alike, so it cannot distinguish them. The
+        # meta file is the actual contract (verified against this exact
+        # isolate build; see the module docstring and the task report for
+        # pasted output from all four cases).
+        try:
+            meta_text = isolate.meta_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise MatrixError(
+                f"isolate produced no readable meta file for {binary} on "
+                f"{stdin_path}: {exc}"
+            ) from exc
+        if not meta_text.strip():
+            raise MatrixError(
+                f"isolate produced an empty meta file for {binary} on "
+                f"{stdin_path} — the sandboxed run did not report any outcome"
+            )
+        meta = _parse_meta(meta_text)
+
+        status = meta.get("status", "")  # absent -> OK; see module docstring trap 1
+        if status == "XX":
+            raise MatrixError(
+                f"isolate reported an internal error (status XX) running "
+                f"{binary} on {stdin_path}: {meta.get('message', '(no message)')} "
+                "— this is isolate's own failure, not a verdict on the solution."
+            )
+
+        oom = meta.get("cg-oom-killed") == "1"  # must be tested before treating
+        killed = status == "TO"                 # SG as a plain crash (trap 2)
+        crashed = (not oom) and status in ("RE", "SG")
+        message = meta.get("message", "")
+
+        try:
+            cpu_ms = int(round(float(meta.get("time", "0")) * 1000))
+            wall_ms = int(round(float(meta.get("time-wall", "0")) * 1000))
+            peak_kb = int(meta.get("max-rss", "0"))
+            exit_code = int(meta.get("exitcode", "0"))
+        except ValueError as exc:
+            raise MatrixError(
+                f"isolate meta file malformed for {binary} on {stdin_path}: "
+                f"{meta!r} ({exc})"
+            ) from exc
+
+        # Copy the sandboxed output back into the repository as *this*
+        # process — never write it through a bind mount again (see
+        # docstring above).
+        try:
+            data = staged_out.read_bytes()
+        except FileNotFoundError:
+            data = b""
+        stdout_dest.unlink(missing_ok=True)
+        stdout_dest.write_bytes(data)
+        staged_out.unlink(missing_ok=True)
+
+        return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
+                          crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
+                          status=status, message=message)
+    finally:
+        _cleanup_box(isolate.binary, box_id)
 
 
 def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,

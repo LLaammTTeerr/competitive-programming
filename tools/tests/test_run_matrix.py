@@ -328,6 +328,124 @@ class TestRunMatrixFixture(unittest.TestCase):
                                            t_main_ms=1, tl_ms=1000, kill_ms=2000))
         self.assertEqual(outcome.verdict, "ML")
 
+    def test_oom_does_not_leak_into_the_next_run_in_the_same_handle(self):
+        # Task 9c: the `flight` dogfood found that isolate's cgroup counters
+        # are NOT reset between `--run`s in the same box — reproduced with
+        # bare isolate, no involvement from this module. A hog that OOMs
+        # followed by a trivial, memory-innocent program in the SAME box
+        # reported the hog's cg-oom-killed for the trivial program too.
+        # Since ML outranks WA in _SEVERITY, that doesn't just add a wrong
+        # row to invocation.json — it overwrites a correct verdict with a
+        # wrong one. This test must FAIL against the single-persistent-box
+        # code this task replaces (confirmed: see the task report for the
+        # actual failing-before transcript) and PASS now that every
+        # `_run_once` call draws its own fresh box from the same
+        # `IsolateHandle` via `box_id_counter`.
+        hog = _compile(
+            "#include <cstring>\n#include <cstdlib>\n"
+            "int main(){ for(;;){ char*p=(char*)malloc(8*1024*1024); "
+            "if(!p) return 1; memset(p,1,8*1024*1024); } }\n",
+            self.tmp / "hog2", self.tmp)
+        tiny = _compile("int main(){ return 0; }\n", self.tmp / "tiny", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box()
+        try:
+            r_hog = run_matrix._run_once(
+                isolate, hog, stdin_path, self.tmp / "hog2.out",
+                cpu_limit_s=5.0, wall_limit_s=15.0, mem_limit_kb=64 * 1024)
+            self.assertTrue(r_hog.oom, r_hog)  # sanity: the hog did OOM
+
+            r_tiny = run_matrix._run_once(
+                isolate, tiny, stdin_path, self.tmp / "tiny.out",
+                cpu_limit_s=5.0, wall_limit_s=15.0, mem_limit_kb=64 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r_tiny.oom, r_tiny)
+        self.assertLess(r_tiny.peak_kb, 10_000, r_tiny)
+
+    def test_peak_kb_does_not_carry_over_between_runs(self):
+        # The other half of the same box-lifetime bug: `cg-mem` is a
+        # box-lifetime high-water mark, so a solution that allocates
+        # substantially followed by one that does not must not have the
+        # second's peak_kb inflated by the first's — with or without an
+        # OOM involved.
+        # `p` is `volatile` and written a non-constant value per page: a
+        # plain malloc+memset+read-one-byte with no other use of `p` is
+        # legal for GCC to constant-fold away *entirely* (it can prove the
+        # byte printed back is always 1 and eliminate the allocation with
+        # it) — which the first version of this test learned the hard way
+        # (objdump showed no call to malloc/memset at all, and peak_kb came
+        # back at ~1.6 MB instead of ~200 MB). `volatile` forces every
+        # access to actually happen.
+        big = _compile(
+            "#include <cstdlib>\n#include <cstdio>\n"
+            "int main(){ size_t n = 200*1024*1024; "
+            "volatile char *p = (volatile char*)malloc(n); if(!p) return 1; "
+            "for (size_t i = 0; i < n; i += 4096) p[i] = (char)(i & 0xFF); "
+            "printf(\"%d\\n\", (int)p[n-4096]); return 0; }\n",
+            self.tmp / "big", self.tmp)
+        small = _compile("int main(){ return 0; }\n", self.tmp / "small", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box()
+        try:
+            r_big = run_matrix._run_once(
+                isolate, big, stdin_path, self.tmp / "big.out",
+                cpu_limit_s=5.0, wall_limit_s=15.0, mem_limit_kb=256 * 1024)
+            r_small = run_matrix._run_once(
+                isolate, small, stdin_path, self.tmp / "small.out",
+                cpu_limit_s=5.0, wall_limit_s=15.0, mem_limit_kb=256 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r_big.oom, r_big)
+        self.assertGreater(r_big.peak_kb, 100_000, r_big)
+        self.assertLess(r_small.peak_kb, 10_000, r_small)
+        self.assertNotEqual(r_big.peak_kb, r_small.peak_kb)
+
+    def test_box_is_cleaned_up_after_a_single_run_that_raises(self):
+        # Task 9c: cleanup is now per-`--run` (a box lives from just before
+        # one _run_once call to just after it), not per-run() — so the
+        # exception-safety guarantee has to be re-pinned at that smaller
+        # scope. Force _run_once itself to raise partway through (after the
+        # sandboxed process has already run and a box exists) by making
+        # meta parsing blow up, and confirm that specific box is still
+        # torn down by _run_once's own `finally`.
+        binary = _compile("int main(){ return 0; }\n", self.tmp / "ok", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        out_path = self.tmp / "ok.out"
+
+        box_dir = Path("/var/local/lib/isolate/54323")
+        with mock.patch.object(run_matrix, "_select_box_id", return_value=54323):
+            isolate = run_matrix.open_isolate_box()
+        try:
+            # itertools.count(54323)'s first next() yields 54323 itself, so
+            # this first _run_once call is guaranteed to use box 54323.
+            with mock.patch.object(run_matrix, "_parse_meta",
+                                   side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                         cpu_limit_s=1.0, wall_limit_s=3.0,
+                                         mem_limit_kb=256 * 1024)
+            self.assertFalse(box_dir.exists(),
+                             f"{box_dir} still present after _run_once raised")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def _isolate_boxes(self) -> set[str]:
+        base = Path("/var/local/lib/isolate")
+        if not base.is_dir():
+            return set()
+        return {p.name for p in base.iterdir()}
+
     def test_boxes_are_cleaned_up_after_a_real_run(self):
         # A box leaked under /var/local/lib/isolate/<id> is exactly the
         # failure mode a `finally`-guarded `--cleanup` exists to prevent —
@@ -338,18 +456,25 @@ class TestRunMatrixFixture(unittest.TestCase):
         # test_boxes_are_cleaned_up_after_run_raises below for the path
         # that does raise, which review found this test's old comment
         # claimed to cover but did not.
-        box_dir = Path("/var/local/lib/isolate/54321")
+        #
+        # Task 9c: `run()` now opens and closes a *different* box for every
+        # single sandboxed execution (see IsolateHandle.box_id_counter), so
+        # checking only the mocked base id would only ever pin the first
+        # of several boxes a real run opens. Snapshotting the whole
+        # directory before and after is the check that actually covers
+        # every box this invocation touched, not just the first.
+        before = self._isolate_boxes()
         with mock.patch.object(run_matrix, "_select_box_id", return_value=54321):
             run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertFalse(box_dir.exists(),
-                             f"{box_dir} still present after a clean run")
+            self.assertEqual(self._isolate_boxes(), before,
+                             "a box was left behind after a clean run")
 
             (self.problem_dir / "tests" / "g1" / "01.in").write_text(
                 "0 0\n", encoding="utf-8")
             payload = run_matrix.run(self.problem_dir, self.testlib_dir)
             self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
-            self.assertFalse(box_dir.exists(),
-                             f"{box_dir} still present after a hole-firing run")
+            self.assertEqual(self._isolate_boxes(), before,
+                             "a box was left behind after a hole-firing run")
 
     def test_boxes_are_cleaned_up_after_run_raises(self):
         # Task 9b review finding D: the test above never actually drives
@@ -361,12 +486,12 @@ class TestRunMatrixFixture(unittest.TestCase):
         (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
             _MAIN_HEADER + "int main(){ int *p = nullptr; *p = 1; return 0; }\n",
             encoding="utf-8")
-        box_dir = Path("/var/local/lib/isolate/54322")
+        before = self._isolate_boxes()
         with mock.patch.object(run_matrix, "_select_box_id", return_value=54322):
             with self.assertRaises(run_matrix.MatrixError):
                 run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertFalse(box_dir.exists(),
-                             f"{box_dir} still present after run() raised")
+            self.assertEqual(self._isolate_boxes(), before,
+                             "a box was left behind after run() raised")
 
     def test_crashing_model_solution_is_diagnosed_as_crashed_not_exited_0(self):
         # Task 9b review finding A: a signal death (status SG) carries no
