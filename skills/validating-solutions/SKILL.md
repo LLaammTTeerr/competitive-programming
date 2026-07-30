@@ -139,6 +139,17 @@ and `failed` are Polygon's remaining two and are rarely needed in this
 pipeline (a stock checker never emits PE, and `failed` is for a
 checker/package bug, not a deliberately-wrong solution).
 
+The nine rows above are a **menu of classes to consider, not a checklist to
+complete.** A problem whose only quantities are small string lengths or
+real-valued probabilities has nowhere a 32-bit-vs-64-bit bug could hide —
+forcing an `overflow` entry onto a problem shaped like that produces exactly
+the strawman the second rule below forbids, since no legal input would ever
+exercise it. Skip a row with no plausible instance for this problem's shape,
+but **record the skip and its one-line reason** — a flag, a line in the
+run's own report, anything durable — because a silently absent class reads
+identically to one the writer simply forgot, and only one of those two is
+fine.
+
 Two rules make the zoo worth writing:
 
 - **Each wrong solution is wrong in exactly one named way.** One wrong in
@@ -150,6 +161,20 @@ Two rules make the zoo worth writing:
   competent contestant submit this at 2am?"* A greedy nobody would write
   catches nothing and inflates the report with a class that was never a real
   risk.
+
+### Convergence-based `time-limit-exceeded` needs a floor
+
+A solution whose slowness comes from **iterative convergence** — power
+iteration, a fixed-point loop, simulated annealing — rather than from raw
+algorithmic complexity needs a **minimum iteration floor**, not merely a
+sweep count that scales with input size. Scaling sweeps as, say, `2^n` looks
+exponential and therefore "right" for this class, but at the *smallest*
+legal input that same formula may run too few iterations to converge — the
+solution then returns a wrong number on the small group, which is `WA`, not
+`TL`, and an `@expect` written from the class name alone is already wrong
+before the matrix ever runs. Verify convergence at the smallest legal size,
+not only at the sizes meant to time out, before declaring `@expect` for this
+class.
 
 ## Writing the zoo is a fan-out
 
@@ -195,6 +220,41 @@ source, not paraphrased from memory):
 - **`@why-wrong`** is optional; `@algorithm` and `@complexity` are not.
 - **Exactly one `main`** is required across the whole `solutions/` directory
   — zero or two both fail the scan.
+
+### A row's name is not a promise about the realized verdict
+
+`@tag wrong-answer` names the **defect**, not the verdict the matrix will
+report. What actually comes back depends on what the checker makes of the
+specific output on the specific test, and two ways that can surprise a
+setter who only read the row name:
+
+- **A malformed number is `PE`, not `WA`.** A solution that emits `NaN` (or
+  empty output, or a token the checker can't parse as the expected type)
+  fails at the checker's own parse step, before any numeric comparison
+  happens at all — a stock checker like `rcmp6` reports that as `_pe`, not
+  `_wa`. Writing `@expect g1=WA` without having actually run the solution
+  and read what it produced is a guess, not an observation.
+- **`group_verdict` collapses a group to its single most severe verdict** —
+  worst-first order `FAIL > TL > ML > RE > PE > WA > OK` — so if one test in
+  a group produces `PE` (say, a NaN) and a *different* test in that same
+  group would have produced `WA` (an ordinary wrong number), the group as a
+  whole reports `PE`, and the `WA` signal from the other test is invisible
+  in that cell. Both tests may be doing their job perfectly; the group-level
+  aggregate hides one of them.
+
+This is not a bug in `group_verdict` or the checker — collapsing to one
+verdict per group is exactly the aggregation this pipeline expects, and
+confirming the checker's own exit-code mapping is correct is a separate
+question (see Environment facts) from confirming a hand-guessed `@expect`
+was accurate.
+
+**Practical fix: derive `@expect` from an observed run, never from the row
+name.** Run the solution against the real tests once before writing its
+metadata block, read what the checker actually returned, and write that. A
+mismatch `run_matrix` reports later is information about *both* sides —
+either the manifest's guess was wrong, or a group is masking one test's
+verdict behind another's, which is worth knowing about the test suite, not
+only about the solution.
 
 ## Running the matrix
 
@@ -258,6 +318,18 @@ Runs only when two `accepted`-class solutions disagree on some input X:
 4. **Hard stop after 3 rounds regardless of outcome**, escalating with the
    minimal case reached so far — an arbiter that can run forever is not an
    arbiter, it's a stall.
+
+Before treating a persistent disagreement as a logic bug or as statement
+ambiguity (step 3), rule out a third cause that is neither: **the iterative
+side hasn't converged.** If either disagreeing solution — including the
+tiny-N brute itself — is iterative or convergence-based rather than exact,
+its accuracy depends on a cap (sweep count, iteration limit) that may simply
+be too low for this particular input's mixing time, especially if its state
+space is larger or slower-mixing than the other side's. Re-run the iterative
+side with a substantially higher cap before concluding anything about
+correctness; if the disagreement disappears, the fix is a bigger cap, not a
+code change, and skipping this check spends a full arbiter round chasing a
+bug that was never there.
 
 **Invoke `superpowers:systematic-debugging`** for the shrink-and-diagnose
 loop in steps 1–2: this is a debugging loop wearing a different name, and its
