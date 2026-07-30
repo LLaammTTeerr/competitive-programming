@@ -61,3 +61,53 @@ def classify(
     if checker_verdict == "FAIL":
         return Outcome("FAIL", banded=False)
     return Outcome(checker_verdict, banded=False)
+
+
+# Worst-first. FAIL is a package bug and must never be masked by a solution's
+# own failure; TL outranks WA because the judge stops before the checker runs.
+_SEVERITY = ["FAIL", "TL", "ML", "RE", "PE", "WA", "OK"]
+
+_FAILING = {"WA", "TL", "ML", "PE", "RE"}
+
+
+def group_verdict(per_test: list[str]) -> str:
+    """Collapse a group's per-test verdicts into the one the judge would report."""
+    if not per_test:
+        raise ValueError("a group must contain at least one test")
+    for verdict in _SEVERITY:
+        if verdict in per_test:
+            return verdict
+    raise ValueError(f"unknown verdicts in group: {sorted(set(per_test))}")
+
+
+def compare(
+    expected: dict[str, dict[str, str]],
+    actual: dict[str, dict[str, str]],
+) -> tuple[list[dict], list[dict]]:
+    """Split every disagreement into holes and mismatches.
+
+    A hole is the suite's failure: a solution declared wrong that nothing
+    caught. A mismatch is everything else that differed, which is where an
+    accepted solution disagreeing with the model shows up.
+    """
+    holes: list[dict] = []
+    mismatches: list[dict] = []
+
+    for solution in sorted(expected):
+        for group in expected[solution]:
+            want = expected[solution][group]
+            got = actual.get(solution, {}).get(group)
+            if want == got:
+                continue
+            record = {
+                "solution": solution,
+                "group": group,
+                "expected": want,
+                "actual": got,
+            }
+            if want in _FAILING and got == "OK":
+                holes.append(record)
+            else:
+                mismatches.append(record)
+
+    return holes, mismatches

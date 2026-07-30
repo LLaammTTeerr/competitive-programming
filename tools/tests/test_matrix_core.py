@@ -145,5 +145,70 @@ class TestClassify(unittest.TestCase):
         self.assertFalse(out.banded)
 
 
+class TestGroupVerdict(unittest.TestCase):
+    def test_all_ok_is_ok(self):
+        from tools.matrix_core import group_verdict
+        self.assertEqual(group_verdict(["OK", "OK", "OK"]), "OK")
+
+    def test_one_failure_decides_the_group(self):
+        from tools.matrix_core import group_verdict
+        self.assertEqual(group_verdict(["OK", "WA", "OK"]), "WA")
+
+    def test_worst_verdict_wins_when_several_differ(self):
+        from tools.matrix_core import group_verdict
+        # FAIL is a package bug and must never be masked by a mere WA.
+        self.assertEqual(group_verdict(["WA", "FAIL", "TL"]), "FAIL")
+        self.assertEqual(group_verdict(["OK", "TL", "WA"]), "TL")
+
+    def test_empty_group_is_an_error(self):
+        from tools.matrix_core import group_verdict
+        with self.assertRaises(ValueError):
+            group_verdict([])
+
+
+class TestCompare(unittest.TestCase):
+    def test_everything_matching_yields_nothing(self):
+        from tools.matrix_core import compare
+        expected = {"sol-main.cpp": {"g1": "OK", "g2": "OK"}}
+        holes, mismatches = compare(expected, expected)
+        self.assertEqual(holes, [])
+        self.assertEqual(mismatches, [])
+
+    def test_a_rejected_solution_that_survived_is_a_hole(self):
+        from tools.matrix_core import compare
+        expected = {"sol-greedy.cpp": {"g1": "WA", "g2": "WA"}}
+        actual = {"sol-greedy.cpp": {"g1": "OK", "g2": "WA"}}
+        holes, mismatches = compare(expected, actual)
+        self.assertEqual(len(holes), 1)
+        self.assertEqual(holes[0], {"solution": "sol-greedy.cpp", "group": "g1",
+                                    "expected": "WA", "actual": "OK"})
+        self.assertEqual(mismatches, [])
+
+    def test_an_accepted_solution_that_failed_is_a_mismatch_not_a_hole(self):
+        from tools.matrix_core import compare
+        expected = {"sol-conway.cpp": {"g1": "OK"}}
+        actual = {"sol-conway.cpp": {"g1": "WA"}}
+        holes, mismatches = compare(expected, actual)
+        self.assertEqual(holes, [])
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0]["actual"], "WA")
+
+    def test_wrong_flavour_of_failure_is_a_mismatch(self):
+        from tools.matrix_core import compare
+        expected = {"sol-brute.cpp": {"g2": "TL"}}
+        actual = {"sol-brute.cpp": {"g2": "WA"}}
+        holes, mismatches = compare(expected, actual)
+        self.assertEqual(holes, [])
+        self.assertEqual(len(mismatches), 1)
+
+    def test_a_group_with_no_result_is_a_mismatch(self):
+        from tools.matrix_core import compare
+        expected = {"sol-main.cpp": {"g1": "OK", "g2": "OK"}}
+        actual = {"sol-main.cpp": {"g1": "OK"}}
+        holes, mismatches = compare(expected, actual)
+        self.assertEqual(len(mismatches), 1)
+        self.assertIsNone(mismatches[0]["actual"])
+
+
 if __name__ == "__main__":
     unittest.main()
