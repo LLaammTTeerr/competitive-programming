@@ -184,7 +184,7 @@ class TestRunMatrixFixture(unittest.TestCase):
             self.assertGreater(record["peak_kb"], 0)
 
     def test_band_result_is_reached_and_flagged_with_accurate_wording(self):
-        # Force every test into the [TL, kill] band deterministically by
+        # Force every test into the (TL, kill] band deterministically by
         # patching compute_limits (imported by name into run_matrix, hence
         # patchable as run_matrix.compute_limits) rather than engineering a
         # sleep-based solution. tl_ms=-1 guarantees classify()'s `time_ms >

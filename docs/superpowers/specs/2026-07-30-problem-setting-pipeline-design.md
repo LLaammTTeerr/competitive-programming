@@ -219,7 +219,8 @@ t_main   = max over tests of (median of 3 runs)
 TL       = max(2 × t_main, 1000 ms), rounded up to a human number
 kill at  = 2 × TL   (= 4 × t_main when the floor is not binding)
 verdict  = AC if t <= TL, else TLE
-band     = [TL, 2×TL] — finished but over: FLAG, never claim a verdict
+band     = (TL, 2×TL] — strictly over TL (t == TL is still AC), up through
+           2×TL: finished but over: FLAG, never claim a verdict
 ```
 
 Rationale for each part:

@@ -3,7 +3,8 @@
 
 Timing policy, from the spec: the model solution is timed as the median of
 three runs per test and the limit follows from its slowest test. Adversary
-solutions get one run, and only a result landing in the [TL, kill] band is
+solutions get one run, and only a result landing in the (TL, kill] band —
+strictly over TL, since a run exactly at TL is accepted, up through kill — is
 re-run three times before being reported — three runs of everything triples
 the cost of the pipeline for no gain outside the band.
 
@@ -798,7 +799,7 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
         # Pass 2 — everything else, one run, band results re-timed.
         # `--time` is set to `kill_ms` (not `tl_ms`): that is the value the
         # old driver's own wait loop enforced as its hard kill deadline,
-        # and preserving it here is what keeps the [TL, kill] band
+        # and preserving it here is what keeps the (TL, kill] band
         # reachable at all — a solution genuinely running between TL and
         # kill must be allowed to actually finish in that window so
         # `classify()` can band it, not be cut off by isolate at TL first.

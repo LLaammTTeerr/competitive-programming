@@ -52,7 +52,9 @@ def classify(
 
     Time is decided before correctness: a judge stops a solution at the limit,
     so the checker never runs on one that exceeded it. `banded` marks the
-    [TL, kill] zone, where the result is too close to call on other hardware.
+    (TL, kill] zone — strictly over TL, open on that end, since a run
+    exactly at TL is accepted (see the `>` below, not `>=`) — where the
+    result is too close to call on other hardware.
     """
     if killed:
         return Outcome("TL", banded=False)

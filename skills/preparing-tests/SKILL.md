@@ -115,9 +115,11 @@ paragraph:
 - **Timing is CPU time**, as isolate reports it, never wall clock — far
   less sensitive to what else is running on the box. `TL = max(2 × t_main,
   1000 ms floor)`, rounded up to the nearest 500 ms; the sandbox kills at
-  `2 × TL`. A result landing in `[TL, 2×TL]` is flagged as `timing-band` and
-  never given a pass/fail verdict — it is a coin flip on different hardware,
-  not a number to argue with.
+  `2 × TL`. A result exactly at `TL` is accepted — the comparison is
+  strictly-greater — so the band is `(TL, 2×TL]`, open at `TL` and closed at
+  `2×TL`; only a result strictly over `TL` and up through `2×TL` is flagged
+  as `timing-band` and never given a pass/fail verdict — it is a coin flip
+  on different hardware, not a number to argue with.
 - **Memory is enforced by the kernel**, not observed. isolate's `--cg-mem`
   plus its `cg-oom-killed` meta field *is* the ML signal — there is no
   polled RSS reading to second-guess, and none of that reasoning belongs in
