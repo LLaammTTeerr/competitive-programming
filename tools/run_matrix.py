@@ -16,10 +16,28 @@ fallback occasionally reported the *driver's* memory (a false-positive ML on
 a correct solution), and `VmHWM` polling could only under-report a peak,
 never over it (a false-negative ML on a solution engineered just over the
 limit). isolate enforces both time and memory *in the kernel* and reports
-the outcome in a meta file, so neither defect is possible here: a memory
-kill is `cg-oom-killed:1` from the cgroup, not an after-the-fact comparison
-against a polled reading, and a time kill is `status:TO` from the sandbox's
-own clock, not a wait-loop deadline this process has to race against.
+the outcome in a meta file: a memory kill is `cg-oom-killed:1` from the
+cgroup, not an after-the-fact comparison against a polled reading, and a
+time kill is `status:TO` from the sandbox's own clock, not a wait-loop
+deadline this process has to race against.
+
+What this module *does* guarantee about accounting, stated precisely
+because a stronger claim ("neither defect is possible here") stood in this
+docstring for two tasks and was false the whole time — see the staging
+paragraph below for the third relocation of the same defect class:
+
+    Memory is bounded by `--cg-mem` and reported by `max-rss`. Output size
+    is bounded by `--fsize` (`OUTPUT_LIMIT_KB`) and is *not* reported at
+    all. These are two different limits over two different resources, and
+    the only thing that keeps them independent is that the file a solution
+    writes its stdout to lives on a **disk-backed** filesystem. On tmpfs
+    they are the same limit, because tmpfs pages are charged to the writing
+    cgroup and are never reclaimable — a solution printing 70 MB under a
+    64 MB memory limit is OOM-killed for its *output*, and reported ML on
+    2.5% of the limit it was actually given. That is why `_stage_base()`
+    refuses to stage on a memory-backed filesystem rather than warning, and
+    why `--fsize` is passed explicitly rather than left to the accident of
+    where the staging directory happened to land.
 
 There is no fallback runner. If isolate is missing, or installed but not
 usable (unconfigured cgroup delegation, no subuid/subgid range, the
@@ -51,9 +69,9 @@ CI rewrite of the checkout would all fail on those files, and — worse —
 account could substitute test inputs or answer keys for a problem still
 under preparation. This driver instead gives every `--run` a *private*
 staging directory (`IsolateHandle.stage_dir`, one `mkdtemp` per `run()`,
-world-writable — which is harmless there, since it is ours, ephemeral, and
-outside the repository entirely) as the only `:rw` mount; the binary's and
-the test input's directories are mounted read-only. After each run, the
+world-writable — which is harmless there, since it is ours and ephemeral)
+as the only `:rw` mount; the binary's and the test input's directories are
+mounted read-only. After each run, the
 staged output is copied back into the repository with an ordinary
 `Path.write_bytes()` call from *this* (unprivileged) process — never
 bind-mounted — so every artifact that lands in the user's tree keeps its
@@ -120,6 +138,43 @@ does one probe `--init`/`--cleanup` at startup (to fail fast, before any
 compilation, if isolate is missing or unconfigured) but no longer holds a
 box open across the whole invocation — see `IsolateHandle.box_id_counter`
 for how each call gets its own id.
+
+Where the staging directory lives, and why it is not `/tmp`: the third
+relocation of one defect class. The staging directory 9b introduced was a
+plain `tempfile.mkdtemp()`, which lands under `$TMPDIR` — `/tmp` — and
+`/tmp` is `tmpfs` on this machine and on most modern Linux. `--stdout`
+points into that directory while `--cg-mem` caps the same cgroup, and
+tmpfs pages are charged to the writing cgroup and are not reclaimable, so
+**a solution's own stdout counted against its memory limit**. Reproduced
+with bare isolate, no involvement from this module: a 1.6 MB program
+writing 70 MB to stdout under a 64 MB limit reported
+`max-rss:1668  cg-mem:65536  cg-oom-killed:1  status:SG` — a false ML on a
+program using 2.5% of the limit it was given. This is the same class as
+the two above (memory accounting contaminated by something other than the
+process being measured): it was the parent's `mm` (9), then the box's
+cgroup (9c), and then the directory the output was staged in. The fix has
+two halves and both are load-bearing:
+
+  * `_stage_base()` picks a **disk-backed** location — by default the
+    problem directory's parent (the same filesystem as the work being
+    staged), overridable with `$RUN_MATRIX_STAGE_DIR`, never falling back
+    to `/tmp`. If the chosen location is memory-backed it raises
+    `MatrixError` rather than warning: this driver's standing doctrine is
+    that it refuses to run rather than produce a confidently wrong
+    verdict, the same call already made for a missing sandbox and for
+    file-based IO, and a warning on stderr in the middle of a few hundred
+    runs is exactly the thing a caller reads past.
+
+  * `--fsize=OUTPUT_LIMIT_KB` bounds the output explicitly. Until this
+    fix, tmpfs *accidentally* capped output at `memory_mb`; moving staging
+    to disk removes that accident, and a `while(1) putchar()` solution —
+    precisely the kind a deliberately-wrong zoo invites — would otherwise
+    write until the disk filled and then have the whole file loaded into
+    the driver's RAM by `staged_out.read_bytes()`. Exceeding `--fsize`
+    kills the process with SIGXFSZ, which arrives as `status:SG` with no
+    `cg-oom-killed`, so it is classified `RE` — the honest verdict for a
+    solution whose output ran away, and distinct from the `ML` a real
+    memory hog gets.
 """
 
 from __future__ import annotations
@@ -177,6 +232,39 @@ CHECKER_TIMEOUT_S = 10
 MODEL_SAFETY_CPU_S = 60.0
 MODEL_SAFETY_WALL_S = 90.0
 
+# Where the per-invocation staging directory is created, and the escape
+# hatch for a machine whose problem tree is somewhere unsuitable. Read by
+# `_stage_base()`; deliberately not defaulted to `/tmp` under any
+# circumstance — see the module docstring for the false-ML that caused.
+STAGE_DIR_ENV = "RUN_MATRIX_STAGE_DIR"
+
+# Filesystems whose pages are charged to the writing process's cgroup and
+# are not reclaimable — i.e. the ones where a file write is indistinguishable
+# from an allocation as far as `--cg-mem` is concerned.
+MEMORY_BACKED_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
+
+# `--fsize`: the hard ceiling, in KB, on any single file the sandboxed
+# process can create — in practice its stdout, the only file it writes.
+#
+# 256 MB, chosen deliberately rather than inherited:
+#   * It must be far above any legitimate output. The largest plausible
+#     answer for a problem this pipeline handles is on the order of 10^6
+#     numbers at ~20 bytes each, i.e. tens of MB; 256 MB is an order of
+#     magnitude clear of that, so no correct solution is ever truncated
+#     into a false WA/RE. A false verdict is the expensive failure here,
+#     and it is the one this number is sized against.
+#   * It must be low enough that the runaway case stays survivable, because
+#     `_run_once` reads the staged file whole into this process's memory
+#     (`staged_out.read_bytes()`) before copying it back. 256 MB is a
+#     bounded, recoverable read; an unbounded one is not, and neither is a
+#     `while(1) putchar()` allowed to fill the user's disk.
+#   * 256 MB is also the output cap mainstream judges use (Codeforces),
+#     so a solution that trips this one would have tripped a real judge's.
+# Note the consequence for `.build/`: a runaway solution can leave a file
+# of this size per test until the next run overwrites it. That is the
+# deliberate price of not truncating a legitimate answer.
+OUTPUT_LIMIT_KB = 256 * 1024
+
 
 class MatrixError(RuntimeError):
     """The matrix could not be run: a build, fixture, or environment problem."""
@@ -233,21 +321,117 @@ class IsolateHandle:
     to land the exact same id at the exact same instant, not merely during
     overlapping lifetimes.
 
-    `stage_dir` is a private `mkdtemp()` directory, outside the repository,
-    that is the *only* `:rw` mount any `--run` ever uses (unrelated to box
-    identity — a plain host directory, shared across every box this
-    invocation opens) — see the module docstring for why a real repo
-    directory must never be the write target again. It lives for the
-    whole `run()` invocation: created in `open_isolate_box()`, removed in
-    `close_isolate_box()`.
+    `stage_dir` is a private `mkdtemp()` directory that is the *only* `:rw`
+    mount any `--run` ever uses (unrelated to box identity — a plain host
+    directory, shared across every box this invocation opens) — see the
+    module docstring for why a real repo directory must never be the write
+    target again. It lives for the whole `run()` invocation: created in
+    `open_isolate_box()`, removed in `close_isolate_box()`. Its *location*
+    is chosen by `_stage_base()` and must be disk-backed, not `/tmp`: on
+    tmpfs the bytes a solution writes here are charged to the same cgroup
+    `--cg-mem` caps, which is a false ML on any solution with a large
+    answer.
     """
 
     binary: str
     version: str
-    cg: bool
     meta_path: Path
     stage_dir: Path
     box_id_counter: itertools.count
+
+
+def _filesystem_type(path: Path) -> str | None:
+    """The type of the filesystem `path` lives on, or None if unknowable.
+
+    Reads `/proc/mounts` and picks the longest mount point that is a prefix
+    of the resolved path — the same longest-prefix rule the kernel itself
+    uses, so a `tmpfs` mounted *inside* a disk-backed tree (or the reverse)
+    is resolved correctly rather than by the first line that happens to
+    match. Mount points in `/proc/mounts` are octal-escaped; the three
+    escapes that occur in practice are decoded.
+
+    Returns None on any platform without `/proc/mounts` rather than
+    guessing: an unknown filesystem type is treated as acceptable by
+    `_stage_base()`, since refusing to run everywhere `/proc` is absent
+    would be a worse failure than the one this detection prevents.
+    """
+    try:
+        raw = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    target = os.path.realpath(path)
+    best_len, best_type = -1, None
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        point = (fields[1].replace("\\040", " ").replace("\\011", "\t")
+                 .replace("\\012", "\n").replace("\\134", "\\"))
+        if target == point or target.startswith(point.rstrip("/") + "/"):
+            if len(point) > best_len:
+                best_len, best_type = len(point), fields[2]
+    return best_type
+
+
+def _stage_base(problem_dir: str | Path | None) -> Path:
+    """Pick the directory the per-invocation staging directory is created in.
+
+    Order: `$RUN_MATRIX_STAGE_DIR` if set, otherwise the problem
+    directory's *parent* — same filesystem as the package being staged,
+    which is the property that matters — otherwise the current working
+    directory (only reachable when a caller opens a box without naming a
+    problem, e.g. a unit test driving `_run_once` directly).
+
+    There is no `/tmp` fallback on any path through this function, and that
+    is the entire point of it existing: `tempfile.mkdtemp()` with no `dir=`
+    lands in `/tmp`, `/tmp` is tmpfs here and on most modern Linux, and a
+    file written to tmpfs is charged to the writing cgroup — the same
+    cgroup `--cg-mem` caps. See the module docstring for the measured false
+    ML that produced.
+
+    Raises `MatrixError` — never warns — when the chosen location is
+    unusable or memory-backed. A warning would be the wrong call twice
+    over: it scrolls past in the middle of a few hundred sandboxed runs,
+    and the failure it precedes is a *wrong verdict on a correct
+    solution*, which this driver already refuses to risk elsewhere (a
+    missing sandbox, file-based IO) rather than proceed through.
+    """
+    override = os.environ.get(STAGE_DIR_ENV)
+    if override:
+        base, source = Path(override), f"${STAGE_DIR_ENV}"
+    elif problem_dir is not None:
+        base, source = Path(problem_dir).resolve().parent, "the problem directory's parent"
+    else:
+        base, source = Path.cwd(), "the current working directory"
+
+    if not base.is_dir():
+        raise MatrixError(
+            f"staging directory base {base} ({source}) is not a directory. "
+            f"Set ${STAGE_DIR_ENV} to a writable directory on a disk-backed "
+            "filesystem."
+        )
+    if not os.access(base, os.W_OK | os.X_OK):
+        raise MatrixError(
+            f"staging directory base {base} ({source}) is not writable by "
+            f"this process. Set ${STAGE_DIR_ENV} to a writable directory on "
+            "a disk-backed filesystem."
+        )
+
+    fstype = _filesystem_type(base)
+    if fstype in MEMORY_BACKED_FSTYPES:
+        raise MatrixError(
+            f"refusing to stage sandbox output on {base} ({source}): it is "
+            f"on a {fstype} filesystem, which is memory-backed. Every byte a "
+            "solution writes to stdout would be charged against its own "
+            "--cg-mem limit and never reclaimed, so a correct solution that "
+            "prints a large answer is OOM-killed and reported ML while using "
+            "a fraction of the memory it was given (measured: 70 MB of output "
+            "at a 64 MB limit reported max-rss:1668 KB, cg-oom-killed:1). "
+            f"Set ${STAGE_DIR_ENV} to a directory on a disk-backed "
+            "filesystem. This driver does not fall back to /tmp, and does "
+            "not run with an accounting defect it can see."
+        )
+    return base
 
 
 def _isolate_binary_name() -> str:
@@ -317,9 +501,14 @@ def _cleanup_box(binary: str, box_id: int) -> None:
                     capture_output=True, text=True)
 
 
-def open_isolate_box() -> IsolateHandle:
+def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     """Verify isolate is installed and usable, then prepare this
     invocation's isolate environment.
+
+    `problem_dir` only decides where the staging directory is created —
+    next to the problem package, on the same (disk-backed) filesystem as
+    the work being staged. See `_stage_base()` for why it must not be
+    `/tmp` and why an unusable location raises rather than warns.
 
     Raises `MatrixError` — naming the fix — for two distinct failure
     families rather than letting a bare `FileNotFoundError` or
@@ -342,6 +531,12 @@ def open_isolate_box() -> IsolateHandle:
     every actual sandboxed execution (`_run_once`) now opens and tears down
     its own box instead (see `IsolateHandle.box_id_counter`).
     """
+    # Resolved (and validated) before isolate is even probed: a staging
+    # location that cannot be used is a refuse-to-run, and refusing early
+    # keeps it a true no-op on the tree, exactly as the isolate probe below
+    # is (see `run()`).
+    stage_base = _stage_base(problem_dir)
+
     name = _isolate_binary_name()
     binary = shutil.which(name)
     if binary is None:
@@ -366,14 +561,16 @@ def open_isolate_box() -> IsolateHandle:
 
     # The only `:rw` mount any `--run` will ever use (see module docstring:
     # a real repo directory must never be the write target again). Private,
-    # ours, outside the repository, and deleted whole in `close_isolate_box`
-    # — world-writable is harmless on a directory with that lifetime, and
-    # it is unrelated to box identity: every box this invocation opens and
-    # closes shares this same plain host directory.
-    stage_dir = Path(tempfile.mkdtemp(prefix="run_matrix_isolate_stage_"))
+    # ours, and deleted whole in `close_isolate_box` — world-writable is
+    # harmless on a directory with that lifetime, and it is unrelated to box
+    # identity: every box this invocation opens and closes shares this same
+    # plain host directory. `dir=stage_base` is the load-bearing argument:
+    # without it `mkdtemp` lands in `/tmp`, which is tmpfs, which charges a
+    # solution's stdout against its own memory limit.
+    stage_dir = Path(tempfile.mkdtemp(prefix=".run_matrix_stage_", dir=stage_base))
     os.chmod(stage_dir, 0o777)
 
-    return IsolateHandle(binary=binary, version=version, cg=True,
+    return IsolateHandle(binary=binary, version=version,
                          meta_path=Path(meta_name), stage_dir=stage_dir,
                          box_id_counter=itertools.count(probe_box_id))
 
@@ -483,10 +680,19 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     binary and the checker's binary both under `.build/`) — the sandboxed
     process never needs to write anywhere inside them. The *only* `:rw`
     mount is `isolate.stage_dir`, a private staging directory that lives
-    outside the repository for the whole `run()` invocation (see
+    on a disk-backed filesystem for the whole `run()` invocation (see
     `IsolateHandle`); every `--run` writes its stdout there under a fixed
     name, and this function copies the result back to `stdout_dest` itself,
     as this (unprivileged) process, immediately afterward.
+
+    Two limits apply to that write and they are deliberately separate.
+    `--cg-mem` caps the solution's *memory*; `--fsize=OUTPUT_LIMIT_KB` caps
+    its *output*. They are only separate because `_stage_base()` refuses a
+    memory-backed staging location — on tmpfs the output would be charged
+    to the same cgroup as the memory, which is the false-ML this driver
+    spent three tasks relocating (see module docstring). A solution that
+    exceeds `--fsize` dies of SIGXFSZ and arrives here as `status:SG` with
+    no `cg-oom-killed`, i.e. classified `crashed`/RE — not ML.
 
     This is the fix for a real bug an earlier version of this module had:
     bind-mounting a real `tests/<group>/` or `.build/` directory as the
@@ -552,7 +758,7 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             isolate.binary, "--cg", f"--box-id={box_id}", "--run",
             f"--meta={isolate.meta_path}", f"--processes={ISOLATE_PROCESSES}",
             f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
-            f"--cg-mem={mem_limit_kb}",
+            f"--cg-mem={mem_limit_kb}", f"--fsize={OUTPUT_LIMIT_KB}",
         ]
         for resolved, label in mounts.items():
             opt = ":rw" if resolved == stage_dir_resolved else ""
@@ -675,6 +881,22 @@ def _check(checker: Path, test_in: Path, out: Path, ans: Path,
               f"on test {test_in} — reporting FAIL", file=sys.stderr)
         return "FAIL"
     return CHECKER_EXIT.get(done.returncode, "FAIL")
+
+
+def _git_rev(path: str | Path) -> str | None:
+    """The git revision checked out at `path`, or None if it isn't a checkout.
+
+    Used to pin the testlib revision into `invocation.json`: the checker is
+    compiled against `$TESTLIB/testlib.h` and `bootstrap_testlib.sh` pulls
+    on every invocation, so an artifact that records only "isolate 2.6" is
+    not enough to reproduce the run that produced it.
+    """
+    try:
+        done = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else None
 
 
 def _tests_by_group(problem_dir: Path, problem: Problem) -> dict[str, list[Path]]:
@@ -802,7 +1024,7 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
     # no-op on the tree: nothing is compiled, nothing is chmod'd, nothing
     # is created. (`--init`/`--cleanup` themselves only touch
     # `/var/local/lib/isolate/`, never this problem's directory.)
-    isolate = open_isolate_box()
+    isolate = open_isolate_box(problem_dir)
     try:
         manifest = scan(problem_dir, problem)
 
@@ -824,7 +1046,15 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
         _compile(checker_src, checker, ["-Wpedantic", "-Werror", f"-I{testlib_dir}"],
                  context=f"checker ({problem.checker_name})")
         # The checker itself is never sandboxed (`_check` runs it directly,
-        # as this process, per ruling 5) — no permission grant needed.
+        # as this process) — no permission grant needed. The reason is that
+        # a checker is *jury-authored* code, not a submission: it is part of
+        # the package the setter is building, it must read the test input
+        # and the jury's own answer file, and nothing about it is under a
+        # contestant's control. The sandbox exists to contain untrusted,
+        # possibly-adversarial submissions and to *measure* them; a checker
+        # is neither untrusted nor measured. It is still bounded in time by
+        # CHECKER_TIMEOUT_S, which is the one failure mode a jury-authored
+        # checker realistically has (an infinite loop in a hand-written one).
 
         binaries = {}
         for entry in manifest["solutions"]:
@@ -985,7 +1215,22 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
             "platform": platform.platform(),
             "runner": "isolate",
             "runner_version": isolate.version,
-            "cg": isolate.cg,
+            # A declaration, not a measurement. This driver passes `--cg` to
+            # every isolate invocation unconditionally (`_init_box`,
+            # `_run_once`, `_cleanup_box`), so what this field records is
+            # what was *requested*; nothing here probes the kernel to
+            # confirm cgroup accounting was actually honoured. The previous
+            # name (`cg`) read as an observation of the machine and was
+            # hardcoded `True` — renamed rather than deleted, because a
+            # reader of an old invocation.json still needs to know which
+            # mode the runner asked for.
+            "cg_requested": True,
+            # Pins the testlib revision the checker in this run was
+            # compiled against. `bootstrap_testlib.sh` runs `git pull` on
+            # every invocation, so without this the artifact certifying
+            # "no solution survives" could not be reproduced against the
+            # header that produced it.
+            "testlib": _git_rev(testlib_dir),
         },
         "t_main_ms": {"per_test": t_main, "max": limits.t_main_ms,
                       "runs": runs, "method": "median", "metric": "cpu"},
@@ -1000,10 +1245,29 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
 
 
 def main(argv: list[str]) -> int:
+    """Exit codes are a contract `validating-solutions` reads directly:
+
+        0 — every solution's @expect was met.
+        1 — the matrix ran and found holes and/or mismatches. This is a
+            *result*, printed to stdout: the signal to keep reading.
+        2 — the matrix could not be run at all (usage error, or any
+            `MatrixError`: a compile failure, a missing tests directory,
+            the file-IO guard, an unusable sandbox or staging location).
+            One line on stderr, nothing on stdout.
+
+    Before this, an uncaught `MatrixError` surfaced as a traceback and
+    exited 1 as well, so an agent told "exit 1 means holes or mismatches"
+    would read a crash as a finding — a compile failure reported as
+    "the suite has a hole".
+    """
     if len(argv) != 3:
         print("usage: run_matrix.py <problem-dir> <testlib-dir>", file=sys.stderr)
         return 2
-    payload = run(argv[1], argv[2])
+    try:
+        payload = run(argv[1], argv[2])
+    except MatrixError as exc:
+        print(f"run_matrix: {exc}", file=sys.stderr)
+        return 2
     print(f"TL {payload['limits']['tl_ms']} ms  "
           f"kill {payload['limits']['kill_ms']} ms  "
           f"holes {len(payload['holes'])}  "

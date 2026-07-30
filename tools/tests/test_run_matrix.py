@@ -10,16 +10,29 @@ checker timeout, and the file-IO guard.
 
 Task 9b migrated the runner from `os.posix_spawn` + `/proc` polling to the
 ioi/isolate sandbox — there is no fallback runner any more, so the tests
-below that need a real sandbox skip (not fail) when isolate is genuinely
-absent, and otherwise exercise the real thing: the peak-RSS test now pins
-isolate's own cgroup accounting rather than `VmHWM`, and new tests below
-cover isolate-specific outcomes a posix_spawn driver could never produce
+below exercise the real thing: the peak-RSS test now pins isolate's own
+cgroup accounting rather than `VmHWM`, and new tests below cover
+isolate-specific outcomes a posix_spawn driver could never produce
 (`status:TO`, `cg-oom-killed`) plus the refuse-to-run and box-cleanup
 guarantees task 9b added.
 
-g++, the testlib cache, and isolate are all expected to be present wherever
-this suite runs; the skips below are for genuinely absent tooling, not a
-way to quietly avoid exercising the module.
+**Missing tooling fails this suite; it does not skip it.** g++, isolate,
+and the testlib cache are hard requirements of the module under test, and
+`run_matrix.py` is the one module in this pipeline with no fallback path —
+gating its only 20 tests on the presence of the very dependency that has
+no fallback meant a fresh clone, or CI without isolate, printed a green
+`OK` for a 1000-line driver that had not been executed at all. Set
+`CP_ALLOW_SANDBOX_SKIP=1` to opt back into skipping, for the one case that
+justifies it: working on an unrelated module on a machine where the
+sandbox genuinely cannot be installed.
+
+Scratch trees live under `<plugin root>/.test-scratch/`, not `/tmp`, and
+that is load-bearing rather than tidiness: `/tmp` is tmpfs, `run()` stages
+sandbox output next to the problem directory, and tmpfs pages are charged
+to the writing cgroup — so a fixture under `/tmp` would put the driver's
+staging directory back on exactly the memory-backed filesystem
+`_stage_base()` now refuses. The refusal would fail every test here with
+a message about staging rather than about the thing under test.
 """
 
 from __future__ import annotations
@@ -39,7 +52,36 @@ from tools import flags, run_matrix
 from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
-BOOTSTRAP_SCRIPT = Path(__file__).resolve().parents[1] / "bootstrap_testlib.sh"
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+BOOTSTRAP_SCRIPT = PLUGIN_ROOT / "tools" / "bootstrap_testlib.sh"
+
+# Scratch trees go here rather than /tmp — see the module docstring: /tmp is
+# tmpfs, and the driver refuses to stage sandbox output on a memory-backed
+# filesystem because that charges a solution's stdout against its own
+# memory limit. This directory is gitignored and each test removes its own
+# subtree in tearDown.
+SCRATCH_ROOT = PLUGIN_ROOT / ".test-scratch"
+
+# Set CP_ALLOW_SANDBOX_SKIP=1 to turn missing tooling back into a skip.
+SKIP_ENV = "CP_ALLOW_SANDBOX_SKIP"
+
+
+def _missing_dependency(reason: str):
+    """Fail — not skip — when a hard dependency of run_matrix is absent.
+
+    Returns an exception for the caller to raise. `unittest.SkipTest` only
+    when the caller explicitly opted in via $CP_ALLOW_SANDBOX_SKIP;
+    otherwise an `AssertionError`, so a fresh clone or a CI runner without
+    isolate reports a failure instead of a green suite over a driver that
+    was never executed.
+    """
+    if os.environ.get(SKIP_ENV) == "1":
+        return unittest.SkipTest(f"{reason} (skipping: ${SKIP_ENV}=1)")
+    return AssertionError(
+        f"{reason}. This is a hard dependency of run_matrix.py, which has no "
+        f"fallback runner — the tests covering it must not pass silently "
+        f"without it. Install the dependency, or set {SKIP_ENV}=1 to skip "
+        f"these tests deliberately.")
 
 # scan_solutions requires every solution file to carry this metadata block
 # (@tag/@expect/...); tests that overwrite sol-main.cpp's body with a
@@ -67,11 +109,12 @@ def _compile(src_text: str, out_path: Path, tmp_dir: Path) -> Path:
 
 
 def _testlib_dir() -> Path:
-    """Resolve the cached testlib checkout, or skip if it cannot be reached.
+    """Resolve the cached testlib checkout, failing if it cannot be reached.
 
     Delegates to bootstrap_testlib.sh (the same script the driver's users run
-    by hand) rather than hardcoding ~/.cache/testlib, so this test skips
-    cleanly instead of failing if the cache lives somewhere else.
+    by hand) rather than hardcoding ~/.cache/testlib, so this still works if
+    the cache lives somewhere else. An unreachable cache is a failure, not a
+    skip, unless $CP_ALLOW_SANDBOX_SKIP=1 — see `_missing_dependency`.
     """
     try:
         done = subprocess.run(
@@ -79,33 +122,39 @@ def _testlib_dir() -> Path:
             capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise unittest.SkipTest(f"bootstrap_testlib.sh could not run: {exc}")
+        raise _missing_dependency(f"bootstrap_testlib.sh could not run: {exc}")
     if done.returncode != 0:
-        raise unittest.SkipTest(f"testlib cache unavailable: {done.stderr.strip()}")
+        raise _missing_dependency(f"testlib cache unavailable: {done.stderr.strip()}")
     path = Path(done.stdout.strip())
     if not (path / "testlib.h").exists():
-        raise unittest.SkipTest(f"testlib cache at {path} has no testlib.h")
+        raise _missing_dependency(f"testlib cache at {path} has no testlib.h")
     return path
 
 
 class TestRunMatrixFixture(unittest.TestCase):
     def setUp(self):
         if shutil.which("g++") is None:
-            raise unittest.SkipTest("g++ not found on PATH")
+            raise _missing_dependency("g++ not found on PATH")
         if shutil.which("isolate") is None:
-            raise unittest.SkipTest(
-                "isolate not found on PATH — this driver has no fallback "
-                "runner (task 9b), so the whole suite skips rather than "
-                "failing when the sandbox is genuinely absent")
+            raise _missing_dependency("isolate not found on PATH")
         self.testlib_dir = _testlib_dir()
 
         # Copy the fixture into a scratch dir so the run's build artifacts
         # (.build/, *.a, invocation.json, flags.json, solutions.json) never
         # touch the checked-in fixture and each test starts from the same
-        # pristine tree.
-        self.tmp = Path(tempfile.mkdtemp(prefix="run_matrix_test_"))
+        # pristine tree. `ignore` is not decoration: a working copy of this
+        # repo accumulates untracked `.build/` binaries and `.a` answer
+        # files under the fixture from earlier manual runs, and copying
+        # those in reproduces the sandbox permission failure they were
+        # created with — this test errored on isolate's "Permission denied"
+        # before its own assertions were ever evaluated.
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="run_matrix_test_", dir=SCRATCH_ROOT))
         self.problem_dir = self.tmp / "mini"
-        shutil.copytree(FIXTURE, self.problem_dir)
+        shutil.copytree(
+            FIXTURE, self.problem_dir,
+            ignore=shutil.ignore_patterns(".build", "invocation.json",
+                                          "solutions.json", "flags.json", "*.a"))
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -252,7 +301,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         # distinguishable from the "installed but unconfigured" case below.
         with mock.patch.dict(os.environ, {"ISOLATE_BIN": "/no/such/isolate"}):
             with self.assertRaises(run_matrix.MatrixError) as ctx:
-                run_matrix.open_isolate_box()
+                run_matrix.open_isolate_box(self.tmp)
         self.assertIn("not found", str(ctx.exception))
 
     def test_isolate_init_failure_is_diagnosed_distinctly_from_missing(self):
@@ -266,7 +315,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         # already-configured machine without root to break it.
         with mock.patch.object(run_matrix, "_select_box_id", return_value=999_999):
             with self.assertRaises(run_matrix.MatrixError) as ctx:
-                run_matrix.open_isolate_box()
+                run_matrix.open_isolate_box(self.tmp)
         message = str(ctx.exception)
         self.assertIn("--init", message)
         self.assertNotIn("not found", message)
@@ -282,7 +331,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         stdin_path.write_text("\n", encoding="utf-8")
         out_path = self.tmp / "spin.out"
 
-        isolate = run_matrix.open_isolate_box()
+        isolate = run_matrix.open_isolate_box(self.tmp)
         try:
             r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
                                      cpu_limit_s=1.0, wall_limit_s=3.0,
@@ -311,7 +360,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         stdin_path.write_text("\n", encoding="utf-8")
         out_path = self.tmp / "hog.out"
 
-        isolate = run_matrix.open_isolate_box()
+        isolate = run_matrix.open_isolate_box(self.tmp)
         try:
             r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
                                      cpu_limit_s=5.0, wall_limit_s=15.0,
@@ -351,7 +400,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         stdin_path = self.tmp / "in.txt"
         stdin_path.write_text("\n", encoding="utf-8")
 
-        isolate = run_matrix.open_isolate_box()
+        isolate = run_matrix.open_isolate_box(self.tmp)
         try:
             r_hog = run_matrix._run_once(
                 isolate, hog, stdin_path, self.tmp / "hog2.out",
@@ -393,7 +442,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         stdin_path = self.tmp / "in.txt"
         stdin_path.write_text("\n", encoding="utf-8")
 
-        isolate = run_matrix.open_isolate_box()
+        isolate = run_matrix.open_isolate_box(self.tmp)
         try:
             r_big = run_matrix._run_once(
                 isolate, big, stdin_path, self.tmp / "big.out",
@@ -425,7 +474,7 @@ class TestRunMatrixFixture(unittest.TestCase):
 
         box_dir = Path("/var/local/lib/isolate/54323")
         with mock.patch.object(run_matrix, "_select_box_id", return_value=54323):
-            isolate = run_matrix.open_isolate_box()
+            isolate = run_matrix.open_isolate_box(self.tmp)
         try:
             # itertools.count(54323)'s first next() yields 54323 itself, so
             # this first _run_once call is guaranteed to use box 54323.
@@ -578,6 +627,167 @@ class TestRunMatrixFixture(unittest.TestCase):
         healed_mode = stat.S_IMODE(group_dir.stat().st_mode)
         self.assertFalse(healed_mode & stat.S_IWOTH,
                          "run() did not heal a pre-existing o+w directory")
+
+    def test_large_output_is_not_charged_against_the_memory_limit(self):
+        # Final-review Critical: the staging directory was a bare
+        # `tempfile.mkdtemp()`, i.e. `/tmp`, i.e. tmpfs. `--stdout` pointed
+        # into it while `--cg-mem` capped the same cgroup, and tmpfs pages
+        # are charged to the writing cgroup and are not reclaimable — so a
+        # solution's own output counted as its memory. Reproduced with bare
+        # isolate before the fix: a 1.6 MB program writing 70 MB to stdout
+        # under a 64 MB limit came back
+        # `max-rss:1668 cg-mem:65536 cg-oom-killed:1 status:SG`, a false ML
+        # on a program using 2.5% of its limit.
+        #
+        # This test FAILS against the pre-fix driver (verified: see the
+        # final fix report for the transcript) — 48 MB of output under a
+        # 32 MB limit is an OOM there and an ordinary OK here.
+        #
+        # The buffer is `static` and the program's own footprint is ~1-2 MB,
+        # so any memory reading above a few MB is coming from the output,
+        # not from the process.
+        mb_out = 48
+        binary = _compile(
+            "#include <cstdio>\n"
+            "int main(){ static char buf[1<<16];\n"
+            "  for (int i = 0; i < (1<<16); i++) buf[i] = 'x';\n"
+            f"  for (int k = 0; k < {mb_out} * 16; k++) fwrite(buf, 1, 1<<16, stdout);\n"
+            "  return 0; }\n",
+            self.tmp / "loud", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        out_path = self.tmp / "loud.out"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                     cpu_limit_s=10.0, wall_limit_s=30.0,
+                                     mem_limit_kb=32 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.oom, r)
+        self.assertFalse(r.crashed, r)
+        self.assertFalse(r.killed, r)
+        self.assertLess(r.peak_kb, 10_000, r)
+        self.assertEqual(out_path.stat().st_size, mb_out * 1024 * 1024)
+
+        outcome = run_matrix._classify(r, checker=Path("/bin/true"),
+                                       test=stdin_path, out=out_path,
+                                       ans=stdin_path, limits=Limits(
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000))
+        self.assertEqual(outcome.verdict, "OK")
+
+    def test_output_is_bounded_by_fsize_and_surfaces_as_a_crash_not_an_ml(self):
+        # The other half of the same fix. Once staging is disk-backed,
+        # nothing accidentally caps output any more — a `while(1)
+        # putchar()` solution would write until the disk filled and then
+        # have the whole file read into the driver's RAM by
+        # `staged_out.read_bytes()`. `--fsize` is the deliberate ceiling.
+        # OUTPUT_LIMIT_KB is patched down to 1 MB so this stays fast; the
+        # real 256 MB constant is exercised by the same code path.
+        binary = _compile(
+            "#include <cstdio>\n"
+            "int main(){ for(;;) putchar('x'); }\n",
+            self.tmp / "runaway", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        out_path = self.tmp / "runaway.out"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with mock.patch.object(run_matrix, "OUTPUT_LIMIT_KB", 1024):
+                r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                         cpu_limit_s=10.0, wall_limit_s=30.0,
+                                         mem_limit_kb=256 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        # SIGXFSZ, so: a signal death with no cg-oom-killed. It must be RE
+        # (the solution's output ran away), never ML (the solution used too
+        # much memory) — those are different findings for the setter.
+        self.assertTrue(r.crashed, r)
+        self.assertFalse(r.oom, r)
+        self.assertLessEqual(out_path.stat().st_size, 1024 * 1024)
+
+        outcome = run_matrix._classify(r, checker=Path("/bin/true"),
+                                       test=stdin_path, out=out_path,
+                                       ans=stdin_path, limits=Limits(
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000))
+        self.assertEqual(outcome.verdict, "RE")
+
+    def test_stage_dir_is_not_on_a_memory_backed_filesystem(self):
+        isolate = run_matrix.open_isolate_box(self.problem_dir)
+        try:
+            fstype = run_matrix._filesystem_type(isolate.stage_dir)
+            self.assertNotIn(fstype, run_matrix.MEMORY_BACKED_FSTYPES,
+                             f"staging landed on {fstype} at {isolate.stage_dir}")
+            self.assertTrue(isolate.stage_dir.is_dir())
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertFalse(isolate.stage_dir.exists(),
+                         "the staging directory outlived close_isolate_box")
+
+    def test_matrix_error_exits_2_so_it_is_not_read_as_a_hole(self):
+        # `validating-solutions` tells the agent that exit 1 means holes or
+        # mismatches. An uncaught MatrixError used to exit 1 as well, so a
+        # compile failure or the file-IO guard read as a finding about the
+        # test suite. Use the file-IO guard as the trigger — it raises
+        # before anything is compiled.
+        meta_path = self.problem_dir / "problem.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["io"] = {"input": "mini.inp", "output": "mini.out"}
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        code = run_matrix.main(["run_matrix.py", str(self.problem_dir),
+                                str(self.testlib_dir)])
+        self.assertEqual(code, 2)
+
+    def test_invocation_json_pins_the_testlib_revision(self):
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        machine = payload["machine"]
+        self.assertIn("testlib", machine)
+        self.assertRegex(machine["testlib"] or "", r"^[0-9a-f]{40}$")
+        # `cg` was a hardcoded True presented as an observation of the
+        # machine; it is a declaration and is now named as one.
+        self.assertNotIn("cg", machine)
+        self.assertTrue(machine["cg_requested"])
+
+
+class TestStageBase(unittest.TestCase):
+    """`_stage_base` needs no sandbox, so it is tested without one."""
+
+    def test_memory_backed_staging_is_refused_with_a_named_fix(self):
+        with mock.patch.object(run_matrix, "_filesystem_type", return_value="tmpfs"):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._stage_base(Path(__file__).parent)
+        message = str(ctx.exception)
+        self.assertIn("tmpfs", message)
+        self.assertIn("RUN_MATRIX_STAGE_DIR", message)
+
+    def test_env_override_wins_over_the_problem_directory(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as override:
+            with mock.patch.dict(os.environ,
+                                 {run_matrix.STAGE_DIR_ENV: override}):
+                self.assertEqual(run_matrix._stage_base(Path("/nonexistent/p")),
+                                 Path(override))
+
+    def test_default_is_the_problem_directorys_parent(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(run_matrix.STAGE_DIR_ENV, None)
+            base = run_matrix._stage_base(SCRATCH_ROOT / "some-problem")
+        self.assertEqual(base, SCRATCH_ROOT.resolve())
+
+    def test_filesystem_type_identifies_a_real_mount(self):
+        # Guards the detection itself: a helper that silently returned None
+        # for everything would make the refusal above unreachable in
+        # practice while still passing its own (mocked) test.
+        self.assertIsNotNone(run_matrix._filesystem_type(Path("/")))
+
+    def setUp(self):
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 if __name__ == "__main__":

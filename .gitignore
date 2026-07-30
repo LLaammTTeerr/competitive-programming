@@ -8,3 +8,13 @@ Thumbs.db
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Scratch trees for the tools test suite. Deliberately inside the repo
+# rather than /tmp: /tmp is tmpfs, and run_matrix.py refuses to stage
+# sandbox output on a memory-backed filesystem (it would charge a
+# solution's stdout against its own memory limit).
+.test-scratch/
+
+# Staging directories run_matrix.py creates next to a problem package.
+# Removed on exit; this catches the ones a hard kill leaves behind.
+.run_matrix_stage_*/

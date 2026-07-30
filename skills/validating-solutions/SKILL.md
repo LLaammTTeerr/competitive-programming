@@ -271,10 +271,21 @@ recorded rather than only inferred.
 
 **This skill never re-implements timing** — no shell `time`, no wall-clock
 stopwatch in a bash loop, no second opinion on what counts as too slow. The
-tool owns the clock; reading its output is this skill's whole job. Exit 0
-means every expectation was met; **exit 1 means
-holes or mismatches exist**, printed to stdout as it exits — that is the
-signal to keep reading, not to retry the command.
+tool owns the clock; reading its output is this skill's whole job.
+
+Three exit codes, and the difference between the last two is what stops a
+crash being read as a finding:
+
+- **0** — every solution's `@expect` was met.
+- **1** — **the matrix ran and found holes and/or mismatches**, printed to
+  stdout as it exits. That is the signal to keep reading, not to retry the
+  command.
+- **2** — **the matrix could not be run at all**: a compile failure, a
+  missing `tests/<group>/` directory, the file-IO guard, an unusable
+  sandbox, or a staging location on a memory-backed filesystem. One line on
+  stderr, nothing on stdout. This is a defect in the *package or the
+  machine*, not a finding about the test suite — fix what the message names
+  and run it again.
 
 ## Reading the result
 
