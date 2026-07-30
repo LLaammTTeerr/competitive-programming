@@ -30,9 +30,16 @@ this order".
 | If it's really about | Use |
 |---|---|
 | Is my suite strong enough? Will a wrong solution survive it? A zoo of deliberately-wrong solutions, the invocation matrix, `@expect` tags | `competitive-programming:validating-solutions` |
-| What N, what subtask ladder, is this problem original, what difficulty | `competitive-programming:shaping-problems` |
+| What N, what subtask ladder, is this problem original, what difficulty | `competitive-programming:shaping-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
 | The prose: story, `\InputFile`, `\Constraints` itemize, `\Examples` | `competitive-programming:writing-statements` |
-| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
+
+The plugin ships five skills: `solving-problems`, `running-contests`,
+`preparing-tests`, `validating-solutions`, `writing-statements`. The two
+marked Stage 2 above are **not among them** — they cannot be invoked. If
+the request really belongs to one, say that it is not built yet and stop,
+rather than offering a handoff that will fail; do not silently do that
+skill's job here either.
 
 Ask only when genuinely ambiguous. **"Write me a validator" is not
 ambiguous. "Make my tests better" is** — that could mean the generators here
@@ -59,14 +66,18 @@ is only importable with `PLUGIN_ROOT` as the working directory — `cd` there
 first, or every invocation fails with `ModuleNotFoundError: No module named
 'tools'` before it does anything.
 
-Two different directories matter from here on, and neither is implicit:
-`python3 -m tools.*` always runs from `$PLUGIN_ROOT` and takes `$PROBLEM` as
-an argument, so it is unaffected by where the problem lives. Everything
-problem-relative — compiling `validator.cpp` and `gen-*.cpp`, running the
-validator over test files, writing `files/` and `tests/` — happens **inside
-`$PROBLEM`**. Keep `$PROBLEM` set and pass it explicitly in every command
-below rather than relying on whatever directory the previous command left
-you in.
+**The working directory stays `$PLUGIN_ROOT` for everything below.** That
+is the one `cd` in this file, and nothing later moves you. `python3 -m
+tools.*` requires it (see above) and takes `$PROBLEM` as an argument;
+every other command — compiling `validator.cpp` and `gen-*.cpp`, running
+the validator over test files, writing `files/` and `tests/` — names
+`$PROBLEM` explicitly in its paths, `"$PROBLEM/validator"` and
+`"$PROBLEM/tests/g1/01.in"` rather than `./validator` and `tests/g1/01.in`.
+Every command block below is written that way and is runnable as-is from
+wherever you are. Do not rely on whatever directory the previous command
+left you in, and do not silently `cd "$PROBLEM"` instead — a half-relative
+file is how a command that "worked when I ran it" fails for the next
+reader.
 
 Then **read `$TESTLIB/docs/usage-guide.md` for the API and `$TESTLIB/plan.md`
 for known defects** before writing a line of `validator.cpp`, `check.cpp`, or
@@ -79,11 +90,19 @@ testlib is fixed upstream. This file carries only what the guide does not —
 subtask binding, ordering doctrine, and the traps below, curated from the
 fork's own audit rather than duplicated from it.
 
-Compile everything the same way:
+Compile everything the same way — with `$PROBLEM` spelled out on both
+sides, since the working directory is `$PLUGIN_ROOT`, not the problem:
 
 ```bash
-g++ -std=c++17 -O2 -Wpedantic -Werror -I"$TESTLIB" file.cpp -o file
+g++ -std=c++17 -O2 -Wpedantic -Werror -I"$TESTLIB" -I"$PROBLEM/files" \
+    "$PROBLEM/validator.cpp" -o "$PROBLEM/validator"
 ```
+
+`-I"$PROBLEM/files"` is not optional for the validator: the generated
+`constraints.h` lives in `$PROBLEM/files/`, and `#include "constraints.h"`
+searches the *including file's* directory (`$PROBLEM/`) — not `files/` —
+so without it the compile fails with `constraints.h: No such file or
+directory` no matter which directory you run from.
 
 Never `-ffast-math` — testlib detects it at runtime and aborts.
 
@@ -93,19 +112,24 @@ Never `-ffast-math` — testlib detects it at runtime and aborts.
 `io.output` must be `"stdin"` / `"stdout"`. File-based IO (`flight.inp` /
 `flight.out`, the shape most VOI-style packages use) is rejected loudly by
 `run_matrix.py` — it is a later feature, not a silent partial mode. If the
-problem was scoped around file IO, that is a `shaping-problems` decision to
-revisit, not something to route around here.
+problem was scoped around file IO, that is a scoping decision to revisit
+with the user — not something to route around here.
 
-**Every solution and generator run is measured under `ioi/isolate`**, not a
-bare `fork`/`exec`. There is no fallback runner, and `run_matrix.py` refuses
-to start rather than silently falling back to something unsandboxed. If
-`isolate --version` fails, this machine needs: `isolate` on `PATH`
+**Every *solution* run is measured under `ioi/isolate`**, not a bare
+`fork`/`exec`. There is no fallback runner, and `run_matrix.py` refuses to
+start rather than silently falling back to something unsandboxed.
+Generators, validators and checkers are **not** sandboxed — nothing in
+`tools/` executes a generator at all, and you run them directly, as
+yourself, exactly as the commands below show. Do not assume a generator
+run carries any of the sandbox's guarantees about time, memory, or what it
+may touch on this machine.
+
+If `isolate --version` fails, this machine needs: `isolate` on `PATH`
 (<https://github.com/ioi/isolate>), a system `isolate` user with
 `isolate:200000:65536` registered in `/etc/subuid` and `/etc/subgid`, and
 `systemctl enable --now isolate.service` so the cgroup keeper is running.
-That setup is a one-time machine concern, not a per-problem one, but a
-generator or validator you can't yet run inside the sandbox is a generator
-you haven't actually tested — see the TDD section below.
+That setup is a one-time machine concern, not a per-problem one, and it
+only blocks `validating-solutions`, not the work in this skill.
 
 Two consequences worth internalizing before writing any timing-sensitive
 code, and if these ever disagree with what you observe, `tools/matrix_core.py`'s
@@ -286,7 +310,7 @@ Validate every test under its own `--group` before it ever reaches a
 solution:
 
 ```bash
-./validator --testset tests --group g1 < tests/g1/01.in
+"$PROBLEM/validator" --testset tests --group g1 < "$PROBLEM/tests/g1/01.in"
 ```
 
 A test that validates against the wrong group's bounds, or against no group
@@ -301,8 +325,8 @@ a missing trailing newline, a stray extra token — and assert it exits
 nonzero, **before** the first generator is written:
 
 ```bash
-printf '1001 5\n' | ./validator --testset tests --group g1; echo "exit: $?"
-# expect nonzero — g1 caps n at 1000
+printf '1001 5\n' | "$PROBLEM/validator" --testset tests --group g1
+echo "exit: $?"   # expect nonzero — g1 caps n at 1000
 ```
 
 This is the single most repeated lesson from building this pipeline's
@@ -324,7 +348,8 @@ a limit it never actually tests. Confirm every declared bound is hit,
 per group:
 
 ```bash
-./validator --testset tests --group g1 --testOverviewLogFileName g1-overview.log < tests/g1/01.in
+"$PROBLEM/validator" --testset tests --group g1 \
+    --testOverviewLogFileName "$PROBLEM/g1-overview.log" < "$PROBLEM/tests/g1/01.in"
 # repeat per test, or loop over the group; then inspect the log for any
 # bound whose "hit" side never appears
 ```
@@ -350,7 +375,7 @@ each group, e.g. (assuming `A` is the sole token on line 1 of each test,
 adjust the field/line selector to match your own format):
 
 ```bash
-awk 'FNR==1{print length($1)}' tests/g1/*.in | sort -n | sed -n '1p;$p'
+awk 'FNR==1{print length($1)}' "$PROBLEM"/tests/g1/*.in | sort -n | sed -n '1p;$p'
 # first number is the shortest A in the group, second the longest;
 # compare both against the declared bound by hand
 ```
@@ -360,8 +385,9 @@ bound that is declared but never reached in any test is exactly the shape
 of `flags.py`'s `test-weakness` kind — record it there if you find one:
 
 ```python
+# run from $PLUGIN_ROOT; pass the same absolute path $PROBLEM holds
 from tools import flags
-flags.append(problem_dir, phase="prepare-tests", severity="medium",
+flags.append("/absolute/path/to/problem", phase="prepare-tests", severity="medium",
               kind="test-weakness",
               what="g1's n <= 6 bound is never attained by any test in tests/g1/",
               assumed="added gen-max.exe --n=6 to close it",

@@ -57,11 +57,12 @@ export CODEFORCES_COOKIE=JSESSIONID=your_cookie_value
 
 Everything else the server understands is documented in `mcp-server/.env.example`.
 
-**Prerequisite:** [`ioi/isolate`](https://github.com/ioi/isolate) — `preparing-tests`
-and `validating-solutions` run every generator and every solution sandboxed under
-isolate, never a bare `fork`/`exec`; `tools/run_matrix.py` refuses to start rather
-than falling back to something unsandboxed. This is a one-time machine setup, not
-a per-problem one:
+**Prerequisite:** [`ioi/isolate`](https://github.com/ioi/isolate) —
+`tools/run_matrix.py` runs every *solution* sandboxed under isolate, never a bare
+`fork`/`exec`, and refuses to start rather than falling back to something
+unsandboxed. Generators, validators and checkers are not sandboxed; nothing in
+`tools/` executes a generator at all. This is a one-time machine setup, not a
+per-problem one:
 
 ```bash
 sudo apt install build-essential pkg-config libcap-dev libseccomp-dev libsystemd-dev

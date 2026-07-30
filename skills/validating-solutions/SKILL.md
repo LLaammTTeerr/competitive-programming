@@ -31,7 +31,13 @@ this order".
 |---|---|
 | The generator, validator, or checker itself — `registerGen`, `registerValidation`, `wcmp`/`ncmp`, the test data doesn't exist yet | `competitive-programming:preparing-tests` |
 | The model solution's own algorithm is wrong or too slow, no test suite involved yet | `competitive-programming:solving-problems` |
-| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
+
+The plugin ships five skills: `solving-problems`, `running-contests`,
+`preparing-tests`, `validating-solutions`, `writing-statements`. The one
+marked Stage 2 above is **not among them** — it cannot be invoked. If the
+request really belongs to it, say that it is not built yet and stop,
+rather than offering a handoff that will fail.
 
 Ask only when genuinely ambiguous. **"Write me a checker" is not ambiguous —
 that's `preparing-tests`. "Are these tests good enough?" is not ambiguous
