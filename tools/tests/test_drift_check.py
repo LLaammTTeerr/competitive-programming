@@ -1,3 +1,4 @@
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,22 @@ class TestParseTex(unittest.TestCase):
     def test_reads_subtask_percentages_in_order(self):
         self.assertEqual(parse_tex(TEX)["subtask_points"], [40, 60])
 
+    def test_a_fractional_time_limit_is_read_as_a_float(self):
+        # `time = 1.5` is a routine limit. `int("1.5")` raises, and the old
+        # code swallowed that into None — which check() then reported as
+        # "no `time` key in \begin{problem}", naming a key that is present
+        # and correct.
+        self.assertEqual(parse_tex(TEX.replace("time   = 1,", "time = 1.5,"))["time"],
+                         1.5)
+
+    def test_a_non_numeric_time_is_still_none(self):
+        self.assertIsNone(parse_tex(TEX.replace("time   = 1,", "time = soon,"))["time"])
+
+    def test_a_fractional_memory_is_rejected_not_truncated(self):
+        # memory is whole megabytes; 256.5 must not be silently read as 256.
+        self.assertIsNone(
+            parse_tex(TEX.replace("memory = 256,", "memory = 256.5,"))["memory"])
+
 
 class TestCheck(unittest.TestCase):
     def test_clean_document_reports_nothing(self):
@@ -52,6 +69,20 @@ class TestCheck(unittest.TestCase):
         problems = check(PROBLEM, TEX.replace("time   = 1", "time   = 2"))
         self.assertEqual(len(problems), 1)
         self.assertIn("time", problems[0])
+
+    def test_a_matching_fractional_time_limit_is_not_drift(self):
+        # The whole-branch review's finding: a 1.5 s limit made this tool
+        # emit `statement: no \`time\` key in \begin{problem}` — false
+        # drift, with a message naming a key that was present and correct.
+        problem = dataclasses.replace(PROBLEM, time_ms_published=1500)
+        self.assertEqual(check(problem, TEX.replace("time   = 1,", "time = 1.5,")), [])
+
+    def test_a_mismatched_fractional_time_limit_is_real_drift(self):
+        problem = dataclasses.replace(PROBLEM, time_ms_published=2500)
+        issues = check(problem, TEX.replace("time   = 1,", "time = 1.5,"))
+        self.assertEqual(len(issues), 1)
+        self.assertIn("2.5 s", issues[0])
+        self.assertIn("1.5 s", issues[0])
 
     def test_detects_memory_mismatch(self):
         problems = check(PROBLEM, TEX.replace("memory = 256", "memory = 512"))

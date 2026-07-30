@@ -126,10 +126,10 @@ def parse_tex(text: str) -> dict:
     # Parse key list with brace awareness
     keys = _parse_keylist_braceaware(text_no_comments)
 
-    def as_int(name):
+    def as_number(name, cast):
         try:
-            return int(keys[name])
-        except (KeyError, ValueError):
+            return cast(keys[name])
+        except (KeyError, ValueError, TypeError):
             return None
 
     # Extract subtasks body and find subtask points only within it
@@ -137,8 +137,19 @@ def parse_tex(text: str) -> dict:
     subtask_points = [int(m.group("points")) for m in _SUBTASK.finditer(subtasks_body)]
 
     return {
-        "time": as_int("time"),
-        "memory": as_int("memory"),
+        # `time` is a float, not an int. A 1.5 s or 2.5 s limit is routine,
+        # and `int("1.5")` raises — which this function used to swallow into
+        # `None`, making `check()` report "statement: no `time` key in
+        # \begin{problem}" for a key that was present, correct, and read.
+        # A drift guard emitting false drift, naming the wrong cause, is
+        # the one failure mode this tool cannot have. `check()` was already
+        # comparing against a float with a 1e-9 tolerance, so the float was
+        # what the rest of the module expected all along.
+        "time": as_number("time", float),
+        # `memory` stays an int: vnolymp's memory key is whole megabytes,
+        # and accepting "256.5 MB" would let a meaningless value through
+        # rather than catching it.
+        "memory": as_number("memory", int),
         "input": keys.get("input"),
         "output": keys.get("output"),
         "subtask_points": subtask_points,
