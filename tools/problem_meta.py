@@ -260,23 +260,37 @@ def load(path: str | Path) -> Problem:
 
     order: dict[str, int] = {}
     visiting: set[str] = set()
+    subtask_by_id = {s.id: s for s in subtasks}
 
-    def visit(sid: str, trail: list[str]) -> None:
+    # Stack contains (phase, sid, trail) tuples.
+    # phase is "enter" (visiting node) or "leave" (cleanup after dependencies).
+    stack = [("enter", s.id, []) for s in subtasks]
+
+    while stack:
+        phase, sid, trail = stack.pop()
+
+        if phase == "leave":
+            visiting.discard(sid)
+            order[sid] = len(order)
+            continue
+
+        # phase == "enter"
         if sid in order:
-            return
+            continue
         if sid in visiting:
             loop = trail[trail.index(sid):] + [sid]
             raise ProblemMetaError(
                 f"{path}: subtask dependency cycle: {' -> '.join(loop)}"
             )
         visiting.add(sid)
-        for dep in next(s for s in subtasks if s.id == sid).depends_on:
-            visit(dep, trail + [sid])
-        visiting.discard(sid)
-        order[sid] = len(order)
+        subtask = subtask_by_id[sid]
 
-    for s in subtasks:
-        visit(s.id, [])
+        # Push leave phase first (so it executes after dependencies are processed).
+        stack.append(("leave", sid, trail))
+
+        # Push dependencies in reverse order (to maintain left-to-right order when popped).
+        for dep in reversed(subtask.depends_on):
+            stack.append(("enter", dep, trail + [sid]))
 
     try:
         name = raw["name"]

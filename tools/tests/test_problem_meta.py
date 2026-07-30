@@ -227,6 +227,79 @@ class TestRejectsCycles(unittest.TestCase):
         problem = load(write(ok))
         self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3"])
 
+    def test_accepts_a_linear_chain_of_2000_subtasks(self):
+        """Verify iterative traversal handles deep chains without RecursionError."""
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = []
+        for i in range(2000):
+            depends = [] if i == 0 else [f"g{i}"]
+            ok["subtasks"].append({
+                "id": f"g{i + 1}",
+                "points": 0 if i > 0 else 100,
+                "bounds": {},
+                "constraints_text": [],
+                "depends_on": depends
+            })
+        problem = load(write(ok))
+        self.assertEqual(len(problem.subtask_ids()), 2000)
+
+    def test_rejects_a_cycle_at_depth_1500(self):
+        """A cycle far from the root must raise ProblemMetaError, not RecursionError."""
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = []
+        # Create a chain g1 -> g2 -> ... -> g1500
+        for i in range(1500):
+            depends = [] if i == 0 else [f"g{i}"]
+            ok["subtasks"].append({
+                "id": f"g{i + 1}",
+                "points": 100 if i == 0 else 0,
+                "bounds": {},
+                "constraints_text": [],
+                "depends_on": depends
+            })
+        # Make g1500 depend on itself to create a cycle at depth 1500
+        ok["subtasks"][-1]["depends_on"] = ["g1500"]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(ok))
+
+    def test_rejects_a_cycle_not_involving_first_visited_subtask(self):
+        """A cycle among later subtasks must be detected."""
+        ok = json.loads(json.dumps(VALID))
+        # g1 has no dependencies (root)
+        # g2, g3, g4 form a cycle not involving g1
+        ok["subtasks"] = [
+            {"id": "g1", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": []},
+            {"id": "g2", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g3"]},
+            {"id": "g3", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g4"]},
+            {"id": "g4", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": ["g2"]},
+        ]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(ok))
+
+    def test_rejects_disjoint_components_one_cyclic(self):
+        """Two disconnected graphs, one acyclic and one cyclic."""
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = [
+            {"id": "g1", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": []},
+            {"id": "g2", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": ["g1"]},
+            {"id": "g3", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g4"]},
+            {"id": "g4", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g3"]},
+        ]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(ok))
+
+    def test_accepts_fan_in_that_is_not_a_cycle(self):
+        """Multiple nodes depending on the same parent is not a cycle."""
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = [
+            {"id": "g1", "points": 20, "bounds": {}, "constraints_text": [], "depends_on": []},
+            {"id": "g2", "points": 20, "bounds": {}, "constraints_text": [], "depends_on": ["g1"]},
+            {"id": "g3", "points": 20, "bounds": {}, "constraints_text": [], "depends_on": ["g1"]},
+            {"id": "g4", "points": 40, "bounds": {}, "constraints_text": [], "depends_on": ["g2", "g3"]},
+        ]
+        problem = load(write(ok))
+        self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3", "g4"])
+
 
 if __name__ == "__main__":
     unittest.main()
