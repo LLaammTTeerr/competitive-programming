@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -95,6 +97,74 @@ class TestAppend(unittest.TestCase):
         )
         self.assertTrue(new_dir.exists())
         self.assertEqual(record["id"], "amb-001")
+
+    def test_corrupt_json_is_a_flag_error_not_a_json_decode_error(self):
+        # R1: this register is read after arbitrary interruptions and is
+        # small enough that a human edits it.
+        (self.dir / "flags.json").write_text('{"schema": 1, "flags": [',
+                                             encoding="utf-8")
+        with self.assertRaisesRegex(flags.FlagError, "not valid JSON"):
+            flags.read(self.dir)
+
+    def test_non_string_id_is_a_flag_error_not_an_attribute_error(self):
+        payload = {"schema": 1, "generated_at": "x", "flags": [{"id": 7}]}
+        (self.dir / "flags.json").write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(flags.FlagError, "expected a string"):
+            flags.read(self.dir)
+
+
+_APPENDER = """
+import sys
+sys.path.insert(0, {root!r})
+from tools import flags
+for i in range({n}):
+    flags.append({dir!r}, phase="p", severity="low", kind="review-judgement",
+                 what="w%d" % i, assumed="a", changes_if_wrong="c")
+"""
+
+
+class TestConcurrentAppend(unittest.TestCase):
+    """Two processes appending at once must not lose records.
+
+    Measured against the previous implementation (a fixed
+    `flags.json.tmp` shared by every writer, and an unguarded
+    read-modify-write): 2 processes x 40 appends produced
+    `FileNotFoundError: 'flags.json.tmp' -> 'flags.json'` and 51 of 80
+    records surviving. Both skills that write here instruct
+    `superpowers:dispatching-parallel-agents`, and
+    `validating-solutions` asks agents to record skipped zoo rows as
+    flags — a register that exists to make judgement calls durable
+    cannot drop 36% of them.
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def test_two_processes_forty_appends_each_lose_nothing(self):
+        root = str(Path(__file__).resolve().parents[2])
+        n, procs = 40, 4
+        script = _APPENDER.format(root=root, n=n, dir=str(self.dir))
+        children = [subprocess.Popen([sys.executable, "-c", script],
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+                    for _ in range(procs)]
+        for child in children:
+            _, err = child.communicate(timeout=120)
+            self.assertEqual(child.returncode, 0, err.decode())
+
+        recorded = flags.read(self.dir)
+        self.assertEqual(len(recorded), n * procs)
+        # Ids must also be unique: two writers that both read the same
+        # `existing` would each number their record identically.
+        self.assertEqual(len(({r["id"] for r in recorded})), n * procs)
+
+    def test_no_temp_file_is_left_behind(self):
+        flags.append(self.dir, phase="p", severity="low",
+                     kind="review-judgement", what="w", assumed="a",
+                     changes_if_wrong="c")
+        leftovers = [p.name for p in self.dir.iterdir()
+                     if p.name.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":
