@@ -1,7 +1,10 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: two skills—one for a single problem, one driving contests on any judge—plus the bundled Codeforces MCP server. This repository is also a **marketplace**, so it can be used in
-place or installed on another machine.
+Claude Code plugin for competitive programming: five skills — two for solving
+(one problem, one whole contest), three for setting one (test data, solution
+validation, statement) — plus the bundled Codeforces MCP server. This repository
+is also a **marketplace**, so it can be used in place or installed on another
+machine.
 
 | Component | Invoked as | What it does |
 |---|---|---|
@@ -9,6 +12,7 @@ place or installed on another machine.
 | Skill `running-contests` | `competitive-programming:running-contests` | Drives a whole contest on any judge: binds to whatever judge MCP is installed, pulls the problem set, orders it, delegates each problem to `solving-problems`, submits, reads verdicts, and keeps going until every problem is solved |
 | Skill `preparing-tests` | `competitive-programming:preparing-tests` | Builds the test-data contract for a problem being set: checker, validator, generators (random / max-size / boundary / structured-adversarial / hand-written), and sample selection, driven by testlib and `tools/gen_constraints_header.py` / `tools/drift_check.py` |
 | Skill `validating-solutions` | `competitive-programming:validating-solutions` | Attacks a problem's test suite with a zoo of deliberately-wrong solutions plus alternative and exhaustive-arbiter `accepted` solutions, runs the invocation matrix (`tools/run_matrix.py`) under `ioi/isolate`, and reports holes and mismatches |
+| Skill `writing-statements` | `competitive-programming:writing-statements` | Authors, translates, and reviews problem statements for the vnolymp LaTeX template — the Vietnamese statement package for problems prepared on Polygon |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 
 ## Layout
@@ -23,7 +27,8 @@ competitive-programming/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
 │   ├── running-contests/SKILL.md   (+ references/judges.md)
 │   ├── preparing-tests/SKILL.md
-│   └── validating-solutions/SKILL.md
+│   ├── validating-solutions/SKILL.md
+│   └── writing-statements/SKILL.md
 ├── tools/                    # Python pipeline the two test-authoring skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  bootstrap_testlib.sh
@@ -118,17 +123,29 @@ matches the directory. Do not nest deeper, and do not remove the manifest.
 
 ## Checks
 
+Each line names its own working directory: the tools suite imports `tools.*`
+and only resolves from the repository root, and the previous version of this
+block put it after a `cd mcp-server`, where it fails with `ImportError: Start
+directory is not importable`.
+
 ```bash
+cd <this repo>
 claude plugin validate . --strict                 # manifests
 claude plugin details competitive-programming     # inventory: 5 skills, 1 MCP server
 
-cd mcp-server && uv run --extra dev pytest -q     # server test suite
-python3 -m unittest discover -s tools/tests -t . -v    # tools test suite
+python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
+(cd mcp-server && uv run --extra dev pytest -q)        # server suite (subshell)
 
 # end-to-end: the server should answer an MCP handshake
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
   | uvx --from ./mcp-server cf-mcp
 ```
+
+The tools suite **fails** rather than skips when `g++`, `isolate`, or the
+testlib cache is missing: `run_matrix.py` is the one module with no fallback
+runner, so gating its tests on the presence of that same dependency meant a
+fresh clone printed a green `OK` over a driver it had never executed. Set
+`CP_ALLOW_SANDBOX_SKIP=1` to opt back into skipping them.
 
 After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new session).
 
