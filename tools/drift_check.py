@@ -2,9 +2,8 @@
 """Compare problem.json against the vnolymp statement.
 
 The statement is not generated — templating the .tex would fight vnolymp — so
-this is the guard that stops the two from disagreeing. Parsing is regex over
-two very specific constructs, which is adequate for the vnolymp key list and
-the subtasks environment and nothing else.
+this is the guard that stops the two from disagreeing. Parsing is brace-aware
+and comment-aware for robustness against well-formed LaTeX statements.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ from pathlib import Path
 
 from tools.problem_meta import Problem, load
 
-_KEYLIST = re.compile(r"\\begin\{problem\}\s*\[(?P<keys>.*?)\]", re.DOTALL)
 _SUBTASK = re.compile(r"\\subtask\{(?P<points>\d+)\}")
 
 
@@ -23,15 +21,110 @@ class DriftCheckError(ValueError):
     """Statement file is malformed, unreadable, or inconsistent with problem.json."""
 
 
-def parse_tex(text: str) -> dict:
-    match = _KEYLIST.search(text)
+def _strip_comments(text: str) -> str:
+    """Remove LaTeX comments (% to EOL) but preserve escaped percents (\\%)."""
+    result = []
+    i = 0
+    while i < len(text):
+        if i + 1 < len(text) and text[i] == '\\' and text[i + 1] == '%':
+            # Escaped percent - keep both characters
+            result.append('\\%')
+            i += 2
+        elif text[i] == '%':
+            # Unescaped percent - skip to EOL
+            while i < len(text) and text[i] != '\n':
+                i += 1
+            # Keep the newline if present
+            if i < len(text):
+                result.append('\n')
+                i += 1
+        else:
+            result.append(text[i])
+            i += 1
+    return ''.join(result)
+
+
+def _extract_subtasks_body(text: str) -> str:
+    """Extract the content between \\begin{subtasks} and \\end{subtasks}."""
+    begin_idx = text.find(r'\begin{subtasks}')
+    if begin_idx == -1:
+        return ""
+    end_idx = text.find(r'\end{subtasks}', begin_idx)
+    if end_idx == -1:
+        return text[begin_idx + len(r'\begin{subtasks}'):]
+    return text[begin_idx + len(r'\begin{subtasks}'):end_idx]
+
+
+def _parse_keylist_braceaware(text: str) -> dict[str, str]:
+    """Parse the vnolymp problem key list with brace-aware scanning.
+
+    Handles keys like origin = {Đề chọn [Vòng 2]} correctly by tracking
+    brace depth and only splitting on commas at depth 0.
+    """
+    # Find \begin{problem}[
+    start = text.find(r'\begin{problem}[')
+    if start == -1:
+        return {}
+
+    i = start + len(r'\begin{problem}[')
+    depth = 0
+    keylist_text = []
+
+    # Scan forward until we find ] at depth 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+            keylist_text.append(ch)
+        elif ch == '}':
+            depth -= 1
+            keylist_text.append(ch)
+        elif ch == ']' and depth == 0:
+            # End of key list
+            break
+        else:
+            keylist_text.append(ch)
+        i += 1
+
+    # Parse the keylist, splitting on commas at depth 0
     keys: dict[str, str] = {}
-    if match:
-        for pair in match.group("keys").split(","):
-            if "=" not in pair:
-                continue
-            name, value = pair.split("=", 1)
-            keys[name.strip()] = value.strip().strip("{}")
+    keylist = ''.join(keylist_text)
+
+    depth = 0
+    pairs = []
+    current_pair = []
+
+    for ch in keylist:
+        if ch == '{':
+            depth += 1
+            current_pair.append(ch)
+        elif ch == '}':
+            depth -= 1
+            current_pair.append(ch)
+        elif ch == ',' and depth == 0:
+            pairs.append(''.join(current_pair))
+            current_pair = []
+        else:
+            current_pair.append(ch)
+
+    if current_pair:
+        pairs.append(''.join(current_pair))
+
+    for pair in pairs:
+        if "=" not in pair:
+            continue
+        name, value = pair.split("=", 1)
+        keys[name.strip()] = value.strip().strip("{}")
+
+    return keys
+
+
+def parse_tex(text: str) -> dict:
+    # Strip comments first
+    text_no_comments = _strip_comments(text)
+
+    # Parse key list with brace awareness
+    keys = _parse_keylist_braceaware(text_no_comments)
 
     def as_int(name):
         try:
@@ -39,12 +132,16 @@ def parse_tex(text: str) -> dict:
         except (KeyError, ValueError):
             return None
 
+    # Extract subtasks body and find subtask points only within it
+    subtasks_body = _extract_subtasks_body(text_no_comments)
+    subtask_points = [int(m.group("points")) for m in _SUBTASK.finditer(subtasks_body)]
+
     return {
         "time": as_int("time"),
         "memory": as_int("memory"),
         "input": keys.get("input"),
         "output": keys.get("output"),
-        "subtask_points": [int(m.group("points")) for m in _SUBTASK.finditer(text)],
+        "subtask_points": subtask_points,
     }
 
 
@@ -95,10 +192,8 @@ def main(argv: list[str]) -> int:
     problem = load(Path(argv[1]) / "problem.json")
     try:
         tex_text = Path(argv[2]).read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise DriftCheckError(f"statement file not found: {argv[2]}") from exc
-    except UnicodeDecodeError as exc:
-        raise DriftCheckError(f"statement file is not valid UTF-8: {argv[2]}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DriftCheckError(f"statement file error: {exc}") from exc
     issues = check(problem, tex_text)
     if not issues:
         print("no drift between problem.json and the statement")

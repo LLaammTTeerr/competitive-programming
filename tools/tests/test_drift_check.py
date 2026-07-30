@@ -85,7 +85,8 @@ class TestMainErrorHandling(unittest.TestCase):
 
             with self.assertRaises(DriftCheckError) as cm:
                 main(["drift_check.py", str(problem_dir), str(statement_file)])
-            self.assertIn("not found", str(cm.exception))
+            # Verify the cause is a FileNotFoundError, which is an OSError
+            self.assertIsInstance(cm.exception.__cause__, FileNotFoundError)
 
     def test_main_raises_drift_check_error_on_non_utf8_statement(self):
         """R1: Non-UTF-8 file must raise DriftCheckError, not UnicodeDecodeError."""
@@ -101,7 +102,139 @@ class TestMainErrorHandling(unittest.TestCase):
 
             with self.assertRaises(DriftCheckError) as cm:
                 main(["drift_check.py", str(problem_dir), str(statement_file)])
-            self.assertIn("UTF-8", str(cm.exception))
+            # Verify the cause is a UnicodeDecodeError
+            self.assertIsInstance(cm.exception.__cause__, UnicodeDecodeError)
+
+    def test_main_raises_drift_check_error_on_directory_as_statement(self):
+        """Finding 1: A directory path raises DriftCheckError, not IsADirectoryError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            problem_dir = Path(tmpdir) / "problem"
+            problem_dir.mkdir()
+            statement_dir = problem_dir / "statement.tex"
+            statement_dir.mkdir()
+            # Create a minimal problem.json
+            problem_json = problem_dir / "problem.json"
+            problem_json.write_text('{"schema": 1, "name": "test", "limits": {"time_ms_published": 1000, "memory_mb": 256}, "io": {"input": "stdin", "output": "stdout"}, "checker": {"kind": "stock", "name": "rcmp6"}, "subtasks": [{"id": "g1", "points": 100}], "constraints": []}')
+
+            with self.assertRaises(DriftCheckError) as cm:
+                main(["drift_check.py", str(problem_dir), str(statement_dir)])
+            # Verify the wrapped cause is IsADirectoryError (which is an OSError)
+            self.assertIsInstance(cm.exception.__cause__, IsADirectoryError)
+
+
+class TestRegression(unittest.TestCase):
+    """Regression tests for Finding 2 and 3."""
+
+    def test_commented_out_subtask_is_ignored(self):
+        """Finding 2: Commented-out \\subtask{30} should not be counted."""
+        tex = r"""
+\documentclass{article}
+\usepackage{vnolymp}
+\begin{document}
+\begin{problem}[
+  input  = stdin, output = stdout,
+  time   = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  % \subtask{30}{nhóm cũ, đã gộp}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["subtask_points"], [40, 60],
+                        "Commented subtask should not be counted")
+
+    def test_subtask_outside_environment_is_ignored(self):
+        """Finding 2: \\subtask mentioned outside \\begin{subtasks}...\\end{subtasks} is ignored."""
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  input  = stdin, output = stdout,
+  time   = 1, memory = 256,
+]{Title}
+Some text mentioning \subtask{25} as an example.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+Text after mentioning \subtask{35} again.
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["subtask_points"], [40, 60],
+                        "Subtask outside environment should not be counted")
+
+    def test_origin_key_with_bracketed_value(self):
+        """Finding 3: origin = {Đề chọn [Vòng 2]} should parse time/memory correctly."""
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  origin = {Đề chọn đội tuyển [Vòng 2]}, input = stdin, output = stdout,
+  time = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["time"], 1, "time key should parse correctly with origin before it")
+        self.assertEqual(parsed["memory"], 256, "memory key should parse correctly with origin before it")
+        self.assertEqual(parsed["input"], "stdin", "input key should parse correctly")
+        self.assertEqual(parsed["output"], "stdout", "output key should parse correctly")
+
+    def test_author_key_with_comma_in_braced_value(self):
+        """Finding 3: author = {Lâm, VOI 2026} with comma inside braces should not break parsing."""
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  author = {Phan Bình Nguyên Lâm, VOI}, input = stdin, output = stdout,
+  time = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["time"], 1, "time should parse correctly despite author comma")
+        self.assertEqual(parsed["memory"], 256, "memory should parse correctly despite author comma")
+
+    def test_escaped_percent_is_not_a_comment(self):
+        """Finding 2: \\% literal percent should not start a comment."""
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  input  = stdin, output = stdout,
+  time   = 1, memory = 256,
+]{Title}
+Text with 100\% accuracy.
+\begin{subtasks}
+  \subtask{40}{40\% of cases}
+  \subtask{60}{60\% accuracy}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        # Should not find fake subtasks from the \% in text
+        self.assertEqual(parsed["subtask_points"], [40, 60],
+                        "Escaped \\% should not be treated as comment")
 
 
 if __name__ == "__main__":
