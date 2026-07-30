@@ -154,8 +154,8 @@ find the probability `A` wins):
 
 | Subtask | Bound | What it actually admits |
 |---|---|---|
-| `g1` (40%) | `\|A\|, \|B\| ≤ 6` | An absorbing Markov chain over the **raw**, uncompressed window of the last `max(\|A\|,\|B\|) − 1` coins — at most `2^5 = 32` states at this bound — discovered by BFS and solved by power iteration. No fail links, no automaton compression. This is exactly what the package's own g1-passing solution, `flight/solutions/sol-exhaustive-tinyn.cpp`, does. |
-| `g2` (60%) | `\|A\|, \|B\| ≤ 20` | That raw state space is now `2^19`, far too large to enumerate. Requires building the Aho–Corasick automaton over `{A, B}` — `O(\|A\| + \|B\|)` states instead of exponentially many — and solving a linear system over its states for absorption probabilities. |
+| `g1` (40%) | `\|A\|, \|B\| ≤ 6` | An absorbing Markov chain over the **raw**, uncompressed window of the last `max(\|A\|,\|B\|) − 1` coins — at most `2^6 − 1 = 63` reachable states at this bound, since the warm-up passes through every shorter window too — discovered by BFS and solved by power iteration. No fail links, no automaton compression. This is exactly what the package's own g1-passing solution, `flight/solutions/sol-exhaustive-tinyn.cpp`, does. |
+| `g2` (60%) | `\|A\|, \|B\| ≤ 20` | That raw state space is now `2^20 − 1`, far too large to enumerate. Requires building the Aho–Corasick automaton over `{A, B}` — `O(\|A\| + \|B\|)` states instead of exponentially many — and solving a linear system over its states for absorption probabilities. |
 
 **Note what `g1` does *not* admit: enumerating coin sequences.** A coin
 stream is infinite — nothing bounds its length — so there is no prefix
