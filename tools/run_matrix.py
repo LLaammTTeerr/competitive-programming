@@ -88,22 +88,35 @@ as RE.
 Task 9c: a fresh box per `--run`, not one box reused for the whole
 invocation. The `flight` dogfood found what neither the 9b migration nor
 its review did: isolate's cgroup counters are **not reset between `--run`s
-in the same box**. `cg-mem` is a box-lifetime high-water mark, and
-`cg-oom-killed` is sticky — reproduced with bare isolate, no involvement
-from this module: a memory hog OOMing at 400 MB in box N, followed by
-`int main(){return 0;}` in the *same* box N, reports the hog's `cg-mem`
-*and* the hog's `cg-oom-killed:1` for the trivial program. Since ML
-outranks WA in `_SEVERITY` (`matrix_core`), one OOM used to silently
-overwrite every later solution's verdict in that run — not merely add a
-wrong row, replace correct ones — and `peak_kb` was inflated for every
-solution after the largest memory user, OOM or not, regardless of solution
-order. This is the same class of defect the 9b migration was fixing
-(memory accounting contaminated by something other than the process being
-measured); it had just relocated from the parent process's address space
-into the box's cgroup. The fix: `_run_once` now owns a full
-`--init`/`--run`/`--cleanup` cycle for its own box id, so no run can ever
-observe another run's counters. `open_isolate_box()` still does one
-probe `--init`/`--cleanup` at startup (to fail fast, before any
+in the same box** — reproduced with bare isolate, no involvement from this
+module: a memory hog OOMing at 400 MB in box N, followed by
+`int main(){return 0;}` in the *same* box N, reports the hog's
+`cg-oom-killed:1` for the trivial program too. Since ML outranks WA in
+`_SEVERITY` (`matrix_core`), one OOM used to silently overwrite every
+later solution's verdict in that run — not merely add a wrong row, replace
+correct ones. This is the bug that mattered: `cg-oom-killed` is sticky
+across `--run`s in the same box, and this module's classification reads it
+directly (see `_run_once`). `cg-mem` is *also* a box-lifetime high-water
+mark in the same way — verified directly against the same box (a 200 MB
+run followed by a trivial one reported `cg-mem` unchanged) — but this is
+not a second consequence for this driver specifically: `peak_kb` is read
+from `max-rss`, never from `cg-mem` (see `_run_once`), and `max-rss` is
+sourced from `wait4()`/`getrusage()` on the sandboxed *process* rather
+than the cgroup, so it resets correctly with every fresh process
+regardless of box reuse (also verified directly: same before/after pair,
+`max-rss` dropped back down while `cg-mem` stayed pinned). `peak_kb` was
+never contaminated, and no `invocation.json` produced before this fix has
+an inflated memory column — but `cg-mem` remains unreliable across `--run`s
+in a shared box and must not be read that way in the future without this
+same per-run isolation. This is the same class of defect the 9b migration
+was fixing (memory accounting contaminated by something other than the
+process being measured); the live instance of it here had just relocated
+from the parent process's address space into the box's cgroup, and it
+surfaced as a corrupted verdict rather than a corrupted number. The fix:
+`_run_once` now owns a full `--init`/`--run`/`--cleanup` cycle for its own
+box id, so no run can ever observe another run's counters — on any field,
+whether or not this driver currently reads it. `open_isolate_box()` still
+does one probe `--init`/`--cleanup` at startup (to fail fast, before any
 compilation, if isolate is missing or unconfigured) but no longer holds a
 box open across the whole invocation — see `IsolateHandle.box_id_counter`
 for how each call gets its own id.
@@ -199,8 +212,11 @@ class IsolateHandle:
     reuse. That theory was wrong in a way neither the 9b migration nor its
     review caught: isolate's cgroup counters (`cg-mem`, `cg-oom-killed`) are
     **not reset between `--run`s in the same box** — reproduced with bare
-    isolate, no involvement from this module (see the module docstring).
-    So every `--run` now gets a brand-new box id, `--init`ed immediately
+    isolate, no involvement from this module (see the module docstring for
+    the precise before/after values, and for which of the two actually
+    reached this driver's output: `cg-oom-killed` did, `cg-mem` did not,
+    because `peak_kb` is read from `max-rss` and never from `cg-mem`). So
+    every `--run` now gets a brand-new box id, `--init`ed immediately
     before it and `--cleanup`ed immediately after (see `_run_once`), and
     this handle carries only what is shared safely across that churn:
 
@@ -500,11 +516,18 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     function returns or raises. isolate's cgroup counters (`cg-mem`,
     `cg-oom-killed`) persist across `--run`s in the same box — verified
     with bare isolate, no involvement from this module (see module
-    docstring) — so reusing a box across calls let one solution's memory
-    reading contaminate every later one in the same box, exactly the class
-    of defect this sandbox migration was meant to eliminate. A box that
-    lives only from just before this one `--run` to just after it can never
-    observe another call's counters.
+    docstring for the precise before/after values). Of the two, only
+    `cg-oom-killed` reached this driver's output: reusing a box let one
+    solution's OOM stick as `oom=True` for every later, memory-innocent
+    run in the same box, which is a corrupted *verdict* (ML silently
+    overwrote a correct one, since ML outranks WA), not a corrupted
+    number — `peak_kb` is read from `max-rss` below, never from `cg-mem`,
+    and `max-rss` was independently verified to reset correctly per
+    process regardless of box reuse. Still the same class of defect this
+    sandbox migration was meant to eliminate (memory-adjacent accounting
+    contaminated by something other than the process being measured); a
+    box that lives only from just before this one `--run` to just after it
+    can never observe another call's counters, on any field.
     """
     box_id = next(isolate.box_id_counter) % 65536
     _init_box(isolate.binary, box_id)
