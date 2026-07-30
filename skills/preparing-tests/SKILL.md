@@ -43,15 +43,20 @@ the hole yet. When in doubt, ask which.
 
 `$BASE` is not an environment variable the harness sets — it is not exported
 into a shell, only into MCP config. What you actually have is the line **"Base
-directory for this skill: `<path>`"** printed in this skill's own invocation
-preamble. Substitute that literal path for `BASE` below; do not leave it as a
-bare `$BASE` reference, or the command fails with "No such file or directory"
-before it does anything:
+directory for this skill" printed in this skill's own invocation preamble.
+Substitute that literal path for `BASE` below:
 
 ```bash
 BASE="<the path from this skill's own 'Base directory for this skill' line>"
-TESTLIB="$(bash "$BASE/../../tools/bootstrap_testlib.sh")"
+PLUGIN_ROOT="$BASE/../.."
+TESTLIB="$(bash "$PLUGIN_ROOT/tools/bootstrap_testlib.sh")"
+cd "$PLUGIN_ROOT"
 ```
+
+Every `python3 -m tools.*` command below is a module inside `tools/`, which
+is only importable with `PLUGIN_ROOT` as the working directory — `cd` there
+first, or every invocation fails with `ModuleNotFoundError: No module named
+'tools'` before it does anything.
 
 Then **read `$TESTLIB/docs/usage-guide.md` for the API and `$TESTLIB/plan.md`
 for known defects** before writing a line of `validator.cpp`, `check.cpp`, or
