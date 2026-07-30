@@ -4,3 +4,7 @@ Thumbs.db
 
 # Scratch space for subagent-driven development runs (ledgers, briefs, reviews).
 .superpowers/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

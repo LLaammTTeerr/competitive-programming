@@ -111,22 +111,27 @@ class TestScan(unittest.TestCase):
             scan(self.dir, PROBLEM)
 
     def test_untracked_file_uses_mtime_timestamp(self):
-        """Untracked file in git repo derives timestamp from mtime, not empty string."""
+        """Untracked file in git repo with history derives timestamp from mtime, not git log."""
         # Initialize a git repo in the temp directory
         git_dir = Path(tempfile.mkdtemp())
-        solutions_dir = git_dir / "solutions"
-        solutions_dir.mkdir()
 
-        # Write solution files
-        (solutions_dir / "sol-main.cpp").write_text(MAIN, encoding="utf-8")
-        (solutions_dir / "sol-greedy.cpp").write_text(GREEDY, encoding="utf-8")
-
-        # Initialize git repo
+        # Initialize git repo and configure user
         subprocess.run(["git", "init"], cwd=git_dir, capture_output=True, check=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_dir, capture_output=True, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=git_dir, capture_output=True, check=True)
 
-        # DO NOT add or commit the files - they should be untracked
+        # Create and commit an unrelated file to establish repo history
+        # (without history, git log exits 128 which is indistinguishable from "no git repo")
+        (git_dir / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=git_dir, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=git_dir, capture_output=True, check=True)
+
+        # Now create solutions directory and write solution files WITHOUT adding them
+        # (they will be untracked in a repo that has history)
+        solutions_dir = git_dir / "solutions"
+        solutions_dir.mkdir()
+        (solutions_dir / "sol-main.cpp").write_text(MAIN, encoding="utf-8")
+        (solutions_dir / "sol-greedy.cpp").write_text(GREEDY, encoding="utf-8")
 
         # Scan should succeed and produce mtime-derived timestamps
         payload = scan(git_dir, PROBLEM)
