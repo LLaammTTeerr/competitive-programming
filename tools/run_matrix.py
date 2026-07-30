@@ -13,12 +13,19 @@ Process control note: a naive `os.wait4(popen.pid, ...)` on top of
 raise `ChildProcessError` or read garbage rusage. This module owns the child
 end-to-end instead: `os.posix_spawn` starts it with the stdio redirected via
 POSIX_SPAWN_DUP2 file actions, and the *same* `os.wait4` call that first
-observes the child's exit is the one that reaps it and reads its
-`ru_maxrss`. There is exactly one reaper per child, so peak RSS is the real
-per-child high-water mark, not a subprocess-module guess and not the
-`RUSAGE_CHILDREN` cumulative figure (which would blur across every child run
-in the whole process's lifetime, wrongly attributing memory from an earlier
-solution's run to a later one).
+observes the child's exit is the one that reaps it. There is exactly one
+reaper per child, so there is no double-reap race — but that call's
+`ru_maxrss` is *not* the child's own peak RSS: `fork`+`exec` (which is what
+`posix_spawn` does under the hood) hands the child a COW copy of the
+parent's address space, and `execve` folds that pre-exec mm's high-water
+mark — i.e. the *driver's own RSS at spawn time* — into the freshly-exec'd
+task's rusage before installing the new address space. `ru_maxrss` is
+therefore `max(driver RSS at spawn, child's real peak)`, which floors every
+reading at whatever the Python driver itself weighs and grows across a run
+as the driver accumulates state. Peak RSS is instead read from the child's
+own `/proc/<pid>/status` (`VmHWM`, which lives on the mm and is reset by
+`execve`) while it is still alive; `ru_maxrss` is used only as a fallback
+for the rare case where that read never lands before the child exits.
 """
 
 from __future__ import annotations
@@ -56,6 +63,16 @@ CXXFLAGS = ["-std=c++17", "-O2"]
 # exit from ever being mistaken for a verdict on the *solution*.
 CHECKER_EXIT = {0: "OK", 1: "WA", 2: "PE", 3: "FAIL"}
 
+# A checker only reads two or three files already on disk and compares them
+# — even a checker doing something unusually heavy (diffing large output
+# files) should finish in well under a second. 10s is a deliberately
+# generous multiple of that (not tied to the problem's own TL, which bounds
+# the *solution*, not the checker) so a merely-slow checker is never
+# mistaken for a hung one, while a genuine infinite loop in a custom
+# checker (externally-authored data, per R1) still fails in bounded time
+# instead of hanging the whole pipeline.
+CHECKER_TIMEOUT_S = 10
+
 
 class MatrixError(RuntimeError):
     """The matrix could not be run: a build, fixture, or environment problem."""
@@ -73,12 +90,53 @@ def _compile(source: Path, binary: Path, extra: list[str] | None = None,
         )
 
 
+_SPIN_WINDOW_MS = 20  # see _run_once: dense polling for a short opening window
+
+
+def _peak_rss_kb(pid: int) -> int | None:
+    """Best-effort read of the child's own peak RSS while it is still alive.
+
+    `VmHWM` lives on the process's mm and is already a running maximum since
+    the last `execve` (which resets it), so a single successful read already
+    reflects every high-water point observed up to that instant — it does
+    not need to land on the actual peak moment, only sometime before the mm
+    is torn down at exit. That teardown (`exit_mm`) happens *before* the
+    task becomes reapable, i.e. before `os.wait4` can ever observe the exit,
+    so this must be attempted on every poll iteration, not once at the end.
+    Returns None if the read races the child's exit or is otherwise
+    unavailable, so the caller can fall back to `ru_maxrss`.
+    """
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])  # "VmHWM:\t 12345 kB" -> kB
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def _run_once(binary: Path, stdin_path: Path, stdout_path: Path, kill_ms: int):
     """Run one process, returning (elapsed_ms, killed, exit_code, peak_kb).
 
     Spawns and reaps the child itself (see module docstring for why) so the
-    rusage read off the single `os.wait4` that observes the exit is real and
-    belongs to exactly this child.
+    single `os.wait4` that observes the exit is the one that reaps it — no
+    double reap. `killed` is derived from the reaped wait status rather than
+    from which branch of the loop broke it: a child that exits naturally in
+    the window between a WNOHANG poll and the deadline check is still reaped
+    with its true exit status even if a `kill()` lands on the (already-dead,
+    now harmless) zombie, and that must not be reported as killed.
+
+    The poll loop busy-spins (no sleep) for the first `_SPIN_WINDOW_MS` of a
+    run, then backs off to a cheap 2ms sleep. A trivial competitive-
+    programming solution can start, run, and exit in well under a
+    millisecond — far faster than a fixed 2ms poll interval, which measured
+    (see task-9-report.md) as often getting zero or one `/proc` samples in
+    before the child was already gone, undercounting `VmHWM` by an order of
+    magnitude. Spinning tightly for a short opening window catches that
+    case; backing off afterward avoids pegging a CPU core for the whole of
+    a multi-hundred-millisecond-to-several-second run, where a 2ms poll has
+    ample opportunity to observe the same monotonic high-water mark anyway.
     """
     with open(stdin_path, "rb") as fin, \
          open(stdout_path, "wb") as fout, \
@@ -95,41 +153,69 @@ def _run_once(binary: Path, stdin_path: Path, stdout_path: Path, kill_ms: int):
         except OSError as exc:
             raise MatrixError(f"could not start {binary}: {exc}") from exc
 
-        killed = False
         status = 0
         rusage = None
+        peak_kb = 0
         while True:
+            hwm = _peak_rss_kb(pid)
+            if hwm is not None:
+                peak_kb = max(peak_kb, hwm)
             got_pid, status, rusage = os.wait4(pid, os.WNOHANG)
             if got_pid != 0:
                 break
-            if (time.monotonic() - started) * 1000 >= kill_ms:
+            elapsed_so_far_ms = (time.monotonic() - started) * 1000
+            if elapsed_so_far_ms >= kill_ms:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 _, status, rusage = os.wait4(pid, 0)
-                killed = True
                 break
-            time.sleep(0.002)
+            if elapsed_so_far_ms >= _SPIN_WINDOW_MS:
+                time.sleep(0.002)
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
-    peak_kb = rusage.ru_maxrss if rusage is not None else 0
-    exit_code = -signal.SIGKILL if killed else os.waitstatus_to_exitcode(status)
+    if peak_kb == 0 and rusage is not None:
+        # The /proc read never landed while the child was alive (a very
+        # fast process, or a race with its exit) — fall back to the
+        # driver-contaminated but still nonzero figure rather than report 0.
+        peak_kb = rusage.ru_maxrss
+
+    killed = os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    exit_code = os.waitstatus_to_exitcode(status)
     return elapsed_ms, killed, exit_code, peak_kb
 
 
 def _time_median(binary, stdin_path, stdout_path, kill_ms, runs):
+    """Median the elapsed time over `runs` runs; a crash on any run wins.
+
+    `killed` and `code` are both sticky: `killed or k` never clears once
+    True, and `code or c` never clears once nonzero (0 is falsy, so this
+    keeps the first crash it sees rather than letting a later successful
+    run silently overwrite it). Without that, a solution that crashes on
+    run 1 and happens to succeed on runs 2-3 would pass the `code != 0`
+    gate its caller checks — for the model solution specifically, that
+    would mean accepting a flaky answer file as jury truth.
+    """
     samples, killed, code, peak = [], False, 0, 0
     for _ in range(runs):
         ms, k, c, p = _run_once(binary, stdin_path, stdout_path, kill_ms)
         samples.append(ms)
-        killed, code, peak = killed or k, c, max(peak, p)
+        killed = killed or k
+        code = code or c
+        peak = max(peak, p)
     return int(statistics.median(samples)), killed, code, peak
 
 
-def _check(checker: Path, test_in: Path, out: Path, ans: Path) -> str:
-    done = subprocess.run([str(checker), str(test_in), str(out), str(ans)],
-                          capture_output=True, text=True)
+def _check(checker: Path, test_in: Path, out: Path, ans: Path,
+           *, timeout_s: float = CHECKER_TIMEOUT_S) -> str:
+    try:
+        done = subprocess.run([str(checker), str(test_in), str(out), str(ans)],
+                              capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        print(f"WARNING: checker {checker} did not finish within {timeout_s}s "
+              f"on test {test_in} — reporting FAIL", file=sys.stderr)
+        return "FAIL"
     return CHECKER_EXIT.get(done.returncode, "FAIL")
 
 
@@ -157,6 +243,17 @@ def _tests_by_group(problem_dir: Path, problem: Problem) -> dict[str, list[Path]
 def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict:
     problem_dir, testlib_dir = Path(problem_dir), Path(testlib_dir)
     problem = load(problem_dir / "problem.json")
+    if problem.input != "stdin" or problem.output != "stdout":
+        raise MatrixError(
+            "file-based IO is not supported by this driver: "
+            f"io.input={problem.input!r}, io.output={problem.output!r} "
+            "(only io.input='stdin' / io.output='stdout' are handled; "
+            "vnolymp-style file-IO problems — e.g. flight.inp/flight.out — "
+            "would otherwise feed the model solution empty stdin, discard "
+            "its real output, and this driver would report a confident "
+            "wrong verdict instead of failing loudly. Supporting file IO "
+            "is a later feature, not something to run silently-wrong now.)"
+        )
     manifest = scan(problem_dir, problem)
 
     build = problem_dir / ".build"
@@ -221,19 +318,25 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                 outcome = classify(ms, killed, verdict_src, limits)
 
                 if outcome.banded:
+                    first_run_ms = ms
                     ms, killed, code, peak = _time_median(
                         binaries[name], test, out, limits.kill_ms, runs)
                     outcome = classify(ms, killed, verdict_src, limits)
                     flags.append(
                         problem_dir, phase="validate-solutions", severity="medium",
                         kind="timing-band",
-                        what=f"{name} on {group}/{test.stem} ran {ms} ms, "
-                             f"between TL {limits.tl_ms} and kill {limits.kill_ms}",
-                        assumed="reported as TL, reclassified to "
-                                "time-limit-exceeded-or-accepted",
+                        what=f"{name} on {group}/{test.stem} ran {first_run_ms} ms "
+                             f"on its first (single) run, between TL {limits.tl_ms} "
+                             f"and kill {limits.kill_ms}",
+                        assumed=f"re-timed {runs}x for stability; the median came "
+                                f"out {ms} ms, and the recorded verdict is "
+                                f"{outcome.verdict} — there is no separate "
+                                "'banded' verdict, only ever a real one "
+                                "(TL if still over the limit, otherwise "
+                                "whatever the checker returned)",
                         changes_if_wrong=f"the expected tag of {name}")
 
-                if peak > problem.memory_mb * 1024:  # ru_maxrss is KB on Linux
+                if peak > problem.memory_mb * 1024:  # peak_kb is in KB
                     outcome = dataclasses.replace(outcome, verdict="ML")
 
                 per_test.append(outcome.verdict)
