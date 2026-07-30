@@ -34,19 +34,70 @@ VERDICTS = ("OK", "WA", "TL", "ML", "PE", "RE")
 
 _FIELD = re.compile(r"^\s*\*?\s*@(?P<key>[a-z-]+)\s+(?P<value>.+?)\s*$")
 
+# Non-greedy across newlines: each match is one complete `/** ... */`
+# block, so a block that is never closed simply does not match (handled
+# explicitly in `_metadata_block`) rather than swallowing the rest of the
+# file.
+_BLOCK = re.compile(r"/\*\*(?P<body>.*?)\*/", re.DOTALL)
+
 
 class ScanError(ValueError):
     """A solution's metadata block is malformed or contradicts problem.json."""
 
 
-def parse_block(text: str) -> dict:
+def _fields_in(body: str) -> dict[str, str]:
     fields: dict[str, str] = {}
-    for line in text.splitlines():
-        if "*/" in line:
-            break
+    for line in body.splitlines():
         match = _FIELD.match(line)
         if match:
             fields[match.group("key")] = match.group("value")
+    return fields
+
+
+def _metadata_block(text: str) -> dict[str, str]:
+    """The fields of the file's `/** ... */` metadata block.
+
+    This used to be "every line from the top of the file until the first
+    line containing `*/`", which aborted the scan at *any* block comment
+    preceding the metadata — a licence header, a note about the approach,
+    anything. A file plainly containing `@tag main` under a `/* … */` note
+    was reported as "metadata block is missing @tag": a message asserting
+    the opposite of what the file says, on the scan that gates the entire
+    invocation matrix.
+
+    Blocks are located properly instead, and the one carrying the metadata
+    is the first that contains `@tag`. The fallback — the first block with
+    any `@field` at all — exists so a real metadata block that forgot
+    `@tag` still produces "missing @tag" rather than "no metadata block",
+    which is the more useful of the two messages for that mistake.
+
+    An unterminated `/**` is its own error (deferred minor T4-8): the old
+    line scan silently read to end of file, which surfaced as a confusing
+    downstream failure rather than as the unclosed comment it is.
+    """
+    candidates = [m.group("body") for m in _BLOCK.finditer(text)]
+    with_fields = [(body, _fields_in(body)) for body in candidates]
+
+    for _, fields in with_fields:
+        if "tag" in fields:
+            return fields
+    for _, fields in with_fields:
+        if fields:
+            return fields
+
+    start = text.find("/**")
+    if start != -1 and text.find("*/", start + 3) == -1:
+        line_no = text.count("\n", 0, start) + 1
+        raise ScanError(
+            f"metadata block opened at line {line_no} is never closed — no "
+            "`*/` anywhere after it")
+    raise ScanError(
+        "no `/** ... */` metadata block found (the block carrying @tag, "
+        "@expect, @algorithm and @complexity)")
+
+
+def parse_block(text: str) -> dict:
+    fields = _metadata_block(text)
 
     for required in ("tag", "expect", "algorithm", "complexity"):
         if required not in fields:

@@ -53,6 +53,37 @@ class TestParseBlock(unittest.TestCase):
         with self.assertRaisesRegex(ScanError, "@tag"):
             parse_block("/**\n * @expect g1=OK\n */\n")
 
+    def test_reads_metadata_under_a_preceding_block_comment(self):
+        # The scan gates the entire invocation matrix, and it used to break
+        # at the first line containing `*/` wherever it appeared — so a file
+        # that plainly contains `@tag main` under an ordinary note reported
+        # "metadata block is missing @tag", asserting the opposite of what
+        # the file says.
+        note = "/* Ported from the 2019 editorial; see notes.md. */\n"
+        self.assertEqual(parse_block(note + MAIN)["tag"], "main")
+
+    def test_reads_metadata_under_a_multi_line_licence_header(self):
+        header = "/*\n * Copyright (c) 2026.\n * All rights reserved.\n */\n"
+        parsed = parse_block(header + GREEDY)
+        self.assertEqual(parsed["tag"], "wrong-answer")
+        self.assertEqual(parsed["expect"], {"g1": "WA", "g2": "WA"})
+
+    def test_reads_metadata_under_a_preceding_doc_block_without_fields(self):
+        self.assertEqual(parse_block("/** A note. */\n" + MAIN)["tag"], "main")
+
+    def test_ignores_a_trailing_block_comment_after_the_metadata(self):
+        parsed = parse_block(MAIN + "\n/**\n * @tag failed\n */\n")
+        self.assertEqual(parsed["tag"], "main")
+
+    def test_rejects_an_unterminated_metadata_block(self):
+        # Deferred minor T4-8: the old line scan read to end of file.
+        with self.assertRaisesRegex(ScanError, "never closed"):
+            parse_block("/**\n * @tag main\n * @expect g1=OK\nint main(){}\n")
+
+    def test_rejects_a_file_with_no_metadata_block_at_all(self):
+        with self.assertRaisesRegex(ScanError, "no `/\\*\\* \\.\\.\\. \\*/`"):
+            parse_block("int main() { return 0; }\n")
+
     def test_rejects_unknown_tag(self):
         with self.assertRaisesRegex(ScanError, "sideways"):
             parse_block("/**\n * @tag sideways\n * @expect g1=OK\n"
