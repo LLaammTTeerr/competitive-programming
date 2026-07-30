@@ -65,7 +65,7 @@ is the one `cd` in this file, and nothing later moves you. `python3 -m
 tools.*` requires it (see above) and takes `$PROBLEM` as an argument;
 every other command — compiling `validator.cpp` and `gen-*.cpp`, running
 the validator over test files, writing `files/` and `tests/` — names
-`$PROBLEM` explicitly in its paths, `"$PROBLEM/validator"` and
+`$PROBLEM` explicitly in its paths, `"$PROBLEM/files/validator"` and
 `"$PROBLEM/tests/g1/01.in"` rather than `./validator` and `tests/g1/01.in`.
 Every command block below is written that way and is runnable as-is from
 wherever you are. Do not rely on whatever directory the previous command
@@ -85,18 +85,28 @@ subtask binding, ordering doctrine, and the traps below, curated from the
 fork's own audit rather than duplicated from it.
 
 Compile everything the same way — with `$PROBLEM` spelled out on both
-sides, since the working directory is `$PLUGIN_ROOT`, not the problem:
+sides, since the working directory is `$PLUGIN_ROOT`, not the problem.
+**`validator.cpp` lives in `$PROBLEM/files/`, not `$PROBLEM/`** — confirmed
+against `tools/package_status.py`'s own `validator` phase check
+(`files / "validator.cpp"`) and against both on-disk packages
+(`flight/files/validator.cpp`, `tools/tests/fixtures/mini/files/validator.cpp`).
+A validator built at `$PROBLEM/validator.cpp` compiles and runs, but
+`package_status` will never see it as done — it checks one specific path,
+not "a validator exists somewhere in this directory":
 
 ```bash
-g++ -std=c++17 -O2 -Wpedantic -Werror -I"$TESTLIB" -I"$PROBLEM/files" \
-    "$PROBLEM/validator.cpp" -o "$PROBLEM/validator"
+g++ -std=c++17 -O2 -Wpedantic -Werror -I"$TESTLIB" \
+    "$PROBLEM/files/validator.cpp" -o "$PROBLEM/files/validator"
 ```
 
-`-I"$PROBLEM/files"` is not optional for the validator: the generated
-`constraints.h` lives in `$PROBLEM/files/`, and `#include "constraints.h"`
-searches the *including file's* directory (`$PROBLEM/`) — not `files/` —
-so without it the compile fails with `constraints.h: No such file or
-directory` no matter which directory you run from.
+No `-I"$PROBLEM/files"` is needed here, and none should be added: with
+`validator.cpp` and the generated `constraints.h` both in `$PROBLEM/files/`,
+`#include "constraints.h"` resolves against the *including file's own*
+directory — which already is `files/` — with no extra include path
+required. (An earlier version of this section put the validator at
+`$PROBLEM/` and, from that wrong premise, argued `-I"$PROBLEM/files"` was
+required to reach `constraints.h` from there — that reasoning no longer
+applies now that the validator and the header are colocated.)
 
 Never `-ffast-math` — testlib detects it at runtime and aborts.
 
@@ -304,7 +314,7 @@ Validate every test under its own `--group` before it ever reaches a
 solution:
 
 ```bash
-"$PROBLEM/validator" --testset tests --group g1 < "$PROBLEM/tests/g1/01.in"
+"$PROBLEM/files/validator" --testset tests --group g1 < "$PROBLEM/tests/g1/01.in"
 ```
 
 A test that validates against the wrong group's bounds, or against no group
@@ -319,7 +329,7 @@ a missing trailing newline, a stray extra token — and assert it exits
 nonzero, **before** the first generator is written:
 
 ```bash
-printf '1001 5\n' | "$PROBLEM/validator" --testset tests --group g1
+printf '1001 5\n' | "$PROBLEM/files/validator" --testset tests --group g1
 echo "exit: $?"   # expect nonzero — g1 caps n at 1000
 ```
 
@@ -338,17 +348,40 @@ anything a generator might later produce.
 ## Reaching check
 
 A bound in `problem.json` that no test attains is a hole — the suite claims
-a limit it never actually tests. Confirm every declared bound is hit,
-per group:
+a limit it never actually tests. Confirm every declared bound is hit, per
+group — **with one log file per test, never a single shared log for the
+whole group.**
+
+`--testOverviewLogFileName` opens its target with `"wb"` (confirmed against
+`testlib.h`'s own handling of that option): every invocation **truncates**
+the file rather than appending to it. Loop several tests over the same log
+path — the shape the previous version of this section itself showed — and
+only the *last* invocation's hits survive; every earlier test's contribution
+is silently overwritten, not merged. The result still looks clean (exit 0,
+a plausible-looking log with some hits in it), not obviously broken, which
+is what makes this dangerous rather than merely wrong: a group where every
+bound really is reached, but reached by different tests, reads back as
+"most bounds unreached" — indistinguishable, from the log alone, from a
+genuinely weak suite.
 
 ```bash
-"$PROBLEM/validator" --testset tests --group g1 \
-    --testOverviewLogFileName "$PROBLEM/g1-overview.log" < "$PROBLEM/tests/g1/01.in"
-# repeat per test, or loop over the group; then inspect the log for any
-# bound whose "hit" side never appears
+rm -rf "$PROBLEM/.reach-g1" && mkdir -p "$PROBLEM/.reach-g1"
+i=0
+for f in "$PROBLEM"/tests/g1/*.in; do
+    i=$((i+1))
+    "$PROBLEM/files/validator" --testset tests --group g1 \
+        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f"
+done
+# union across every per-test log, not just the last one written
+cat "$PROBLEM"/.reach-g1/*.log | grep -E '": (min|max)-value-hit' | sort -u
+rm -rf "$PROBLEM/.reach-g1"   # scratch output, not a package artifact
 ```
 
-**This only sees bounds read as numbers.** A `readInt` / `readLong` /
+A bound whose `min-value-hit` or `max-value-hit` line never appears
+**anywhere in the union** — not merely absent from the last test's log —
+is genuinely unreached. Repeat per group.
+
+**Even fixed this way, it only sees bounds read as numbers.** A `readInt` / `readLong` /
 `readDouble` with a min and max registers `constant-bounds` plus a
 `min-value-hit` / `max-value-hit` line — that is what makes the log
 meaningful. A string read with `readToken(pattern, "A")` or `readLine`
@@ -362,6 +395,19 @@ log, checking nothing. This is `flight`'s own bound shape
 (`1 <= |A| <= 20`), and it is a common one: the reaching check silently
 does nothing for it, and a clean run reads as "nothing to report" when the
 truth is "this mechanism cannot see this bound".
+
+**The same blindness applies to a subtask-tightened numeric bound enforced
+via `ensure()`** — exactly the pattern the Validator section above
+recommends (`if (validator.group() == "g1") ensure(n <= G1_N_MAX);`).
+`n` itself is still read once, against the *global* range, for the
+hit-tracker's bookkeeping — so `g1`'s tightened `n <= G1_N_MAX` never
+registers its own `max-value-hit`; only the (usually uninteresting) global
+max does. Confirmed empirically: a group whose every test genuinely reaches
+its subtask-tightened maximum still shows no `max-value-hit` line for that
+variable in the union above. `ensure()`-tightened bounds are the standard
+way this pipeline expresses subtask bounds, not an edge case, so treat
+every such bound as belonging to the fallback check below by default,
+rather than trusting a hit-tracker line that will never appear for it.
 
 For any length (or otherwise non-numeric) bound, fall back to inspecting
 the tests directly — confirm the minimum and maximum are each attained in

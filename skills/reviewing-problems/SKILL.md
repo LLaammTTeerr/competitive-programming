@@ -101,7 +101,15 @@ this class is immune to (see the next section).
 ### 2. Assumed definitions
 
 A term used as though the reader already knows it, with no definition
-anywhere in the statement. **The live example, and it must be treated as a
+anywhere in the statement.
+
+**Operator-facing rationale — not part of the dispatch payload.** The rest
+of this subsection names a specific package and its specific answer; it
+exists to convince *you*, reading this skill, that this class of defect is
+real and easy to miss — never relay it to a subagent you dispatch to review
+that package (see "Run as a subagent" below for what to relay instead).
+
+**The live example, and it must be treated as a
 real defect, not a hypothetical:** `flight`'s own constraint line says
 
 > một trong hai xâu có thể là **xâu con** của xâu còn lại
@@ -151,30 +159,54 @@ never tests. `review_checks` does not check this; it is a hole in an
 *earlier* phase (`preparing-tests`'s own reaching check) that this audit
 re-verifies rather than trusting was done. Re-run the same mechanism
 `preparing-tests` documents, per group, instead of assuming it was run
-correctly the first time:
+correctly the first time — **with one log file per test, never a single
+shared log for the whole group.** `--testOverviewLogFileName` opens its
+target with `"wb"` (confirmed against `testlib.h`): every invocation
+**truncates** the file rather than appending, so a loop that reuses one log
+path across a group silently keeps only the last test's hits and discards
+every earlier one — and the result still looks clean (exit 0, a few
+`variable "x"` lines), not obviously wrong, which is what makes this a
+reviewing hazard rather than a loud failure:
 
 ```bash
-"$PROBLEM/validator" --testset tests --group g1 \
-    --testOverviewLogFileName "$PROBLEM/g1-overview.log" < "$PROBLEM/tests/g1/01.in"
-# repeat for every test in the group (or loop over the group), then read
-# the log for any declared bound whose min-value-hit / max-value-hit line
-# never appears
+rm -rf "$PROBLEM/.reach-g1" && mkdir -p "$PROBLEM/.reach-g1"
+i=0
+for f in "$PROBLEM"/tests/g1/*.in; do
+    i=$((i+1))
+    "$PROBLEM/files/validator" --testset tests --group g1 \
+        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f"
+done
+# union across every per-test log, not just the last one written
+cat "$PROBLEM"/.reach-g1/*.log | grep -E '": (min|max)-value-hit' | sort -u
+rm -rf "$PROBLEM/.reach-g1"   # scratch output, not a package artifact
 ```
 
+A bound whose `min-value-hit` or `max-value-hit` line never appears
+**anywhere in the union** — not just absent from the last test's log — is
+genuinely unreached. Repeat per group.
+
 **Known limitation, inherited from `preparing-tests`'s own dogfood
-finding:** this only sees bounds read as *numbers* — `readInt`/`readLong`/
-`readDouble` with an explicit min/max register a hit line; a length bound
-expressed via `readToken(pattern, "A")` (`flight`'s own `1 <= |A| <= 20`
-shape) registers only a bare `variable "A"` line with no hit tracking at
-all, so a clean log for that variable means "this mechanism cannot see this
-bound," not "nothing to report." For any such bound, inspect the tests
-directly instead:
+finding:** even fixed this way, the mechanism only sees bounds read as
+*numbers* — `readInt`/`readLong`/`readDouble` with an explicit min/max
+register a hit line; a length bound expressed via `readToken(pattern, "A")`
+registers only a bare `variable "A"` line with no hit tracking at all, so a
+clean union for that variable means "this mechanism cannot see this bound,"
+not "nothing to report." For any such bound, inspect the tests directly
+instead:
 
 ```bash
 awk 'FNR==1{print length($1)}' "$PROBLEM"/tests/g1/*.in | sort -n | sed -n '1p;$p'
 # first line is the shortest value in the group, second the longest;
 # compare both against the declared bound by hand
 ```
+
+**Operator-facing rationale — not part of the dispatch payload.** This
+`readToken` limitation was first found on `flight`'s own `1 <= |A| <= 20`
+bound, which is expressed exactly this way. Worth knowing if you are the
+operator deciding whether to trust a clean-looking union, but naming the
+specific package and bound here is exactly the kind of worked example class
+2's marker above warns against relaying verbatim to a fresh subagent
+reviewing that same package.
 
 A bound that turns out unreached is a `test-weakness` flag — hand it back to
 `preparing-tests` for a test that closes it; this audit records the gap, it
@@ -187,19 +219,41 @@ mechanism: that skill's own protocol starts from `BASE_SHA`/`HEAD_SHA` and a
 `git diff`, which this skill has nothing to supply — a problem package may
 never have touched git at all, and `## Am I the right skill?` above says so
 directly. Take from it only what actually transfers: **dispatch a fresh
-subagent rather than reviewing inline.** The dispatch this skill needs has
-no diff range in it at all — hand the subagent the problem directory path,
-the statement path, and the five judgement classes above, and let it read
-the package the way a contestant would,
-with none of the context that produced it. This is not optional convenience
-— it is the whole reason this skill exists as a separate step rather than a
-final read-through by whoever just finished writing the statement. A
-reviewer that inherited the assumptions of the agent that wrote the
-statement **cannot see the assumed definition**: the `xâu con` example above
-survived exactly this — its own author's verification pass — because the
-author already knew which reading was meant and read the sentence through
-that knowledge rather than against it. Dispatching with fresh context is
-what makes the difference between a rubber-stamp and a review.
+subagent rather than reviewing inline.**
+
+**The dispatch payload, precisely.** Hand the subagent the problem
+directory path and the statement path, plus, for each of the five judgement
+classes above, only its **number, name, and generic definition** — the
+opening sentence or two that says what the class *is* — and let it read the
+package the way a contestant would, with none of the context that produced
+it. **Stop before any worked example.** A worked example that names the
+package under review — class 2's `xâu con` paragraph, class 5's `readToken`
+paragraph — exists to convince the *operator reading this file* that fresh
+context matters; relaying it to the subagent instead hands over that
+package's own answer before the subagent has read a line of the statement,
+which is self-defeating on the one package (`flight`) this file is written
+against, and would be equally self-defeating on any future worked example
+added here. This is a general rule, not a one-off patch for `flight`. Both
+package-specific blocks above are marked **"Operator-facing rationale — not
+part of the dispatch payload"** for exactly this reason: read them
+yourself, never paste them into a subagent's prompt.
+
+**Preserve the dispatch prompt you actually send.** Keep it — a scratch
+file next to the review is enough — for at least the lifetime of the run.
+Whether this skill's fresh-context claim held up on a given run ("did the
+judgement half find X independently?") can only be checked against what the
+subagent was actually told; a claim of independence whose own input is
+already gone cannot be audited later, only taken on faith.
+
+This is not optional convenience — it is the whole reason this skill exists
+as a separate step rather than a final read-through by whoever just
+finished writing the statement. A reviewer that inherited the assumptions
+of the agent that wrote the statement **cannot see the assumed
+definition**: the `xâu con` example above survived exactly this — its own
+author's verification pass — because the author already knew which reading
+was meant and read the sentence through that knowledge rather than against
+it. Dispatching with fresh context is what makes the difference between a
+rubber-stamp and a review.
 
 ## Recording findings
 
