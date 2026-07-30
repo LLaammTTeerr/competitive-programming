@@ -7,6 +7,8 @@ place or installed on another machine.
 |---|---|---|
 | Skill `solving-problems` | `competitive-programming:solving-problems` | Algorithm design and C++ for one problem on a stdin/stdout judge — constraints → complexity budget → design → edge cases → clean implementation, with stress testing against a brute-force oracle |
 | Skill `running-contests` | `competitive-programming:running-contests` | Drives a whole contest on any judge: binds to whatever judge MCP is installed, pulls the problem set, orders it, delegates each problem to `solving-problems`, submits, reads verdicts, and keeps going until every problem is solved |
+| Skill `preparing-tests` | `competitive-programming:preparing-tests` | Builds the test-data contract for a problem being set: checker, validator, generators (random / max-size / boundary / structured-adversarial / hand-written), and sample selection, driven by testlib and `tools/gen_constraints_header.py` / `tools/drift_check.py` |
+| Skill `validating-solutions` | `competitive-programming:validating-solutions` | Attacks a problem's test suite with a zoo of deliberately-wrong solutions plus alternative and exhaustive-arbiter `accepted` solutions, runs the invocation matrix (`tools/run_matrix.py`) under `ioi/isolate`, and reports holes and mismatches |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 
 ## Layout
@@ -19,7 +21,13 @@ competitive-programming/
 ├── .mcp.json                 # registers the bundled codeforces server
 ├── skills/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
-│   └── running-contests/SKILL.md   (+ references/judges.md)
+│   ├── running-contests/SKILL.md   (+ references/judges.md)
+│   ├── preparing-tests/SKILL.md
+│   └── validating-solutions/SKILL.md
+├── tools/                    # Python pipeline the two test-authoring skills drive
+│   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
+│   ├── scan_solutions.py  matrix_core.py  run_matrix.py  bootstrap_testlib.sh
+│   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
     ├── pyproject.toml  uv.lock
     ├── src/cf_mcp/
@@ -48,6 +56,30 @@ export CODEFORCES_COOKIE=JSESSIONID=your_cookie_value
 ```
 
 Everything else the server understands is documented in `mcp-server/.env.example`.
+
+**Prerequisite:** [`ioi/isolate`](https://github.com/ioi/isolate) — `preparing-tests`
+and `validating-solutions` run every generator and every solution sandboxed under
+isolate, never a bare `fork`/`exec`; `tools/run_matrix.py` refuses to start rather
+than falling back to something unsandboxed. This is a one-time machine setup, not
+a per-problem one:
+
+```bash
+sudo apt install build-essential pkg-config libcap-dev libseccomp-dev libsystemd-dev
+git clone https://github.com/ioi/isolate.git && cd isolate
+make && sudo make install
+```
+
+Then create the system user isolate expects, register its subuid/subgid range, and
+start the cgroup keeper daemon:
+
+```bash
+sudo useradd -r isolate   # if it doesn't already exist
+echo "isolate:200000:65536" | sudo tee -a /etc/subuid /etc/subgid
+sudo systemctl enable --now isolate.service
+```
+
+Verify with `isolate --version`; if `--init` still fails, the likely cause is a
+missing subuid/subgid range or `isolate.service` not running — both above.
 
 ## Installing
 
@@ -87,9 +119,10 @@ matches the directory. Do not nest deeper, and do not remove the manifest.
 
 ```bash
 claude plugin validate . --strict                 # manifests
-claude plugin details competitive-programming     # inventory: 2 skills, 1 MCP server
+claude plugin details competitive-programming     # inventory: 5 skills, 1 MCP server
 
 cd mcp-server && uv run --extra dev pytest -q     # server test suite
+python3 -m unittest discover -s tools/tests -t . -v    # tools test suite
 
 # end-to-end: the server should answer an MCP handshake
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
