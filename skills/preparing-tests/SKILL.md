@@ -108,7 +108,9 @@ generator or validator you can't yet run inside the sandbox is a generator
 you haven't actually tested — see the TDD section below.
 
 Two consequences worth internalizing before writing any timing-sensitive
-code:
+code, and if these ever disagree with what you observe, `tools/matrix_core.py`'s
+`compute_limits` and `classify` are the single source of truth, not this
+paragraph:
 
 - **Timing is CPU time**, as isolate reports it, never wall clock — far
   less sensitive to what else is running on the box. `TL = max(2 × t_main,
