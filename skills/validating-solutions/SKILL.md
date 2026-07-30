@@ -55,6 +55,7 @@ Substitute that literal path for `BASE` below:
 ```bash
 BASE="<the path from this skill's own 'Base directory for this skill' line>"
 PLUGIN_ROOT="$BASE/../.."
+PROBLEM="<absolute path to the problem directory you are validating>"
 TESTLIB="$(bash "$PLUGIN_ROOT/tools/bootstrap_testlib.sh")"
 cd "$PLUGIN_ROOT"
 ```
@@ -63,6 +64,14 @@ Every `python3 -m tools.*` command below is a module inside `tools/`, which
 is only importable with `PLUGIN_ROOT` as the working directory — `cd` there
 first, or every invocation fails with `ModuleNotFoundError: No module named
 'tools'` before it does anything.
+
+Two different directories matter from here on, and neither is implicit:
+`python3 -m tools.*` always runs from `$PLUGIN_ROOT` and takes `$PROBLEM` as
+an argument, so it is unaffected by where the problem lives. Everything
+problem-relative — reading `solutions/*.cpp`, writing `solutions.json` and
+`invocation.json` — happens **inside `$PROBLEM`**. Keep `$PROBLEM` set and
+pass it explicitly in every command below rather than relying on whatever
+directory the previous command left you in.
 
 ## Environment facts this skill's results depend on
 
@@ -138,7 +147,7 @@ from it, and renaming the file cannot orphan it. `solutions.json` is a scan
 product, regenerated every run:
 
 ```bash
-python3 -m tools.scan_solutions <problem-dir>
+python3 -m tools.scan_solutions "$PROBLEM"
 ```
 
 The exact format `tools/scan_solutions.py` parses (confirmed against its
@@ -169,7 +178,7 @@ source, not paraphrased from memory):
 ## Running the matrix
 
 ```bash
-python3 -m tools.run_matrix <problem-dir> "$TESTLIB"
+python3 -m tools.run_matrix "$PROBLEM" "$TESTLIB"
 ```
 
 This builds every solution, times the model as the median of 3 runs per
@@ -203,7 +212,7 @@ solution and group, for the entry whose `verdict` isn't `OK`:
 ```bash
 python3 -c "
 import json
-data = json.load(open('<problem-dir>/invocation.json'))
+data = json.load(open('$PROBLEM/invocation.json'))
 for r in data['results']:
     if r['solution'] == '<file>.cpp' and r['group'] == '<group>' and r['verdict'] != 'OK':
         print(f\"{r['solution']} {r['group']}/{r['test']} -> {r['verdict']}\")
