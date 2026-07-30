@@ -227,8 +227,36 @@ class TestRejectsCycles(unittest.TestCase):
         problem = load(write(ok))
         self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3"])
 
-    def test_accepts_a_linear_chain_of_2000_subtasks(self):
-        """Verify iterative traversal handles deep chains without RecursionError."""
+    def test_accepts_a_deep_reverse_chain_of_2000_subtasks(self):
+        """Regression test: deep chain (g1→g2→...→g2000) raises RecursionError on pre-fix recursive code.
+
+        This test builds a reverse-order dependency chain where each subtask depends on
+        the next, with g1 declared first. When visit(g1) is called, it recursively
+        walks g1→g2→...→g2000, which with the recursive implementation would exceed
+        Python's ~1000 recursion limit. The iterative implementation must handle this.
+        """
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = []
+        # Build reverse-order chain: g1 depends on g2, g2 depends on g3, ..., g1999 depends on g2000
+        for i in range(2000):
+            depends = [f"g{i + 2}"] if i < 1999 else []
+            ok["subtasks"].append({
+                "id": f"g{i + 1}",
+                "points": 100 if i == 1999 else 0,
+                "bounds": {},
+                "constraints_text": [],
+                "depends_on": depends
+            })
+        problem = load(write(ok))
+        self.assertEqual(len(problem.subtask_ids()), 2000)
+
+    def test_accepts_a_linear_chain_of_2000_subtasks_forward_order(self):
+        """Large-input smoke test: forward-order chain (g1, g2→g1, g3→g2, ...).
+
+        This variant does not trigger deep recursion because each subtask depends on
+        an already-visited node, so it passes both pre-fix and post-fix code.
+        Useful as a smoke test for large inputs but does NOT guard against recursion depth.
+        """
         ok = json.loads(json.dumps(VALID))
         ok["subtasks"] = []
         for i in range(2000):
@@ -244,21 +272,25 @@ class TestRejectsCycles(unittest.TestCase):
         self.assertEqual(len(problem.subtask_ids()), 2000)
 
     def test_rejects_a_cycle_at_depth_1500(self):
-        """A cycle far from the root must raise ProblemMetaError, not RecursionError."""
+        """Regression test: cycle detected at depth 1500 raises ProblemMetaError, not RecursionError.
+
+        Builds a deep reverse-order chain (g1→g2→...→g1500) with g1500 depending on itself.
+        With the recursive implementation, detecting the self-loop at depth 1500 would
+        require ~1500 nested calls before hitting the revisit check, exceeding Python's
+        recursion limit. The iterative implementation must handle this.
+        """
         ok = json.loads(json.dumps(VALID))
         ok["subtasks"] = []
-        # Create a chain g1 -> g2 -> ... -> g1500
+        # Build reverse-order chain: g1 depends on g2, g2 depends on g3, ..., g1499 depends on g1500
         for i in range(1500):
-            depends = [] if i == 0 else [f"g{i}"]
+            depends = [f"g{i + 2}"] if i < 1499 else [f"g{i + 1}"]  # g1500 depends on itself
             ok["subtasks"].append({
                 "id": f"g{i + 1}",
-                "points": 100 if i == 0 else 0,
+                "points": 100 if i == 1499 else 0,
                 "bounds": {},
                 "constraints_text": [],
                 "depends_on": depends
             })
-        # Make g1500 depend on itself to create a cycle at depth 1500
-        ok["subtasks"][-1]["depends_on"] = ["g1500"]
         with self.assertRaisesRegex(ProblemMetaError, "cycle"):
             load(write(ok))
 
