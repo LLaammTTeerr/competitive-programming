@@ -75,9 +75,14 @@ directory the previous command left you in.
 
 ## Environment facts this skill's results depend on
 
-`preparing-tests` covers installing and configuring `ioi/isolate`
-(<https://github.com/ioi/isolate>) — this skill only states what its output
-means, since every number in `invocation.json` comes from it:
+Every solution runs inside the `ioi/isolate` sandbox
+(<https://github.com/ioi/isolate>) — there is no fallback runner, and
+`run_matrix` refuses to start rather than silently falling back to something
+unsandboxed. (`preparing-tests` covers installing and configuring it; that
+setup is a one-time machine concern shared by both skills.) Given that, every
+number in `invocation.json` means the following, and if these ever disagree
+with what you observe, `tools/matrix_core.py`'s `compute_limits` and
+`classify` are the single source of truth, not this paragraph:
 
 - **Timing is CPU time**, not wall clock. `TL = max(2 x t_main, 1000 ms)`,
   rounded up to the nearest 500 ms; the sandbox kills at `2 x TL`. A result
@@ -91,19 +96,25 @@ means, since every number in `invocation.json` comes from it:
 - **Only stdin/stdout problems are supported.** File IO is rejected loudly by
   `run_matrix`, not silently mishandled.
 - **`isolate` defaults to one process.** A multi-threaded or multi-process
-  wrong solution is recorded as `RE`, not timed at all. Real judges usually
-  limit processes too, so this is defensible — but it is worth stating
-  plainly, because a setter who writes a threaded TLE solution and gets `RE`
-  back can burn an hour assuming the *harness* is broken before realizing
-  the sandbox's own single-process default is what fired.
+  wrong solution is not judged on timing at all — `run_matrix` still records
+  whatever CPU time isolate measured before the crash, but the crash itself
+  (not the clock) decides the verdict, which comes back `RE`. Real judges
+  usually limit processes too, so this is defensible — but it is worth
+  stating plainly, because a setter who writes a threaded TLE solution and
+  gets `RE` back can burn an hour assuming the *harness* is broken before
+  realizing the sandbox's own single-process default is what fired.
 
 ## The zoo
 
-Nine classes, each with a job — not just a name:
+`main` is not a zoo class — it's the reference: the one solution the zoo
+attacks *with*, never a solution the zoo attacks. It defines both the
+expected answers and the timing baseline, and every other tag in this table
+is `main` on trial one way or another, so it does not get a row of its own.
+
+The zoo itself is nine rows, each with a job — not just a name:
 
 | Class | Job |
 |---|---|
-| `main` | the model; defines both the expected answers and the timing baseline |
 | `accepted`, alternative algorithm | cross-check oracle — worth nothing unless genuinely independent, not a transcription of `main` |
 | `accepted`, exhaustive, tiny-N | **the arbiter.** Exists to break ties between disagreeing `accepted` solutions, not to pass the suite |
 | `wrong-answer`, plausible greedy | what a contestant actually submits at 2am |
@@ -111,12 +122,19 @@ Nine classes, each with a job — not just a name:
 | `wrong-answer`, overflow | `int` where `long long` is needed — kills any suite that never reaches the value bound |
 | `wrong-answer`, misread statement | e.g. start- vs end-index, off-by-one on an inclusive range |
 | `time-limit-exceeded` | correct, wrong complexity class |
+| `time-limit-exceeded-or-accepted` | the honest home for a solution expected to land in `[TL, 2xTL]` — a result too close to call on other hardware, tagged that way rather than as a flat `TL` |
 | `memory-limit-exceeded` | correct, allocates too much |
 
-`time-limit-exceeded-or-accepted` is a tenth tag `scan_solutions.py` accepts
-(alongside `presentation-error` and `failed`, Polygon's remaining two) for a
-solution that is only *expected* to land in the timing band — see
-Environment facts above.
+`scan_solutions.py` accepts eight `@tag` values in total (confirm with
+`python3 -c "from tools.scan_solutions import TAGS; print(TAGS)"`):
+`main`, `accepted`, `wrong-answer`, `time-limit-exceeded`,
+`time-limit-exceeded-or-accepted`, `memory-limit-exceeded`,
+`presentation-error`, `failed`. The nine zoo rows above map onto six of
+those tags (`accepted` and `wrong-answer` each cover several rows); `main`
+is the reference, not a row; `presentation-error` and `failed` are
+Polygon's remaining two and are rarely needed in this pipeline (a stock
+checker never emits PE, and `failed` is for a checker/package bug, not a
+deliberately-wrong solution).
 
 Two rules make the zoo worth writing:
 
@@ -181,13 +199,17 @@ source, not paraphrased from memory):
 python3 -m tools.run_matrix "$PROBLEM" "$TESTLIB"
 ```
 
-This builds every solution, times the model as the median of 3 runs per
-test, derives `TL`/`kill` from that, runs every other solution once (re-timed
-only if it lands in the band), checks each result, and writes
-`invocation.json`. **This skill never re-implements timing** — no shell
-`time`, no wall-clock stopwatch in a bash loop, no second opinion on what
-counts as too slow. The tool owns the clock; reading its output is this
-skill's whole job. Exit 0 means every expectation was met; **exit 1 means
+This builds every solution, times `main` as the median of 3 runs per test,
+derives `TL`/`kill` from that, then runs every solution in the manifest —
+`main` included — once each (re-timed only if a result lands in the band),
+checks each result, and writes `invocation.json`. `main`'s own pass-2 run
+appears in `results` alongside the rest, which is how you see its own `OK`
+recorded rather than only inferred.
+
+**This skill never re-implements timing** — no shell `time`, no wall-clock
+stopwatch in a bash loop, no second opinion on what counts as too slow. The
+tool owns the clock; reading its output is this skill's whole job. Exit 0
+means every expectation was met; **exit 1 means
 holes or mismatches exist**, printed to stdout as it exits — that is the
 signal to keep reading, not to retry the command.
 
