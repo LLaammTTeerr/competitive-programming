@@ -82,6 +82,18 @@ class TestLoad(unittest.TestCase):
         with self.assertRaisesRegex(ProblemMetaError, "magic"):
             load(write(bad))
 
+    def test_rejects_missing_required_top_level_field(self):
+        bad = json.loads(json.dumps(VALID))
+        del bad["name"]
+        with self.assertRaisesRegex(ProblemMetaError, "name"):
+            load(write(bad))
+
+    def test_rejects_subtask_missing_required_field(self):
+        bad = json.loads(json.dumps(VALID))
+        del bad["subtasks"][0]["points"]
+        with self.assertRaisesRegex(ProblemMetaError, "points"):
+            load(write(bad))
+
 
 if __name__ == "__main__":
     unittest.main()

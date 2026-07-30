@@ -100,29 +100,50 @@ def load(path: str | Path) -> Problem:
             f"expected one of {CHECKER_KINDS}"
         )
 
-    constraints = [
-        Constraint(id=c["id"], expr=c["expr"], min=c.get("min"), max=c.get("max"))
-        for c in raw.get("constraints", [])
-    ]
+    constraints = []
+    try:
+        for c in raw.get("constraints", []):
+            try:
+                constraints.append(
+                    Constraint(
+                        id=c["id"], expr=c["expr"], min=c.get("min"), max=c.get("max")
+                    )
+                )
+            except KeyError as exc:
+                raise ProblemMetaError(
+                    f"{path}: constraint missing required field {exc}"
+                ) from exc
+    except ProblemMetaError:
+        raise
+
     seen_c: set[str] = set()
     for c in constraints:
         if c.id in seen_c:
             raise ProblemMetaError(f"{path}: duplicate constraint id {c.id!r}")
         seen_c.add(c.id)
 
-    subtasks = [
-        Subtask(
-            id=s["id"],
-            points=s["points"],
-            bounds={
-                k: Bound(v.get("min"), v.get("max"))
-                for k, v in s.get("bounds", {}).items()
-            },
-            constraints_text=list(s.get("constraints_text", [])),
-            depends_on=list(s.get("depends_on", [])),
-        )
-        for s in raw.get("subtasks", [])
-    ]
+    subtasks = []
+    try:
+        for s in raw.get("subtasks", []):
+            try:
+                subtasks.append(
+                    Subtask(
+                        id=s["id"],
+                        points=s["points"],
+                        bounds={
+                            k: Bound(v.get("min"), v.get("max"))
+                            for k, v in s.get("bounds", {}).items()
+                        },
+                        constraints_text=list(s.get("constraints_text", [])),
+                        depends_on=list(s.get("depends_on", [])),
+                    )
+                )
+            except KeyError as exc:
+                raise ProblemMetaError(
+                    f"{path}: subtask missing required field {exc}"
+                ) from exc
+    except ProblemMetaError:
+        raise
 
     seen_s: set[str] = set()
     for s in subtasks:
@@ -146,17 +167,34 @@ def load(path: str | Path) -> Problem:
                     f"{path}: subtask {s.id!r} bounds unknown constraint {cid!r}"
                 )
 
+    try:
+        name = raw["name"]
+    except KeyError as exc:
+        raise ProblemMetaError(f"{path}: missing required field {exc}") from exc
+
+    try:
+        time_ms_published = limits["time_ms_published"]
+        memory_mb = limits["memory_mb"]
+    except KeyError as exc:
+        raise ProblemMetaError(f"{path}: missing required field in limits {exc}") from exc
+
+    try:
+        checker_kind = checker["kind"]
+        checker_name = checker["name"]
+    except KeyError as exc:
+        raise ProblemMetaError(f"{path}: missing required field in checker {exc}") from exc
+
     return Problem(
-        name=raw["name"],
+        name=name,
         title=raw.get("title", {}),
         tags=list(raw.get("tags", [])),
-        time_ms_published=limits["time_ms_published"],
+        time_ms_published=time_ms_published,
         time_ms_computed=limits.get("time_ms_computed"),
-        memory_mb=limits["memory_mb"],
+        memory_mb=memory_mb,
         input=io.get("input", "stdin"),
         output=io.get("output", "stdout"),
-        checker_kind=checker["kind"],
-        checker_name=checker["name"],
+        checker_kind=checker_kind,
+        checker_name=checker_name,
         constraints=constraints,
         subtasks=subtasks,
         examples=list(raw.get("examples", [])),
