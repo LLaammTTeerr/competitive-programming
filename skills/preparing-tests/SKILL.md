@@ -214,6 +214,10 @@ int main(int argc, char* argv[]) {
 - **Enforce format strictly**: `readSpace()`, `readEoln()`, `readEof()`
   between and after every token. A validator that accepts extra whitespace
   accepts a test the judge's real input parser might not.
+- **`ensure(cond)` takes exactly one argument.** `ensure(cond, "message")` is
+  a compile error (`macro 'ensure' passed 2 arguments, but takes just 1`) —
+  confirmed by compiling it. Use `ensuref(cond, fmt, ...)` if you want a
+  custom message; `ensure` always builds its own from the condition text.
 
 Once the validator exists, drift-check the statement against it:
 
@@ -325,9 +329,35 @@ per group:
 # bound whose "hit" side never appears
 ```
 
-Read the log rather than assuming; a bound that is declared but never
-reached in any test is exactly the shape of `flags.py`'s `test-weakness`
-kind — record it there if you find one:
+**This only sees bounds read as numbers.** A `readInt` / `readLong` /
+`readDouble` with a min and max registers `constant-bounds` plus a
+`min-value-hit` / `max-value-hit` line — that is what makes the log
+meaningful. A string read with `readToken(pattern, "A")` or `readLine`
+registers only a bare `variable "A"` line, with no min, no max, and no hit
+tracking at all, because the bound (a length, checked against the pattern
+or an explicit `A.size()` check) was never expressed to testlib as a
+number. Confirmed against a real validator: a length-bounded
+`readToken("[a-z]{1,20}", "A")`, run through `--testOverviewLogFileName`,
+produces exactly `variable "A"` and nothing else — exit 0, clean-looking
+log, checking nothing. This is `flight`'s own bound shape
+(`1 <= |A| <= 20`), and it is a common one: the reaching check silently
+does nothing for it, and a clean run reads as "nothing to report" when the
+truth is "this mechanism cannot see this bound".
+
+For any length (or otherwise non-numeric) bound, fall back to inspecting
+the tests directly — confirm the minimum and maximum are each attained in
+each group, e.g. (assuming `A` is the sole token on line 1 of each test,
+adjust the field/line selector to match your own format):
+
+```bash
+awk 'FNR==1{print length($1)}' tests/g1/*.in | sort -n | sed -n '1p;$p'
+# first number is the shortest A in the group, second the longest;
+# compare both against the declared bound by hand
+```
+
+Read the log (or the fallback check's output) rather than assuming; a
+bound that is declared but never reached in any test is exactly the shape
+of `flags.py`'s `test-weakness` kind — record it there if you find one:
 
 ```python
 from tools import flags
