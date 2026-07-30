@@ -65,6 +65,37 @@ class TestAppend(unittest.TestCase):
         with self.assertRaisesRegex(flags.FlagError, "changes_if_wrong"):
             self.append(changes_if_wrong="")
 
+    def test_read_rejects_non_dict_top_level(self):
+        (self.dir / "flags.json").write_text("[]", encoding="utf-8")
+        with self.assertRaisesRegex(flags.FlagError, "top-level must be dict"):
+            flags.read(self.dir)
+
+    def test_append_rejects_corrupted_record_missing_id(self):
+        payload = {
+            "schema": 1,
+            "flags": [{"phase": "x"}],
+            "generated_at": "2026-07-30T14:02:11+07:00",
+        }
+        (self.dir / "flags.json").write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(flags.FlagError, "id"):
+            self.append()
+
+    def test_append_creates_missing_problem_directory(self):
+        new_dir = self.dir / "nonexistent" / "path"
+        self.assertFalse(new_dir.exists())
+        record = flags.append(
+            new_dir,
+            phase="test",
+            severity="low",
+            kind="statement-ambiguity",
+            what="test",
+            assumed="test",
+            changes_if_wrong="test",
+            now=FIXED,
+        )
+        self.assertTrue(new_dir.exists())
+        self.assertEqual(record["id"], "amb-001")
+
 
 if __name__ == "__main__":
     unittest.main()

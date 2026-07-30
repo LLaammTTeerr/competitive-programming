@@ -41,7 +41,19 @@ def read(problem_dir: str | Path) -> list[dict]:
     path = _path(problem_dir)
     if not path.exists():
         return []
-    return json.loads(path.read_text(encoding="utf-8")).get("flags", [])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise FlagError(f"flags.json top-level must be dict, got {type(data).__name__}")
+    flags = data.get("flags", [])
+    if not isinstance(flags, list):
+        raise FlagError(f"flags.json 'flags' field must be list, got {type(flags).__name__}")
+    # Validate each record has required fields
+    for flag in flags:
+        if not isinstance(flag, dict):
+            raise FlagError(f"flag record must be dict, got {type(flag).__name__}")
+        if "id" not in flag:
+            raise FlagError("corrupted flags.json: flag record missing 'id' field")
+    return flags
 
 
 def append(
@@ -84,6 +96,7 @@ def append(
         "flags": existing + [record],
     }
     path = _path(problem_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
                    encoding="utf-8")
