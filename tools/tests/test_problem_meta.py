@@ -205,5 +205,28 @@ class TestRejectsNonIntegerBounds(unittest.TestCase):
             load(write(bad))
 
 
+class TestRejectsCycles(unittest.TestCase):
+    def test_rejects_a_self_dependency(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["depends_on"] = ["g1"]
+        with self.assertRaisesRegex(ProblemMetaError, "g1"):
+            load(write(bad))
+
+    def test_rejects_a_two_node_cycle(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["depends_on"] = ["g2"]
+        bad["subtasks"][1]["depends_on"] = ["g1"]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(bad))
+
+    def test_accepts_a_diamond_which_is_not_a_cycle(self):
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"].append({"id": "g3", "points": 0, "bounds": {},
+                               "constraints_text": [], "depends_on": ["g1", "g2"]})
+        ok["subtasks"][1]["depends_on"] = ["g1"]
+        problem = load(write(ok))
+        self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3"])
+
+
 if __name__ == "__main__":
     unittest.main()

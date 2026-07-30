@@ -258,6 +258,26 @@ def load(path: str | Path) -> Problem:
                     f"{path}: subtask {s.id!r} bounds unknown constraint {cid!r}"
                 )
 
+    order: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def visit(sid: str, trail: list[str]) -> None:
+        if sid in order:
+            return
+        if sid in visiting:
+            loop = trail[trail.index(sid):] + [sid]
+            raise ProblemMetaError(
+                f"{path}: subtask dependency cycle: {' -> '.join(loop)}"
+            )
+        visiting.add(sid)
+        for dep in next(s for s in subtasks if s.id == sid).depends_on:
+            visit(dep, trail + [sid])
+        visiting.discard(sid)
+        order[sid] = len(order)
+
+    for s in subtasks:
+        visit(s.id, [])
+
     try:
         name = raw["name"]
     except KeyError as exc:
