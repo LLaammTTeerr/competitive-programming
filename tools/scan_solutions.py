@@ -95,7 +95,11 @@ def scan(problem_dir: str | Path, problem: Problem) -> dict:
 
     for path in sorted((problem_dir / "solutions").glob("*.cpp")):
         try:
-            parsed = parse_block(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ScanError(f"{path.name}: {exc}") from exc
+        try:
+            parsed = parse_block(text)
         except ScanError as exc:
             raise ScanError(f"{path.name}: {exc}") from exc
 

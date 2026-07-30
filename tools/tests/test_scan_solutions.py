@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -101,6 +102,37 @@ class TestScan(unittest.TestCase):
         (self.dir / "solutions" / "sol-main.cpp").unlink()
         with self.assertRaisesRegex(ScanError, "exactly one"):
             scan(self.dir, PROBLEM)
+
+    def test_rejects_invalid_utf8_with_scantError(self):
+        """File with invalid UTF-8 raises ScanError, not UnicodeDecodeError."""
+        bad_file = self.dir / "solutions" / "sol-bad.cpp"
+        bad_file.write_bytes(b"/**\n * @tag main\n * @expect g1=OK g2=OK\n * @algorithm x\n * @complexity O(1)\n */\nint main() { return \xff; }\n")
+        with self.assertRaisesRegex(ScanError, "sol-bad.cpp"):
+            scan(self.dir, PROBLEM)
+
+    def test_untracked_file_uses_mtime_timestamp(self):
+        """Untracked file in git repo derives timestamp from mtime, not empty string."""
+        # Initialize a git repo in the temp directory
+        git_dir = Path(tempfile.mkdtemp())
+        solutions_dir = git_dir / "solutions"
+        solutions_dir.mkdir()
+
+        # Write solution files
+        (solutions_dir / "sol-main.cpp").write_text(MAIN, encoding="utf-8")
+        (solutions_dir / "sol-greedy.cpp").write_text(GREEDY, encoding="utf-8")
+
+        # Initialize git repo
+        subprocess.run(["git", "init"], cwd=git_dir, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_dir, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_dir, capture_output=True, check=True)
+
+        # DO NOT add or commit the files - they should be untracked
+
+        # Scan should succeed and produce mtime-derived timestamps
+        payload = scan(git_dir, PROBLEM)
+        for entry in payload["solutions"]:
+            # Should have a valid timestamp (not empty, not error)
+            self.assertRegex(entry["updated"], r"^\d{4}-\d{2}-\d{2}T")
 
 
 if __name__ == "__main__":
