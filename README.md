@@ -153,6 +153,19 @@ After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new sess
 > `mcp.server.fastmcp`, which 2.0 removed — an unpinned `>=1.2.0` resolves to 2.0 and
 > fails at import. Keep the upper bound until the server is ported.
 
+> **Note on `flags.json.lock`.** `tools/flags.py` takes an advisory `flock` on a
+> separate lock file beside every problem package's `flags.json`, so concurrent
+> writers (several `dispatching-parallel-agents` subagents appending flags at once)
+> don't race each other's read-modify-write. That lock file — `flags.json.lock` —
+> is never unlinked: `flags.json` itself is replaced with `os.replace` on every
+> write, so a lock held on it would be a lock on an unlinked inode the moment the
+> first writer finished, and `flock` is released by `os.close` (or process death)
+> regardless of whether the file is ever removed. It is left on disk deliberately
+> rather than cleaned up, which means it is a **permanent** byproduct of running
+> this pipeline. Problem repositories (e.g. the one `creating-problems` and its
+> siblings write packages into) should gitignore `flags.json.lock`; this repo
+> itself never creates one, since no problem package lives here.
+
 ## Author
 
 LamTer <lamtercqh@gmail.com>

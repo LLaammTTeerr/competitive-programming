@@ -33,15 +33,9 @@ this order".
 | If it's really about | Use |
 |---|---|
 | The prose: story, `\InputFile`, `\Constraints` itemize, `\Examples` | `competitive-programming:writing-statements` |
-| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
+| Auditing a finished package end to end — statement ambiguity, assumed definitions, unproven solution steps, no new phase to run | `competitive-programming:reviewing-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
 | Solving this problem yourself — no shaping decision in play | `competitive-programming:solving-problems` |
-
-The plugin ships six skills: `solving-problems`, `running-contests`,
-`preparing-tests`, `validating-solutions`, `writing-statements`,
-`shaping-problems`. `creating-problems` above is **not among them** — it
-cannot be invoked. If the request really belongs to it, say that it is not
-built yet and stop, rather than offering a handoff that will fail; do not
-silently sequence the other skills yourself either.
 
 Ask only when genuinely ambiguous. **"Help me pick N" is not ambiguous.
 "Help me design a problem" is** — that could mean the numbers here, the

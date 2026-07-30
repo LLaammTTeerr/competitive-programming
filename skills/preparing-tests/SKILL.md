@@ -30,16 +30,10 @@ this order".
 | If it's really about | Use |
 |---|---|
 | Is my suite strong enough? Will a wrong solution survive it? A zoo of deliberately-wrong solutions, the invocation matrix, `@expect` tags | `competitive-programming:validating-solutions` |
-| What N, what subtask ladder, is this problem original, what difficulty | `competitive-programming:shaping-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
+| What N, what subtask ladder, is this problem original, what difficulty | `competitive-programming:shaping-problems` |
 | The prose: story, `\InputFile`, `\Constraints` itemize, `\Examples` | `competitive-programming:writing-statements` |
-| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
-
-The plugin ships five skills: `solving-problems`, `running-contests`,
-`preparing-tests`, `validating-solutions`, `writing-statements`. The two
-marked Stage 2 above are **not among them** — they cannot be invoked. If
-the request really belongs to one, say that it is not built yet and stop,
-rather than offering a handoff that will fail; do not silently do that
-skill's job here either.
+| Auditing a finished package end to end — statement ambiguity, assumed definitions, unproven solution steps, no new phase to run | `competitive-programming:reviewing-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
 
 Ask only when genuinely ambiguous. **"Write me a validator" is not
 ambiguous. "Make my tests better" is** — that could mean the generators here

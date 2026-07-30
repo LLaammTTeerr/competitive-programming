@@ -1253,7 +1253,7 @@ def main(argv: list[str]) -> int:
         2 — the matrix could not be run at all (usage error, or any
             `MatrixError`: a compile failure, a missing tests directory,
             the file-IO guard, an unusable sandbox or staging location).
-            One line on stderr, nothing on stdout.
+            A message on stderr, nothing on stdout.
 
     Before this, an uncaught `MatrixError` surfaced as a traceback and
     exited 1 as well, so an agent told "exit 1 means holes or mismatches"
