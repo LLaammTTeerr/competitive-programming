@@ -293,14 +293,26 @@ Text with 100\% accuracy.
 
     def test_commented_out_input_key_is_ignored(self):
         """In the spirit of Finding 2 (commented-out \\subtask): a
-        commented-out `input =` line, superseded by a real one, must not
-        leak a stale value into the parsed key."""
+        commented-out override line, superseded by a real one, must not
+        leak a stale `input`/`output` value into the parsed keys.
+
+        The `%` must precede a throwaway token with no `=` ("superseded")
+        so that, once `_strip_comments` removes the whole line, nothing is
+        left behind — but if stripping were a no-op, the comma right after
+        "superseded" would hand the brace-aware comma-splitter a *clean*
+        standalone `input = flight.inp` token (no `%` glued to it, unlike
+        `% input = ...` where the `%` sticks to the key name and never
+        collides with `"input"` at all). That clean token would then
+        overwrite the real pair, since dict assignment is last-pair-wins.
+        Only real comment-stripping prevents that collision — so this test
+        is red exactly when `_strip_comments` is broken, not incidentally.
+        """
         tex = r"""
 \documentclass{article}
 \begin{document}
 \begin{problem}[
-  % input = flight.inp, output = flight.out,
   input  = stdin, output = stdout,
+  % superseded, input = flight.inp, output = flight.out,
   time   = 1, memory = 256,
 ]{Title}
 Text.
@@ -317,15 +329,32 @@ Text.
         self.assertEqual(check(PROBLEM, tex), [])
 
     def test_input_word_inside_another_keys_value_is_ignored(self):
-        """In the spirit of Finding 3 (origin's bracketed value): the word
-        "input" appearing inside another key's braced value must not be
-        mistaken for the `input` key itself."""
+        """In the spirit of Finding 3 (origin's bracketed value): a comma
+        *inside* another key's braced value — the character brace-depth
+        tracking exists to protect — must not be treated as a top-level
+        separator, even when the text on either side of it reads exactly
+        like a real `input =` / `output =` pair.
+
+        Without brace-depth tracking, the comma-splitter would cut
+        `note = {bản nháp: input = flight.inp, output = flight.out, đã sửa}`
+        into pieces at every comma, including the ones inside the braces.
+        The piece right after each such internal comma —
+        ` input = flight.inp` and ` output = flight.out` — has no `%` or
+        `note =` prefix glued to it (that contamination lands on the
+        *previous* piece instead, split at the same broken comma), so it
+        parses as a clean, standalone `input`/`output` pair and overwrites
+        the real one below it. Only correct brace-depth tracking keeps the
+        whole `{...}` a single value and prevents that collision — so this
+        test is red exactly when brace-awareness is broken, not
+        incidentally (there is no top-level `]` inside the braces for the
+        *other* loop to trip on, unlike `test_origin_key_with_bracketed_value`).
+        """
         tex = r"""
 \documentclass{article}
 \begin{document}
 \begin{problem}[
-  note = {Đề bài dùng input = flight.inp trong bản nháp cũ},
   input  = stdin, output = stdout,
+  note = {bản nháp: input = flight.inp, output = flight.out, đã sửa},
   time   = 1, memory = 256,
 ]{Title}
 Text.
