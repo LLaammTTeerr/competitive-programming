@@ -718,6 +718,225 @@ class TestRunMatrixFixture(unittest.TestCase):
                                            t_main_ms=1, tl_ms=1000, kill_ms=2000))
         self.assertEqual(outcome.verdict, "RE")
 
+    # ------------------------------------------------------------------
+    # File-based IO (`io.input`/`io.output` naming real files rather than
+    # the `stdin`/`stdout` sentinels). Every test below drives `_run_once`
+    # directly: `run()` still refuses file IO one level up, and wiring that
+    # is a later task — this one is only about the sandboxed execution.
+    # ------------------------------------------------------------------
+
+    def test_file_io_solution_reads_its_inp_and_writes_its_out(self):
+        # A solution that never touches stdin or stdout at all: it opens
+        # "t.inp" and "t.out" by *relative* name, so this passes only if the
+        # sandbox's cwd is the one `:rw` mount (the staging directory). It
+        # fails two distinct ways against the pre-fix driver: `--chdir` used
+        # to point at the binary's read-only mount, where fopen("t.inp") is
+        # NULL (exit 3, `crashed`) and where "t.out" could not be created at
+        # all even if the input had been found.
+        binary = _compile(
+            '#include <cstdio>\n'
+            'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+            '  int a, b; if (fscanf(fi, "%d %d", &a, &b) != 2) return 4;\n'
+            '  fclose(fi);\n'
+            '  FILE *fo = fopen("t.out", "w"); if (!fo) return 5;\n'
+            '  fprintf(fo, "%d\\n", a + b); fclose(fo); return 0; }\n',
+            self.tmp / "fileio", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        dest = self.tmp / "01.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.crashed, r)   # exit 3/4/5 above would show up here
+        self.assertEqual(r.exit_code, 0, r)
+        self.assertFalse(r.no_output, r)
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
+
+    def test_file_io_missing_output_file_is_reported_not_crashed(self):
+        # Exits 0 and writes nothing — an outcome a stdin/stdout problem
+        # cannot have (isolate always creates the stdout file), so it needs
+        # its own signal rather than being folded into `crashed`.
+        binary = _compile("int main(){ return 0; }\n", self.tmp / "silent", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        dest = self.tmp / "01.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertTrue(r.no_output, r)
+        self.assertFalse(r.crashed, r)   # a clean exit is not a crash
+        self.assertFalse(r.killed, r)
+        self.assertFalse(r.oom, r)
+        self.assertEqual(r.exit_code, 0, r)
+
+    def test_stdin_mode_never_reports_no_output(self):
+        # Pins the `no_output` docstring claim that it is only reachable in
+        # file-IO mode: the *same* silent binary, run through the default
+        # path, has a stdout file (empty) and must report no_output=False.
+        # Without this, "only reachable in file-IO mode" is an untested
+        # claim about a field a later task classifies as a verdict.
+        binary = _compile("int main(){ return 0; }\n", self.tmp / "silent_std", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        dest = self.tmp / "01.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.no_output, r)
+        self.assertTrue(dest.exists())
+        self.assertEqual(dest.read_bytes(), b"")
+
+    def test_file_io_output_does_not_leak_between_runs(self):
+        # The same contamination shape as the three memory bugs, one level
+        # down: `_time_median` calls `_run_once` three times and every
+        # solution reuses the same handle — hence the same staging
+        # directory. Run 1 writes "first"; run 2 writes nothing at all. If
+        # the pre-run unlink of the output file is removed, run 2 reads run
+        # 1's file and is reported as a solution that produced "first".
+        writer = _compile(
+            '#include <cstdio>\n'
+            'int main(){ FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "first\\n"); fclose(f); return 0; }\n',
+            self.tmp / "writer", self.tmp)
+        silent = _compile("int main(){ return 0; }\n", self.tmp / "silent2", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        d1, d2 = self.tmp / "a.produced", self.tmp / "b.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r1 = run_matrix._run_once(isolate, writer, test_in, d1,
+                                      cpu_limit_s=2.0, wall_limit_s=6.0,
+                                      mem_limit_kb=256 * 1024,
+                                      io_input="t.inp", io_output="t.out")
+            r2 = run_matrix._run_once(isolate, silent, test_in, d2,
+                                      cpu_limit_s=2.0, wall_limit_s=6.0,
+                                      mem_limit_kb=256 * 1024,
+                                      io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r1.no_output, r1)
+        self.assertEqual(d1.read_text(encoding="utf-8").strip(), "first")
+        self.assertTrue(r2.no_output, r2)
+        # The destination is rewritten every run too, so a stale `.out` in
+        # the repository cannot be read as this run's answer either.
+        self.assertEqual(d2.read_bytes(), b"")
+
+    def test_file_io_output_is_not_charged_against_the_memory_limit(self):
+        # Risk 1 — the tmpfs bug, a fourth time. The first three times the
+        # contaminated write was the driver's own staging of *stdout*; the
+        # solution's own output file is a new writable file inside the box
+        # and is the same shape again. 48 MB written under a 32 MB
+        # `--cg-mem` is an OK on a disk-backed staging directory and an OOM
+        # on a memory-backed one, so this fails immediately if the output
+        # file ever moves onto tmpfs or into a second, memory-backed mount.
+        # The buffer is `static` and the program's own footprint is ~1-2 MB.
+        mb_out = 48
+        binary = _compile(
+            "#include <cstdio>\n"
+            'int main(){ static char buf[1<<16];\n'
+            "  for (int i = 0; i < (1<<16); i++) buf[i] = 'x';\n"
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            f"  for (int k = 0; k < {mb_out} * 16; k++) fwrite(buf, 1, 1<<16, f);\n"
+            "  fclose(f); return 0; }\n",
+            self.tmp / "bigout", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "big.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=10.0, wall_limit_s=30.0,
+                                     mem_limit_kb=32 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.oom, r)
+        self.assertFalse(r.crashed, r)
+        self.assertFalse(r.killed, r)
+        self.assertFalse(r.no_output, r)
+        self.assertLess(r.peak_kb, 10_000, r)
+        self.assertEqual(dest.stat().st_size, mb_out * 1024 * 1024)
+
+    def test_file_io_name_colliding_with_the_staged_stdout_is_refused(self):
+        # `--stdout` still points at the staging directory's fixed `run.out`
+        # in file-IO mode (see `_run_once`). A problem whose own io.output
+        # is literally that name would have isolate and the solution writing
+        # the same file — garbage, silently. Task 1 accepts any bare
+        # filename, so this collision is reachable and must be refused
+        # rather than run.
+        binary = _compile("int main(){ return 0; }\n", self.tmp / "collide", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in,
+                                     self.tmp / "c.produced",
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp",
+                                     io_output=run_matrix.STAGED_STDOUT_NAME)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertIn(run_matrix.STAGED_STDOUT_NAME, str(ctx.exception))
+
+    def test_stdin_mode_is_unchanged(self):
+        # The default path must behave exactly as before: this test passes
+        # both before and after the file-IO change, and is here so that a
+        # regression in the sentinel path shows up as a failure about the
+        # sentinel path rather than as a puzzling fixture failure.
+        binary = _compile(
+            '#include <cstdio>\n'
+            'int main(){ int a, b; scanf("%d %d", &a, &b);\n'
+            '  printf("%d\\n", a + b); return 0; }\n',
+            self.tmp / "stdio_sum", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("7 8\n", encoding="utf-8")
+        dest = self.tmp / "s.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.crashed, r)
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "15")
+
     def test_stage_dir_is_not_on_a_memory_backed_filesystem(self):
         isolate = run_matrix.open_isolate_box(self.problem_dir)
         try:

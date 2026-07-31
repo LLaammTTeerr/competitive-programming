@@ -633,6 +633,14 @@ class RunResult:
     defaulting to 0 read as "exited 0" (looks like success); and `killed`
     alone can't tell a CPU-time kill from a wall-time kill, which matters
     for pass 1's diagnostic naming the *right* limit it tripped.
+
+    `no_output` means the process exited without being killed and never
+    created the problem's output file. Only reachable in file-IO mode — a
+    stdin/stdout run always has a stdout file, because isolate creates it
+    whether or not the solution writes a byte to it. It is not a crash: the
+    exit status was clean, so `crashed` is False and `exit_code` is whatever
+    the solution returned; it is a separate fact about the *artifact*, and
+    classifying it is the caller's job, not this dataclass's.
     """
 
     cpu_ms: int
@@ -644,6 +652,7 @@ class RunResult:
     peak_kb: int
     status: str
     message: str
+    no_output: bool = False
 
 
 def _parse_meta(text: str) -> dict[str, str]:
@@ -669,10 +678,18 @@ def _parse_meta(text: str) -> dict[str, str]:
 # such limit; flagged in the task report rather than left undisclosed.
 ISOLATE_PROCESSES = 1
 
+# The fixed name every `--run` writes its *stdout* to inside the staging
+# directory, in both IO modes. Named rather than inlined because file-IO
+# mode has to refuse a problem whose own `io.output` is this string: Task 1
+# accepts any bare filename, so the collision is reachable, and it would put
+# isolate and the solution on the same file with no error anywhere.
+STAGED_STDOUT_NAME = "run.out"
+
 
 def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
               stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
-              mem_limit_kb: int) -> RunResult:
+              mem_limit_kb: int, *, io_input: str = "stdin",
+              io_output: str = "stdout") -> RunResult:
     """Run one process inside `isolate`'s sandbox and return its verdict.
 
     `binary`'s and `stdin_path`'s directories are mounted **read-only**
@@ -716,6 +733,46 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     `run()`); both unlinks rely only on `stage_dir`'s own permissions,
     which this process set to 0o777 when it created it.
 
+    **File-based IO** (`io_input`/`io_output` naming real files instead of
+    the `"stdin"`/`"stdout"` sentinels; Task 1 guarantees each is either a
+    sentinel or a bare filename, so neither is re-validated here). Three
+    things change and nothing else does — every existing call site passes
+    neither keyword and gets exactly the previous behaviour:
+
+      * The test input is *copied* into `isolate.stage_dir` under
+        `io_input`, because the solution opens it by relative name and the
+        directory it opens it in must be writable for `io_output`. There is
+        still exactly one `:rw` mount and it is still the same disk-backed
+        staging directory: a second, memory-backed writable mount for the
+        solution's output would recreate — a fourth time — the accounting
+        bug of charging a solution's output to its own `--cg-mem` (see the
+        module docstring's staging paragraph).
+      * `--chdir` points at that staging mount rather than at the binary's,
+        which is mounted read-only. A file-IO solution chdir'd into a
+        read-only mount cannot create its output file at all.
+      * The output is read back from `io_output` instead of from the staged
+        stdout. `--stdout` still points at `STAGED_STDOUT_NAME` in both
+        modes, so a file-IO solution's stray debug printing goes there, is
+        discarded, and is still capped by `--fsize`; `--stdin` is pointed at
+        the staged *copy* of the input, so a solution that reads stdin as
+        well as its file still sees the test data. If `io_output` is
+        literally `STAGED_STDOUT_NAME`, isolate and the solution would be
+        writing the same file, so that is refused with `MatrixError`.
+
+    Both staged file-IO files are unlinked *before* the run and deliberately
+    **not** after it: it is the pre-run unlink that has to be load-bearing,
+    since the contamination it prevents is a run reading an *earlier* run's
+    output (`_time_median` calls this three times, and every solution in a
+    whole `run()` shares one handle, hence one staging directory). Cleaning
+    up afterwards as well would leave that unlink untested — the stale file
+    would be gone either way — and buy nothing: the names are fixed, so at
+    most two files exist at a time rather than one per call.
+
+    A file-IO run whose output file is absent afterwards returns
+    `no_output=True` (and an empty `stdout_dest`, rewritten like any other
+    run so a stale answer already in the repository cannot be read as this
+    run's). It is reported, not classified, here.
+
     Task 9c: every call gets its **own, freshly-`--init`ed box** — one is
     claimed from `isolate.box_id_counter`, `--init`ed before the sandboxed
     execution, and `--cleanup`ed in a `finally` regardless of how this
@@ -751,8 +808,32 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         stage_label = _label(isolate.stage_dir)
         stage_dir_resolved = isolate.stage_dir.resolve()
 
-        staged_out = isolate.stage_dir / "run.out"
+        file_io = io_input != "stdin" or io_output != "stdout"
+        if file_io and (io_input == STAGED_STDOUT_NAME
+                        or io_output == STAGED_STDOUT_NAME):
+            raise MatrixError(
+                f"io.input/io.output may not be named {STAGED_STDOUT_NAME!r}: "
+                "that is the fixed name this driver stages the sandboxed "
+                "process's stdout under, so isolate and the solution would "
+                "write the same file (io.input="
+                f"{io_input!r}, io.output={io_output!r}) — rename the "
+                "problem's IO files."
+            )
+
+        staged_out = isolate.stage_dir / STAGED_STDOUT_NAME
         staged_out.unlink(missing_ok=True)
+
+        # In file-IO mode the solution reads and writes real files in its
+        # cwd, which must be the ONE `:rw` mount. Both are unlinked first:
+        # a stale file from an earlier run would otherwise be read as this
+        # run's output — see the docstring above.
+        staged_in = staged_result = None
+        if file_io:
+            staged_in = isolate.stage_dir / io_input
+            staged_result = isolate.stage_dir / io_output
+            staged_in.unlink(missing_ok=True)
+            staged_result.unlink(missing_ok=True)
+            shutil.copyfile(stdin_path, staged_in)
 
         cmd = [
             isolate.binary, "--cg", f"--box-id={box_id}", "--run",
@@ -764,8 +845,9 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             opt = ":rw" if resolved == stage_dir_resolved else ""
             cmd.append(f"--dir={label}={resolved}{opt}")
         cmd += [
-            f"--chdir={bin_label}",
-            f"--stdin={stdin_label}/{stdin_path.name}",
+            f"--chdir={stage_label if file_io else bin_label}",
+            (f"--stdin={stage_label}/{staged_in.name}" if file_io
+             else f"--stdin={stdin_label}/{stdin_path.name}"),
             f"--stdout={stage_label}/{staged_out.name}",
             "--", f"{bin_label}/{binary.name}",
         ]
@@ -817,17 +899,23 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         # Copy the sandboxed output back into the repository as *this*
         # process — never write it through a bind mount again (see
         # docstring above).
+        source = staged_result if file_io else staged_out
         try:
-            data = staged_out.read_bytes()
+            data = source.read_bytes()
+            no_output = False
         except FileNotFoundError:
+            # In file-IO mode this is the reportable outcome `no_output`; in
+            # stdin mode isolate always created the file, so an absent one
+            # is not a fact about the solution and stays unreported.
             data = b""
+            no_output = file_io
         stdout_dest.unlink(missing_ok=True)
         stdout_dest.write_bytes(data)
         staged_out.unlink(missing_ok=True)
 
         return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
                           crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
-                          status=status, message=message)
+                          status=status, message=message, no_output=no_output)
     finally:
         _cleanup_box(isolate.binary, box_id)
 
