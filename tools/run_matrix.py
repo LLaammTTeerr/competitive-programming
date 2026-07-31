@@ -688,6 +688,55 @@ ISOLATE_PROCESSES = 1
 STAGED_STDOUT_NAME = "run.out"
 
 
+def _clear_stage_dir(stage_dir: Path) -> None:
+    """Empty the private staging directory before a sandboxed run.
+
+    Called once at the top of every `_run_once`, in both IO modes. It
+    replaces what used to be three targeted unlinks (`run.out`, `io_input`,
+    `io_output`), and the difference is not tidiness — it is a verdict.
+
+    A solution may create files this driver has no name for. The mistake
+    file IO exists to diagnose *is* exactly that: a solution that writes
+    `output.txt` instead of the `io.output` `problem.json` declares. That
+    file lands in the staging directory owned by the mapped subuid of the
+    box it ran in, at the default `0644`. Every `_run_once` claims a
+    **fresh box id** (Task 9c), and a fresh box means a *different* subuid,
+    so the next run cannot open that leftover file for writing at all:
+    `fopen(..., "w")` fails EACCES, the solution exits nonzero, and the
+    driver reports RE. Measured on the Task 6 dogfood package before this
+    function existed: the wrong-filename solution was `NO_OUTPUT` on the
+    first test it ran and `RE` on the eleven after it. The same leak also
+    crosses *solutions* — the staging directory lives for the whole
+    `run()` — so one solution's litter could decide another's verdict.
+
+    This process can always unlink those files despite not owning them,
+    because unlinking is governed by the *directory's* permissions and this
+    driver owns the staging directory it created (verified directly; see
+    the task report). A foreign-owned *subdirectory* with contents is the
+    one case that can fail, and it raises `MatrixError` rather than being
+    swallowed: a staging directory this driver cannot guarantee is empty is
+    a staging directory whose next verdict cannot be trusted, and refusing
+    to run beats reporting confidently wrong results — the same call made
+    for a missing sandbox and a memory-backed staging location.
+    """
+    for entry in stage_dir.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise MatrixError(
+                f"could not clear {entry} out of the sandbox staging "
+                f"directory {stage_dir}: {exc} — a previous run left a file "
+                "or directory this process cannot remove, and running on top "
+                "of it would let that run's leftovers decide this run's "
+                "verdict."
+            ) from exc
+
+
 def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
               stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
               mem_limit_kb: int, *, io_input: str = "stdin",
@@ -729,11 +778,13 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     buggy behaviour (foreign-owned, possibly not writable by us at all): it
     is simply replaced, not fought with.
 
-    The staged file itself is unlinked before the sandboxed run (in case a
-    previous call left stale content there) and after the copy-back (so
-    `isolate.stage_dir` doesn't accumulate one file per call across a whole
-    `run()`); both unlinks rely only on `stage_dir`'s own permissions,
-    which this process set to 0o777 when it created it.
+    The whole staging directory is emptied before the sandboxed run
+    (`_clear_stage_dir`, in both IO modes) so no call can ever see another
+    call's files, and the staged stdout is unlinked again after the
+    copy-back so `isolate.stage_dir` does not hold a large output for
+    longer than it must. Both rely only on `stage_dir`'s own permissions,
+    which this process set to 0o777 when it created it — never on the
+    permissions of the files themselves, which the sandboxed subuid owns.
 
     **File-based IO** (`io_input`/`io_output` naming real files instead of
     the `"stdin"`/`"stdout"` sentinels; Task 1 guarantees each is either a
@@ -776,14 +827,31 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     us (`umask(077)`); that is surfaced as `MatrixError` naming the file
     and the solution, never as `no_output` — it is a different fact.
 
-    Both staged file-IO files are unlinked *before* the run and deliberately
-    **not** after it: it is the pre-run unlink that has to be load-bearing,
-    since the contamination it prevents is a run reading an *earlier* run's
-    output (`_time_median` calls this three times, and every solution in a
+    The staging directory is emptied *before* every run
+    (`_clear_stage_dir`) and deliberately **not** after it: it is the
+    pre-run clear that has to be load-bearing, since the contamination it
+    prevents is a run reading — or colliding with — an *earlier* run's
+    files (`_time_median` calls this three times, and every solution in a
     whole `run()` shares one handle, hence one staging directory). Cleaning
-    up afterwards as well would leave that unlink untested — the stale file
-    would be gone either way — and buy nothing: the names are fixed, so at
-    most two files exist at a time rather than one per call.
+    up afterwards as well would leave that clear untested, because the
+    stale file would be gone either way.
+
+    It is a full clear rather than an unlink of the three names this driver
+    itself knows (`run.out`, `io_input`, `io_output`) because the Task 6
+    dogfood proved three names are not enough. A solution that writes *any
+    other* filename — the wrong-output-filename mistake this whole feature
+    exists to diagnose writes `output.txt` — leaves that file behind owned
+    by the mapped subuid of the box it ran in, and every box gets a *fresh*
+    box id, hence a different subuid (Task 9c). The next run therefore
+    cannot `fopen(..., "w")` that file at all: it fails EACCES, the
+    solution exits nonzero, and the driver reports **RE**. Measured on the
+    dogfood package: the wrong-filename solution came back `NO_OUTPUT` on
+    the first test it ran and `RE` on the eleven after it — a verdict that
+    depended on execution order, and worse, one solution's leftover file
+    silently changing a *different* solution's verdict. That is the same
+    cross-run contamination class as the box-reuse bug (9c) and the three
+    memory bugs above, relocated once more into the staging directory's
+    contents.
 
     A file-IO run whose output file is absent afterwards returns
     `no_output=True` (and an empty `stdout_dest`, rewritten like any other
@@ -852,19 +920,18 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                 "problem's IO files."
             )
 
+        # Everything the previous run left behind goes first — not just the
+        # names this driver knows. See `_clear_stage_dir` and the docstring
+        # above for the measured verdict corruption that motivates it.
+        _clear_stage_dir(isolate.stage_dir)
         staged_out = isolate.stage_dir / STAGED_STDOUT_NAME
-        staged_out.unlink(missing_ok=True)
 
         # In file-IO mode the solution reads and writes real files in its
-        # cwd, which must be the ONE `:rw` mount. Both are unlinked first:
-        # a stale file from an earlier run would otherwise be read as this
-        # run's output — see the docstring above.
+        # cwd, which must be the ONE `:rw` mount.
         staged_in = staged_result = None
         if file_io:
             staged_in = isolate.stage_dir / io_input
             staged_result = isolate.stage_dir / io_output
-            staged_in.unlink(missing_ok=True)
-            staged_result.unlink(missing_ok=True)
             shutil.copyfile(stdin_path, staged_in)
             # `run()` already granted the original test file the "other"
             # read bit the mapped subuid needs (`_ensure_sandbox_readable`);

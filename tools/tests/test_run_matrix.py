@@ -900,6 +900,51 @@ class TestRunMatrixFixture(unittest.TestCase):
         # the repository cannot be read as this run's answer either.
         self.assertEqual(d2.read_bytes(), b"")
 
+    def test_a_stray_file_from_one_run_does_not_break_the_next(self):
+        # Found by the Task 6 dogfood, not by reasoning. The three targeted
+        # unlinks this driver used to do (`run.out`, io_input, io_output)
+        # covered only the names it knows. A solution that writes any OTHER
+        # filename — `output.txt` here, which is precisely the
+        # wrong-output-filename mistake the NO_OUTPUT verdict exists to
+        # diagnose — leaves that file behind owned by the mapped subuid of
+        # its own box, and every `_run_once` claims a fresh box id, hence a
+        # different subuid. The next run's `fopen(..., "w")` on it then
+        # fails EACCES, the solution exits 4, and the driver reports RE.
+        #
+        # So the *same binary on the same input* used to return no_output on
+        # its first run and crashed/RE on its second: a verdict that
+        # depended on execution order. Both runs below must be identical.
+        stray = _compile(
+            '#include <cstdio>\n'
+            'int main(){ FILE *f = fopen("output.txt", "w"); if (!f) return 4;\n'
+            '  fprintf(f, "answer\\n"); fclose(f); return 0; }\n',
+            self.tmp / "stray", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            first = run_matrix._run_once(isolate, stray, test_in,
+                                         self.tmp / "a.produced",
+                                         cpu_limit_s=2.0, wall_limit_s=6.0,
+                                         mem_limit_kb=256 * 1024,
+                                         io_input="t.inp", io_output="t.out")
+            second = run_matrix._run_once(isolate, stray, test_in,
+                                          self.tmp / "b.produced",
+                                          cpu_limit_s=2.0, wall_limit_s=6.0,
+                                          mem_limit_kb=256 * 1024,
+                                          io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        for label, r in (("first", first), ("second", second)):
+            with self.subTest(run=label):
+                # It wrote the wrong filename: no output file, clean exit.
+                self.assertTrue(r.no_output, r)
+                self.assertFalse(r.crashed, r)
+                self.assertEqual(r.exit_code, 0, r)
+
     def test_file_io_output_is_not_charged_against_the_memory_limit(self):
         # Risk 1 — the tmpfs bug, a fourth time. The first three times the
         # contaminated write was the driver's own staging of *stdout*; the
@@ -1103,12 +1148,9 @@ class TestRunMatrixFixture(unittest.TestCase):
 
     def test_time_median_carries_no_output_from_any_run_not_just_the_last(self):
         # The mutation test for the sticky-OR *and* for the rebuilt
-        # RunResult. The binary writes `t.out` on every run EXCEPT the
-        # first: it drops a marker in the staging directory (which survives
-        # between runs — only the staged input/output are unlinked) and
-        # keys off its absence. So the final run produced real output, and
-        # only a flag that is OR-ed across runs *and* passed to the
-        # returned RunResult reports the first run's silence.
+        # RunResult. The first of three runs writes no `t.out`; runs 2 and 3
+        # do. Only a flag OR-ed across runs *and* passed to the RunResult
+        # built below the loop reports the first run's silence.
         #
         # Three ways to break the driver, all caught here: not threading the
         # IO names through `_time_median` (the runs execute in stdin mode,
@@ -1116,30 +1158,58 @@ class TestRunMatrixFixture(unittest.TestCase):
         # accumulator (the last run wins and reports False), and not passing
         # `no_output` to the RunResult built below the loop (computed, then
         # thrown away).
-        binary = _compile(
+        #
+        # The "first run differs" mechanism is supplied by this test — the
+        # binary on disk is swapped between calls — and deliberately not by
+        # a marker file the solution leaves in the staging directory. That
+        # earlier mechanism relied on the staging directory *keeping* a
+        # solution's stray files between runs, which Task 6's dogfood proved
+        # is a defect, not a feature: the leftover is owned by one box's
+        # subuid and no later box can reopen it, so it turned NO_OUTPUT into
+        # RE. `_clear_stage_dir` now wipes the directory before every run,
+        # and this test must not be the reason to reintroduce the leak.
+        silent = _compile("int main(){ return 0; }\n",
+                          self.tmp / "silent_first", self.tmp)
+        writer = _compile(
             '#include <cstdio>\n'
-            'int main(){ FILE *m = fopen("marker", "r");\n'
-            '  if (!m) { FILE *c = fopen("marker", "w"); if (!c) return 6;\n'
-            '            fputs("x", c); fclose(c); return 0; }\n'
-            '  fclose(m);\n'
-            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            'int main(){ FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
             '  fprintf(f, "later\\n"); fclose(f); return 0; }\n',
-            self.tmp / "late_writer", self.tmp)
+            self.tmp / "later_writer", self.tmp)
+        binary = self.tmp / "swapped"
+        shutil.copyfile(silent, binary)
+        os.chmod(binary, 0o755)
         os.chmod(self.tmp, 0o777)
         test_in = self.tmp / "01.in"
         test_in.write_text("x\n", encoding="utf-8")
         dest = self.tmp / "late.produced"
 
+        real_run_once = run_matrix._run_once
+        seen = []
+
+        def _swap_after_the_first_run(*args, **kwargs):
+            result = real_run_once(*args, **kwargs)
+            seen.append(result)
+            if len(seen) == 1:
+                shutil.copyfile(writer, binary)
+                os.chmod(binary, 0o755)
+            return result
+
         isolate = run_matrix.open_isolate_box(self.tmp)
         try:
-            r = run_matrix._time_median(isolate, binary, test_in, dest,
-                                        2.0, 6.0, 256 * 1024, 3,
-                                        io_input="t.inp", io_output="t.out")
+            with mock.patch.object(run_matrix, "_run_once",
+                                   _swap_after_the_first_run):
+                r = run_matrix._time_median(isolate, binary, test_in, dest,
+                                            2.0, 6.0, 256 * 1024, 3,
+                                            io_input="t.inp", io_output="t.out")
         finally:
             run_matrix.close_isolate_box(isolate)
 
-        # Runs 2 and 3 really did write — so this is a genuine sticky-OR,
-        # not "every run was silent".
+        # Exactly one silent run out of three — asserted per run, so "every
+        # run was silent" can never masquerade as a working sticky-OR.
+        self.assertEqual([x.no_output for x in seen], [True, False, False],
+                         [str(x) for x in seen])
+        # Runs 2 and 3 really did write, and the last one's output is what
+        # landed in the repository.
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "later")
         self.assertFalse(r.crashed, r)
         self.assertFalse(r.killed, r)
@@ -1245,6 +1315,50 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(len(mismatch), 1, payload["mismatches"])
         self.assertEqual(mismatch[0]["expected"], "WA")
         self.assertEqual(mismatch[0]["actual"], "NO_OUTPUT")
+
+    def test_wrong_filename_solution_is_NO_OUTPUT_on_every_test_not_just_the_first(self):
+        # The `run()`-level half of the stray-file leak, and the exact shape
+        # the Task 6 dogfood hit: a solution writing `output.txt` was
+        # NO_OUTPUT on the first test it ran and RE on every test after it,
+        # because its own leftover file — owned by a box subuid no later box
+        # shares — could not be reopened for writing.
+        #
+        # A second test input is what makes this test able to fail at all:
+        # with one test per group the wrong-filename solution never gets a
+        # second run, and the bug is invisible.
+        wrong_name = (
+            "/**\n"
+            " * @tag        wrong-answer\n"
+            " * @expect     g1=WA\n"
+            " * @algorithm  Correct sum, written to output.txt.\n"
+            " * @why-wrong  Writes output.txt, not the t.out problem.json declares.\n"
+            " * @complexity O(1)\n"
+            " */\n"
+            "#include <cstdio>\n"
+            'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+            '  long long a, b; if (fscanf(fi, "%lld %lld", &a, &b) != 2) return 4;\n'
+            "  fclose(fi);\n"
+            '  FILE *fo = fopen("output.txt", "w"); if (!fo) return 5;\n'
+            '  fprintf(fo, "%lld\\n", a + b); fclose(fo); return 0; }\n'
+        )
+        self._make_file_io_package(extra_solution=("wrongname.cpp", wrong_name))
+        (self.problem_dir / "tests" / "g1" / "02.in").write_text(
+            "4 5\n", encoding="utf-8")
+
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        got = {r["test"]: r["verdict"] for r in payload["results"]
+               if r["solution"] == "wrongname.cpp"}
+        self.assertEqual(got, {"01": "NO_OUTPUT", "02": "NO_OUTPUT"},
+                         "the wrong-filename solution's verdict changed with "
+                         "run order — its own leftover file poisoned the "
+                         "later run")
+        # And it did not poison the honest solutions sharing the staging
+        # directory either: both still get their real verdicts on both tests.
+        self.assertEqual(
+            {r["test"]: r["verdict"] for r in payload["results"]
+             if r["solution"] == "sol-main.cpp"},
+            {"01": "OK", "02": "OK"})
 
     def test_model_solution_that_writes_no_output_file_is_refused(self):
         # Pass 1 turns the model solution's output into the jury's `.a`

@@ -22,7 +22,12 @@ import re
 import unittest
 from pathlib import Path
 
-SKILLS = Path(__file__).resolve().parents[2] / "skills"
+from tools import run_matrix
+from tools.matrix_core import _SEVERITY
+from tools.scan_solutions import VERDICTS
+
+ROOT = Path(__file__).resolve().parents[2]
+SKILLS = ROOT / "skills"
 
 # A fenced block, tagged with its language. Non-greedy so each match is one
 # complete fence rather than everything between the first and last one.
@@ -103,6 +108,121 @@ class TestReachingCheckRecipeDoesNotDrift(unittest.TestCase):
                 self.assertIn("REJECTED", block,
                               f"{skill}: the reaching-check loop ignores the "
                               f"validator's exit code")
+
+
+class TestFileIOProseMatchesTheDriver(unittest.TestCase):
+    """The IO-mode paragraphs, pinned to the code they describe.
+
+    For two whole stages `preparing-tests`, `validating-solutions` and the
+    README all said file IO was "rejected loudly by `run_matrix`". Nothing
+    caught it when that stopped being true, because nothing was watching
+    those sentences — three separate documents making the same claim, and
+    no test naming any of them. This class is that mechanism, and it is
+    deliberately written against *values imported from the code* rather
+    than against a second copy of the prose: a test that only compares one
+    string in this file to one string in a document goes green the moment
+    someone edits both, which is precisely how the retired claim survived.
+    """
+
+    DOCUMENTS = {
+        "README.md": ROOT / "README.md",
+        "preparing-tests": SKILLS / "preparing-tests" / "SKILL.md",
+        "validating-solutions": SKILLS / "validating-solutions" / "SKILL.md",
+    }
+
+    # Sentences that were true before file IO landed and are false now. They
+    # are listed literally, because the failure mode being guarded is a
+    # revert or a copy-paste from an old draft, not a paraphrase.
+    RETIRED_CLAIMS = (
+        "Only stdin/stdout problems are supported",
+        "rejected loudly by",
+        "the file-IO guard",
+        "it is a later feature, not a silent partial mode",
+    )
+
+    def text(self, name: str) -> str:
+        path = self.DOCUMENTS[name]
+        self.assertTrue(path.is_file(), f"{path} is missing")
+        body = path.read_text(encoding="utf-8")
+        # The extractor guard, same role as TestFenceExtraction above: an
+        # empty read would make every assertNotIn below trivially pass.
+        self.assertGreater(len(body), 1000, f"{path} read back nearly empty")
+        return body
+
+    def test_no_document_still_claims_file_io_is_rejected(self):
+        for name in self.DOCUMENTS:
+            body = self.text(name)
+            for claim in self.RETIRED_CLAIMS:
+                with self.subTest(document=name, claim=claim):
+                    self.assertNotIn(
+                        claim, body,
+                        f"{name} still carries a pre-file-IO claim. "
+                        f"run_matrix.run() accepts file-IO problems — the "
+                        f"refusal it describes was deleted.")
+
+    def flat(self, name: str) -> str:
+        """`text`, with every run of whitespace collapsed to one space.
+
+        These documents are hard-wrapped at ~76 columns, so any phrase long
+        enough to be worth pinning is split across a newline in at least one
+        of them. Matching the raw text would make this test pass or fail on
+        where a paragraph happened to wrap.
+        """
+        return re.sub(r"\s+", " ", self.text(name))
+
+    def test_every_document_states_what_file_io_does_not_change(self):
+        # The two facts a setter most needs and most doubts. Duplicated
+        # across all three documents on purpose (skills load independently,
+        # there is no include mechanism), which is exactly why they need a
+        # test holding them together.
+        required = (
+            "enerators and validators are unaffected",
+            "three file paths",
+        )
+        for name in self.DOCUMENTS:
+            body = self.flat(name)
+            for phrase in required:
+                with self.subTest(document=name, phrase=phrase):
+                    self.assertIn(
+                        phrase, body,
+                        f"{name} describes file IO without saying that "
+                        f"{phrase!r} — the question every setter asks first.")
+
+    def test_prose_names_the_drivers_real_staged_stdout_file(self):
+        # `validating-solutions` tells a reader their `io.output` may not
+        # collide with the driver's staged stdout, and names it. Rename
+        # STAGED_STDOUT_NAME and that instruction silently starts naming a
+        # file that no longer exists.
+        self.assertIn(f"(`{run_matrix.STAGED_STDOUT_NAME}`)",
+                      self.flat("validating-solutions"),
+                      "the collision warning names a file the driver no "
+                      "longer stages to")
+
+    def test_the_declarable_verdicts_in_prose_are_the_ones_the_scanner_takes(self):
+        # `validating-solutions` claims @expect accepts exactly
+        # `OK WA TL ML PE RE`. That list lives in scan_solutions.VERDICTS,
+        # and the whole NO_OUTPUT-is-a-mismatch-not-a-hole explanation
+        # around it is only true while NO_OUTPUT stays out of it.
+        body = self.flat("validating-solutions")
+        match = re.search(r"`([A-Z][A-Z ]+)` \(`scan_solutions\.VERDICTS`\)", body)
+        self.assertIsNotNone(
+            match, "validating-solutions no longer quotes the declarable "
+                   "verdict list next to `scan_solutions.VERDICTS`")
+        self.assertEqual(match.group(1).split(), list(VERDICTS),
+                         "the verdict list in validating-solutions has "
+                         "drifted from scan_solutions.VERDICTS")
+        self.assertNotIn("NO_OUTPUT", VERDICTS,
+                         "NO_OUTPUT became declarable, so the prose calling "
+                         "it 'not declarable' is now wrong")
+        self.assertIn("NO_OUTPUT", _SEVERITY,
+                      "NO_OUTPUT left the severity table the prose ranks it in")
+
+    def test_no_output_is_documented_as_ranked_next_to_FAIL(self):
+        # The ranking claim in prose, checked against the table itself:
+        # NO_OUTPUT must sit immediately after FAIL, above every verdict a
+        # solution can earn on its own merits.
+        self.assertEqual(_SEVERITY[:2], ["FAIL", "NO_OUTPUT"], _SEVERITY)
+        self.assertIn("NO_OUTPUT", self.text("validating-solutions"))
 
 
 if __name__ == "__main__":
