@@ -6,7 +6,7 @@ mismatches) and — the actual point of the tool — that the hole detector
 fires when a test can no longer distinguish the wrong solution from the
 model solution. It also pins down the fixes made during review: the
 child's own peak RSS (not the driver's), the timing-band re-run path, the
-checker timeout, and the file-IO guard.
+checker timeout, and — since Stage 3 — both IO modes end to end.
 
 Task 9b migrated the runner from `os.posix_spawn` + `/proc` polling to the
 ioi/isolate sandbox — there is no fallback runner any more, so the tests
@@ -97,6 +97,43 @@ _MAIN_HEADER = (
 )
 
 
+# The file-IO variant of the mini fixture's two solutions: the same
+# arithmetic, but reading `t.inp` and writing `t.out` by *relative* name and
+# never touching stdin or stdout. Used by `_make_file_io_package` to drive
+# `run()` end to end in file-IO mode. The nonzero returns are diagnostics:
+# any of them surfaces as `crashed`/RE rather than as a mystery WA.
+_FILE_IO_MAIN = (
+    "/**\n"
+    " * @tag        main\n"
+    " * @expect     g1=OK\n"
+    " * @algorithm  Reads two integers from t.inp, writes their sum to t.out.\n"
+    " * @complexity O(1)\n"
+    " */\n"
+    "#include <cstdio>\n"
+    'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+    '  long long a, b; if (fscanf(fi, "%lld %lld", &a, &b) != 2) return 4;\n'
+    "  fclose(fi);\n"
+    '  FILE *fo = fopen("t.out", "w"); if (!fo) return 5;\n'
+    '  fprintf(fo, "%lld\\n", a + b); fclose(fo); return 0; }\n'
+)
+
+_FILE_IO_WRONG = (
+    "/**\n"
+    " * @tag        wrong-answer\n"
+    " * @expect     g1=WA\n"
+    " * @algorithm  Writes the difference instead of the sum.\n"
+    " * @why-wrong  Wrong operator; every test with a != 0 catches it.\n"
+    " * @complexity O(1)\n"
+    " */\n"
+    "#include <cstdio>\n"
+    'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+    '  long long a, b; if (fscanf(fi, "%lld %lld", &a, &b) != 2) return 4;\n'
+    "  fclose(fi);\n"
+    '  FILE *fo = fopen("t.out", "w"); if (!fo) return 5;\n'
+    '  fprintf(fo, "%lld\\n", a - b); fclose(fo); return 0; }\n'
+)
+
+
 def _compile(src_text: str, out_path: Path, tmp_dir: Path) -> Path:
     """Compile a throwaway C++ source string, for tests that need a binary
     with a specific misbehavior (busy-looping, memory-hogging) that has no
@@ -158,6 +195,34 @@ class TestRunMatrixFixture(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_file_io_package(self, *, extra_solution=None, main_source=None):
+        """Turn the scratch copy of the mini fixture into a file-IO package.
+
+        `problem.json`'s `io` block names real files and both checked-in
+        solutions are replaced by ones that read `t.inp` and write `t.out`.
+        Everything else — the checker (stock `ncmp`, which already takes
+        three paths), the validator, the generator, the tests — is untouched,
+        which is the point: only `problem.json` and the solutions differ
+        between the two IO modes.
+
+        `extra_solution` is an `(filename, source)` pair added to
+        `solutions/`; `main_source` overrides the model solution.
+        """
+        meta_path = self.problem_dir / "problem.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["io"] = {"input": "t.inp", "output": "t.out"}
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        solutions = self.problem_dir / "solutions"
+        (solutions / "sol-main.cpp").write_text(
+            main_source if main_source is not None else _FILE_IO_MAIN,
+            encoding="utf-8")
+        (solutions / "sol-wrong.cpp").write_text(_FILE_IO_WRONG, encoding="utf-8")
+        if extra_solution is not None:
+            name, source = extra_solution
+            (solutions / name).write_text(source, encoding="utf-8")
+        return self.problem_dir
 
     def test_clean_matrix_has_no_holes_or_mismatches(self):
         payload = run_matrix.run(self.problem_dir, self.testlib_dir)
@@ -260,18 +325,6 @@ class TestRunMatrixFixture(unittest.TestCase):
             # "time-limit-exceeded-or-accepted", a verdict that does not
             # exist — the recorded verdict is always a real one.
             self.assertNotIn("time-limit-exceeded-or-accepted", flag["assumed"])
-
-    def test_file_based_io_is_rejected_not_silently_mis_run(self):
-        # A vnolymp-style file-IO problem (flight.inp/flight.out) must fail
-        # loudly rather than silently feed the model solution empty stdin
-        # and report a confident wrong verdict.
-        meta_path = self.problem_dir / "problem.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["io"] = {"input": "mini.inp", "output": "mini.out"}
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
-
-        with self.assertRaises(run_matrix.MatrixError):
-            run_matrix.run(self.problem_dir, self.testlib_dir)
 
     def test_checker_timeout_reports_fail_instead_of_hanging(self):
         # A custom checker is externally-authored data; one that hangs
@@ -1041,6 +1094,229 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertFalse(r.crashed, r)
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "15")
 
+    # ------------------------------------------------------------------
+    # `_time_median` in file-IO mode. It calls `_run_once` `runs` times and
+    # rebuilds a RunResult from the samples, and every field it forgets to
+    # carry is silently lost. `no_output` was dropped there — unreachable
+    # while nothing passed IO names down, live the moment `run()` did.
+    # ------------------------------------------------------------------
+
+    def test_time_median_carries_no_output_from_any_run_not_just_the_last(self):
+        # The mutation test for the sticky-OR *and* for the rebuilt
+        # RunResult. The binary writes `t.out` on every run EXCEPT the
+        # first: it drops a marker in the staging directory (which survives
+        # between runs — only the staged input/output are unlinked) and
+        # keys off its absence. So the final run produced real output, and
+        # only a flag that is OR-ed across runs *and* passed to the
+        # returned RunResult reports the first run's silence.
+        #
+        # Three ways to break the driver, all caught here: not threading the
+        # IO names through `_time_median` (the runs execute in stdin mode,
+        # where `no_output` is never set), not OR-ing `r.no_output` into the
+        # accumulator (the last run wins and reports False), and not passing
+        # `no_output` to the RunResult built below the loop (computed, then
+        # thrown away).
+        binary = _compile(
+            '#include <cstdio>\n'
+            'int main(){ FILE *m = fopen("marker", "r");\n'
+            '  if (!m) { FILE *c = fopen("marker", "w"); if (!c) return 6;\n'
+            '            fputs("x", c); fclose(c); return 0; }\n'
+            '  fclose(m);\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "later\\n"); fclose(f); return 0; }\n',
+            self.tmp / "late_writer", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "late.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._time_median(isolate, binary, test_in, dest,
+                                        2.0, 6.0, 256 * 1024, 3,
+                                        io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        # Runs 2 and 3 really did write — so this is a genuine sticky-OR,
+        # not "every run was silent".
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "later")
+        self.assertFalse(r.crashed, r)
+        self.assertFalse(r.killed, r)
+        self.assertTrue(
+            r.no_output,
+            "the first of three runs created no output file; _time_median "
+            f"reported no_output=False ({r})")
+
+    def test_time_median_does_not_invent_no_output_when_every_run_writes(self):
+        # The other direction: a solution that writes its output file on
+        # every run must come back clean. Without this, `no_output=True`
+        # hardcoded in the rebuilt RunResult would pass the test above.
+        binary = _compile(
+            '#include <cstdio>\n'
+            'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+            '  int a, b; if (fscanf(fi, "%d %d", &a, &b) != 2) return 4;\n'
+            '  fclose(fi);\n'
+            '  FILE *fo = fopen("t.out", "w"); if (!fo) return 5;\n'
+            '  fprintf(fo, "%d\\n", a + b); fclose(fo); return 0; }\n',
+            self.tmp / "median_writer", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        dest = self.tmp / "median.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._time_median(isolate, binary, test_in, dest,
+                                        2.0, 6.0, 256 * 1024, 3,
+                                        io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.no_output, r)
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
+
+    # ------------------------------------------------------------------
+    # `run()` end to end in file-IO mode, and `_classify`'s ordering.
+    # ------------------------------------------------------------------
+
+    def test_run_accepts_a_file_io_problem(self):
+        # The refusal is gone: a vnolymp-style package (io.input/io.output
+        # naming real files) now produces a real matrix rather than a
+        # MatrixError. Same fixture, same tests, same checker as the
+        # stdin/stdout run above — only the IO mode differs, so the two
+        # runs must agree verdict for verdict.
+        self._make_file_io_package()
+
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertEqual(payload["holes"], [])
+        self.assertEqual(payload["mismatches"], [])
+        by_solution = {r["solution"]: r for r in payload["results"]
+                       if r["group"] == "g1" and r["test"] == "01"}
+        self.assertEqual(by_solution["sol-main.cpp"]["verdict"], "OK")
+        self.assertEqual(by_solution["sol-wrong.cpp"]["verdict"], "WA")
+
+        # Pass 1 wrote the jury's answer from the model solution's *file*
+        # output, not from an empty stdout: 2 + 3 = 5. An empty `.a` here
+        # would mean the matrix judged everything against nothing.
+        answer = self.problem_dir / "tests" / "g1" / "01.a"
+        self.assertEqual(answer.read_text(encoding="utf-8").strip(), "5")
+
+        # And the artifact on disk is a normal one, not a special case.
+        written = json.loads(
+            (self.problem_dir / "invocation.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["holes"], [])
+        self.assertEqual(written["results"], payload["results"])
+
+    def test_solution_that_never_writes_output_is_NO_OUTPUT(self):
+        # The verdict a stdin/stdout problem cannot produce. `silent.cpp`
+        # exits 0 and writes nothing — the classic "wrote the wrong
+        # filename" mistake — and must be reported as NO_OUTPUT rather than
+        # checked (an empty file against the jury's answer would read as WA
+        # and hide the real defect).
+        silent = (
+            "/**\n"
+            " * @tag        wrong-answer\n"
+            " * @expect     g1=WA\n"
+            " * @algorithm  Writes nothing at all.\n"
+            " * @why-wrong  Never creates t.out; stands in for a wrong filename.\n"
+            " * @complexity O(1)\n"
+            " */\n"
+            "int main(){ return 0; }\n"
+        )
+        self._make_file_io_package(extra_solution=("silent.cpp", silent))
+
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        verdicts = {r["solution"]: r["verdict"] for r in payload["results"]
+                    if r["group"] == "g1" and r["test"] == "01"}
+        self.assertEqual(verdicts["silent.cpp"], "NO_OUTPUT")
+        # The other two are unaffected by its presence.
+        self.assertEqual(verdicts["sol-main.cpp"], "OK")
+        self.assertEqual(verdicts["sol-wrong.cpp"], "WA")
+
+        # NO_OUTPUT is not declarable, so `silent.cpp` had to declare WA;
+        # the disagreement is a mismatch, never a hole. The hole rule is
+        # unchanged: a hole is a solution declared wrong that got OK.
+        self.assertEqual(payload["holes"], [])
+        mismatch = [m for m in payload["mismatches"]
+                    if m["solution"] == "silent.cpp"]
+        self.assertEqual(len(mismatch), 1, payload["mismatches"])
+        self.assertEqual(mismatch[0]["expected"], "WA")
+        self.assertEqual(mismatch[0]["actual"], "NO_OUTPUT")
+
+    def test_model_solution_that_writes_no_output_file_is_refused(self):
+        # Pass 1 turns the model solution's output into the jury's `.a`
+        # answer file. In file-IO mode a model solution that writes nothing
+        # would hand pass 2 an EMPTY answer to judge every submission
+        # against — a whole matrix of confident, wrong verdicts. It must
+        # refuse, naming the filename problem.json declares. (This also
+        # exercises the median path: pass 1 runs the model solution `runs`
+        # times through `_time_median`.)
+        silent_main = (
+            "/**\n"
+            " * @tag        main\n"
+            " * @expect     g1=OK\n"
+            " * @algorithm  Writes nothing — a model solution with the wrong filename.\n"
+            " * @complexity O(1)\n"
+            " */\n"
+            "int main(){ return 0; }\n"
+        )
+        self._make_file_io_package(main_source=silent_main)
+
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        message = str(ctx.exception)
+        self.assertIn("t.out", message)          # names the file it wanted
+        self.assertIn("model solution", message)
+        # It must refuse, not leave a blank answer behind as if it were jury
+        # truth — and it must not have written invocation.json either.
+        self.assertFalse((self.problem_dir / "invocation.json").exists())
+
+    def test_classify_checks_killed_and_crashed_before_no_output(self):
+        # Ordering, stated in `_classify`'s docstring and load-bearing: a
+        # segfault and a time-limit kill both leave no output file, and
+        # reporting either as NO_OUTPUT names the symptom instead of the
+        # cause. Pure — no sandbox needed. `_check` is patched to fail
+        # loudly, pinning the other half of the claim: the checker is never
+        # invoked on a run that produced no output file.
+        limits = Limits(t_main_ms=10, tl_ms=1000, kill_ms=2000)
+        missing = self.tmp / "does-not-exist.out"
+
+        def _never(*args, **kwargs):
+            raise AssertionError("the checker must not run on a no-output run")
+
+        cases = {
+            "RE": dict(crashed=True),
+            "TL": dict(killed=True),
+            "ML": dict(oom=True),
+            "NO_OUTPUT": dict(),
+        }
+        with mock.patch.object(run_matrix, "_check", _never):
+            for expected, extra in cases.items():
+                base = dict(cpu_ms=5, wall_ms=5, killed=False, oom=False,
+                            crashed=False, exit_code=0, peak_kb=100,
+                            status="", message="", no_output=True)
+                base.update(extra)
+                outcome = run_matrix._classify(
+                    run_matrix.RunResult(**base), self.tmp / "no-checker",
+                    self.tmp / "01.in", missing, self.tmp / "01.a", limits)
+                self.assertEqual(outcome.verdict, expected, base)
+
+        # And time still beats correctness: a run over the limit that also
+        # wrote nothing is TL, not NO_OUTPUT (matrix_core decides time
+        # first). 2500 ms is past kill_ms, so it is not merely banded.
+        over = run_matrix.RunResult(
+            cpu_ms=2500, wall_ms=2500, killed=False, oom=False, crashed=False,
+            exit_code=0, peak_kb=100, status="", message="", no_output=True)
+        with mock.patch.object(run_matrix, "_check", _never):
+            outcome = run_matrix._classify(
+                over, self.tmp / "no-checker", self.tmp / "01.in", missing,
+                self.tmp / "01.a", limits)
+        self.assertEqual(outcome.verdict, "TL")
+
     def test_stage_dir_is_not_on_a_memory_backed_filesystem(self):
         isolate = run_matrix.open_isolate_box(self.problem_dir)
         try:
@@ -1056,12 +1332,15 @@ class TestRunMatrixFixture(unittest.TestCase):
     def test_matrix_error_exits_2_so_it_is_not_read_as_a_hole(self):
         # `validating-solutions` tells the agent that exit 1 means holes or
         # mismatches. An uncaught MatrixError used to exit 1 as well, so a
-        # compile failure or the file-IO guard read as a finding about the
-        # test suite. Use the file-IO guard as the trigger — it raises
-        # before anything is compiled.
+        # compile failure or a refused package read as a finding about the
+        # test suite. The trigger used to be the blanket file-IO refusal,
+        # which this task deleted; the surviving refusal in the same family
+        # is an `io.output` colliding with the name the driver stages the
+        # sandboxed process's stdout under.
         meta_path = self.problem_dir / "problem.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["io"] = {"input": "mini.inp", "output": "mini.out"}
+        meta["io"] = {"input": "mini.inp",
+                      "output": run_matrix.STAGED_STDOUT_NAME}
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
         code = run_matrix.main(["run_matrix.py", str(self.problem_dir),

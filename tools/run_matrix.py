@@ -161,9 +161,10 @@ two halves and both are load-bearing:
     to `/tmp`. If the chosen location is memory-backed it raises
     `MatrixError` rather than warning: this driver's standing doctrine is
     that it refuses to run rather than produce a confidently wrong
-    verdict, the same call already made for a missing sandbox and for
-    file-based IO, and a warning on stderr in the middle of a few hundred
-    runs is exactly the thing a caller reads past.
+    verdict, the same call already made for a missing sandbox and for an
+    `io.output` that would collide with the staged stdout, and a warning
+    on stderr in the middle of a few hundred runs is exactly the thing a
+    caller reads past.
 
   * `--fsize=OUTPUT_LIMIT_KB` bounds the output explicitly. Until this
     fix, tmpfs *accidentally* capped output at `memory_mb`; moving staging
@@ -394,7 +395,8 @@ def _stage_base(problem_dir: str | Path | None) -> Path:
     over: it scrolls past in the middle of a few hundred sandboxed runs,
     and the failure it precedes is a *wrong verdict on a correct
     solution*, which this driver already refuses to risk elsewhere (a
-    missing sandbox, file-based IO) rather than proceed through.
+    missing sandbox, a model solution that writes no output file at all)
+    rather than proceed through.
     """
     override = os.environ.get(STAGE_DIR_ENV)
     if override:
@@ -980,30 +982,47 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
 
 def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                   stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
-                  mem_limit_kb: int, runs: int) -> RunResult:
+                  mem_limit_kb: int, runs: int, *, io_input: str = "stdin",
+                  io_output: str = "stdout") -> RunResult:
     """Median the CPU/wall time over `runs` runs; any bad outcome wins.
 
-    `killed`/`oom`/`crashed` are all sticky-OR (never cleared once True) and
-    `exit_code`/`status`/`message` are sticky-first-nonempty — mirroring the
-    old driver's reasoning for the model solution specifically: a run that
-    fails once and happens to succeed on a later retry must not have that
-    failure silently overwritten, or a flaky answer file could pass as jury
-    truth, and the diagnostic for that failure must survive to be reported
-    even though it happened on an earlier iteration than the last one.
+    `killed`/`oom`/`crashed`/`no_output` are all sticky-OR (never cleared
+    once True) and `exit_code`/`status`/`message` are sticky-first-nonempty
+    — mirroring the old driver's reasoning for the model solution
+    specifically: a run that fails once and happens to succeed on a later
+    retry must not have that failure silently overwritten, or a flaky answer
+    file could pass as jury truth, and the diagnostic for that failure must
+    survive to be reported even though it happened on an earlier iteration
+    than the last one.
+
+    `no_output` joined that list when `run()` started passing real IO
+    filenames down here: dropping it was unreachable while every call was
+    stdin/stdout (isolate always creates a stdout file), and became live the
+    moment file-IO problems reached this function. It is sticky in both
+    directions that matter — a first run that wrote nothing must not be
+    erased by two later runs that did, and the flag must actually reach the
+    returned `RunResult`, or `_classify` never sees it and the whole
+    NO_OUTPUT verdict silently disappears on any re-timed (banded) run and
+    on the model solution's entire pass 1.
+
+    `io_input`/`io_output` are forwarded verbatim to `_run_once`, which owns
+    every file-IO behaviour and every refusal; nothing is interpreted here.
     """
     cpu_samples, wall_samples = [], []
-    killed = oom = crashed = False
+    killed = oom = crashed = no_output = False
     exit_code = 0
     status = message = ""
     peak = 0
     for _ in range(runs):
         r = _run_once(isolate, binary, stdin_path, stdout_dest,
-                      cpu_limit_s, wall_limit_s, mem_limit_kb)
+                      cpu_limit_s, wall_limit_s, mem_limit_kb,
+                      io_input=io_input, io_output=io_output)
         cpu_samples.append(r.cpu_ms)
         wall_samples.append(r.wall_ms)
         killed = killed or r.killed
         oom = oom or r.oom
         crashed = crashed or r.crashed
+        no_output = no_output or r.no_output
         exit_code = exit_code or r.exit_code
         status = status or r.status
         message = message or r.message
@@ -1013,7 +1032,7 @@ def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         wall_ms=int(statistics.median(wall_samples)),
         killed=killed, oom=oom, crashed=crashed,
         exit_code=exit_code, peak_kb=peak,
-        status=status, message=message,
+        status=status, message=message, no_output=no_output,
     )
 
 
@@ -1135,6 +1154,19 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
     so the checker never runs on one that exceeded it" is already
     `classify()`'s own stated doctrine for the TL case, and it applies just
     as much to a run that never produced valid output to check at all.
+
+    `no_output` (file-IO mode only: the process exited cleanly and never
+    created the problem's output file, typically because it wrote the wrong
+    filename) becomes the verdict `NO_OUTPUT`, and is checked *after*
+    `killed` and `crashed`, never before: a solution that segfaulted is RE,
+    and one that was stopped at the limit is TL — both would also leave no
+    output file, and reporting either as NO_OUTPUT would name the symptom
+    instead of the cause. Only a run that finished cleanly and still wrote
+    nothing is NO_OUTPUT. It is fed through `classify()` as a checker
+    verdict rather than returned directly, because `classify()` decides time
+    before correctness (`matrix_core`): a run that overran the limit without
+    being killed is TL, not NO_OUTPUT. The checker is never invoked on this
+    path, so it is never handed a nonexistent file.
     """
     if r.oom:
         return Outcome("ML", banded=False)
@@ -1142,6 +1174,8 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
         verdict_src = ""  # unused: classify() returns TL before consulting it
     elif r.crashed:
         verdict_src = "RE"
+    elif r.no_output:
+        verdict_src = "NO_OUTPUT"
     else:
         verdict_src = _check(checker, test, out, ans)
     return classify(r.cpu_ms, r.killed, verdict_src, limits)
@@ -1150,17 +1184,15 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
 def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict:
     problem_dir, testlib_dir = Path(problem_dir), Path(testlib_dir)
     problem = load(problem_dir / "problem.json")
-    if problem.input != "stdin" or problem.output != "stdout":
-        raise MatrixError(
-            "file-based IO is not supported by this driver: "
-            f"io.input={problem.input!r}, io.output={problem.output!r} "
-            "(only io.input='stdin' / io.output='stdout' are handled; "
-            "vnolymp-style file-IO problems — e.g. flight.inp/flight.out — "
-            "would otherwise feed the model solution empty stdin, discard "
-            "its real output, and this driver would report a confident "
-            "wrong verdict instead of failing loudly. Supporting file IO "
-            "is a later feature, not something to run silently-wrong now.)"
-        )
+    # Both IO modes run through the same code from here on. `problem.input`
+    # and `problem.output` are either the sentinels "stdin"/"stdout" or bare
+    # filenames — `problem_meta.load` validated that, refused a path
+    # separator or a dot-segment, and refused input == output, so nothing is
+    # re-validated here. They are threaded, unchanged, into every sandboxed
+    # execution below; `_run_once` owns what they mean and owns the two
+    # remaining refusals (a name colliding with the staged stdout, and the
+    # same check on input == output for callers that build their own
+    # arguments).
     # Task 9b review, aggravating detail: an earlier version of this
     # function only discovered whether isolate was even usable *after*
     # already compiling every solution and touching the tree — so a
@@ -1245,7 +1277,9 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                 answer = test.with_suffix(".a")
                 r = _time_median(isolate, binaries[main_file], test, answer,
                                  MODEL_SAFETY_CPU_S, MODEL_SAFETY_WALL_S,
-                                 mem_limit_kb, runs)
+                                 mem_limit_kb, runs,
+                                 io_input=problem.input,
+                                 io_output=problem.output)
                 if r.killed:
                     # isolate's own `status:TO` fires for either a CPU-time
                     # kill or a wall-time kill, and this pass has two
@@ -1284,6 +1318,25 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                         f"model solution crashed on {test} ({detail}) — a "
                         "solution that exits abnormally cannot define the "
                         "jury's expected timing or answers")
+                if r.no_output:
+                    # File-IO mode only, and new with it: the model solution
+                    # exited 0 and never created `io.output`. Left unchecked
+                    # this writes an EMPTY `.a` answer file and carries on,
+                    # so pass 2 checks every solution — including the model
+                    # one — against a blank jury answer. That is precisely
+                    # the confidently-wrong matrix this driver refuses to
+                    # produce, and it is reachable the moment `run()` stops
+                    # rejecting file IO: the usual cause is a model solution
+                    # written for stdout, or one writing a filename that
+                    # disagrees with `problem.json`.
+                    raise MatrixError(
+                        f"model solution exited 0 on {test} without creating "
+                        f"its output file {problem.output!r} — the jury's "
+                        "answer file would be empty and every verdict below "
+                        "would be measured against it. Check that the model "
+                        "solution writes the filename problem.json declares "
+                        f"(io.input={problem.input!r}, "
+                        f"io.output={problem.output!r}).")
                 t_main[f"{group}/{test.stem}"] = r.cpu_ms
 
         limits = compute_limits(t_main)
@@ -1312,14 +1365,18 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                     out = build / f"{Path(name).stem}.{group}.{test.stem}.out"
                     answer = test.with_suffix(".a")
                     r = _run_once(isolate, binaries[name], test, out,
-                                 cpu_limit_s, wall_limit_s, mem_limit_kb)
+                                 cpu_limit_s, wall_limit_s, mem_limit_kb,
+                                 io_input=problem.input,
+                                 io_output=problem.output)
                     outcome = _classify(r, checker, test, out, answer, limits)
 
                     if outcome.banded:
                         first_run_ms = r.cpu_ms
                         r = _time_median(isolate, binaries[name], test, out,
                                          cpu_limit_s, wall_limit_s,
-                                         mem_limit_kb, runs)
+                                         mem_limit_kb, runs,
+                                         io_input=problem.input,
+                                         io_output=problem.output)
                         outcome = _classify(r, checker, test, out, answer, limits)
                         flags.append(
                             problem_dir, phase="validate-solutions", severity="medium",
@@ -1397,8 +1454,9 @@ def main(argv: list[str]) -> int:
         1 — the matrix ran and found holes and/or mismatches. This is a
             *result*, printed to stdout: the signal to keep reading.
         2 — the matrix could not be run at all (usage error, or any
-            `MatrixError`: a compile failure, a missing tests directory,
-            the file-IO guard, an unusable sandbox or staging location).
+            `MatrixError`: a compile failure, a missing tests directory, a
+            model solution that produced no output file, an unusable
+            sandbox or staging location).
             A message on stderr, nothing on stdout.
 
     Before this, an uncaught `MatrixError` surfaced as a traceback and
