@@ -755,9 +755,24 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         modes, so a file-IO solution's stray debug printing goes there, is
         discarded, and is still capped by `--fsize`; `--stdin` is pointed at
         the staged *copy* of the input, so a solution that reads stdin as
-        well as its file still sees the test data. If `io_output` is
-        literally `STAGED_STDOUT_NAME`, isolate and the solution would be
-        writing the same file, so that is refused with `MatrixError`.
+        well as its file still sees the test data.
+
+    Two name collisions are refused with `MatrixError` rather than run,
+    because both are silent: `io_output == STAGED_STDOUT_NAME` would have
+    isolate and the solution writing the same file, and `io_input ==
+    io_output` would have the staged *input* read back as the solution's
+    answer (so a solution that writes nothing scores OK on every test).
+    `problem_meta` refuses the second at load time too; this one is the
+    check at the point of use.
+
+    Permissions cut both ways here and neither direction is hypothetical.
+    The staged copy of the input is re-granted the "other" read bit
+    (`_ensure_sandbox_readable`) that `run()` granted the original and that
+    `shutil.copyfile` drops, or a strict umask on the *driver's* side makes
+    every file-IO run fail as isolate `status:XX`. In the other direction
+    the solution owns its own output file and may leave it unreadable to
+    us (`umask(077)`); that is surfaced as `MatrixError` naming the file
+    and the solution, never as `no_output` — it is a different fact.
 
     Both staged file-IO files are unlinked *before* the run and deliberately
     **not** after it: it is the pre-run unlink that has to be load-bearing,
@@ -809,6 +824,21 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         stage_dir_resolved = isolate.stage_dir.resolve()
 
         file_io = io_input != "stdin" or io_output != "stdout"
+        if file_io and io_input == io_output:
+            # `problem_meta` refuses this at load time; this is the same
+            # check at the point of use, because `_run_once` is also called
+            # directly (tests, and anything that builds its own arguments)
+            # and the consequence is silent: the solution's output file is
+            # the staged *input* file, so a solution that writes nothing
+            # hands the test data back as its answer and the checker
+            # accepts it.
+            raise MatrixError(
+                f"io.input and io.output are both {io_input!r}: the "
+                "solution's output file would be the file it read the test "
+                "from, so a solution that wrote nothing would have the test "
+                "input itself checked as its answer. Give them different "
+                "names."
+            )
         if file_io and (io_input == STAGED_STDOUT_NAME
                         or io_output == STAGED_STDOUT_NAME):
             raise MatrixError(
@@ -834,6 +864,14 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             staged_in.unlink(missing_ok=True)
             staged_result.unlink(missing_ok=True)
             shutil.copyfile(stdin_path, staged_in)
+            # `run()` already granted the original test file the "other"
+            # read bit the mapped subuid needs (`_ensure_sandbox_readable`);
+            # the copy is created fresh at `0666 & ~umask` and would throw
+            # that away. Under a strict umask (077) the sandbox then cannot
+            # open its own input, and it surfaces as isolate's status:XX —
+            # i.e. as this driver blaming isolate for a permission bit it
+            # set itself. Re-grant it on the copy.
+            _ensure_sandbox_readable(staged_in)
 
         cmd = [
             isolate.binary, "--cg", f"--box-id={box_id}", "--run",
@@ -909,6 +947,26 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             # is not a fact about the solution and stays unreported.
             data = b""
             no_output = file_io
+        except OSError as exc:
+            # The file exists but this process cannot read it — reachable in
+            # file-IO mode because the *solution* owns that file: a
+            # `umask(077)` in the solution leaves it `-rw-------` under the
+            # sandbox's subuid, which is neither our uid nor our group, and
+            # we own only the directory, so we cannot even chmod it. Left
+            # bare this escaped `_run_once` as `PermissionError` and took
+            # the whole matrix down mid-run on one careless solution.
+            # Deliberately NOT folded into `no_output`: "we could not read
+            # it" and "it was never written" are different facts about the
+            # solution, and conflating them is how this project has produced
+            # wrong verdicts before.
+            raise MatrixError(
+                f"could not read the output file {source} that {binary} "
+                f"produced on {stdin_path}: {exc} — the file exists but is "
+                "not readable by this process (a solution that restricts "
+                "its own output's permissions, e.g. umask(077), does this). "
+                "That is not the same as producing no output at all, so it "
+                "is reported rather than judged."
+            ) from exc
         stdout_dest.unlink(missing_ok=True)
         stdout_dest.write_bytes(data)
         staged_out.unlink(missing_ok=True)

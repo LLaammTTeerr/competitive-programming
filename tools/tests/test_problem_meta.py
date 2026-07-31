@@ -375,6 +375,19 @@ class TestIoValidation(unittest.TestCase):
         with self.assertRaises(ProblemMetaError):
             self._load_with_io({"input": "", "output": "x.out"})
 
+    def test_io_rejects_the_same_name_for_input_and_output(self):
+        # Cross-field, so `_io_name` (one value at a time) cannot catch it.
+        # Measured in run_matrix: with both names equal the staged test
+        # input IS the file read back as the answer, so a solution that
+        # writes nothing has the test data checked as its output and passes
+        # every test. Refused at load time, before anything is compiled.
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "t.txt", "output": "t.txt"})
+        message = str(ctx.exception)
+        self.assertIn("io.input", message)
+        self.assertIn("io.output", message)
+        self.assertIn("t.txt", message)
+
     def test_io_accepts_stdin_stdout_and_bare_filenames(self):
         p = self._load_with_io({"input": "stdin", "output": "stdout"})
         self.assertEqual((p.input, p.output), ("stdin", "stdout"))

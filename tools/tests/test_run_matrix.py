@@ -911,6 +911,110 @@ class TestRunMatrixFixture(unittest.TestCase):
             run_matrix.close_isolate_box(isolate)
         self.assertIn(run_matrix.STAGED_STDOUT_NAME, str(ctx.exception))
 
+    def test_file_io_same_name_for_input_and_output_is_refused(self):
+        # Measured, not theorised (review finding): with both names equal,
+        # the staged input IS the file read back as the answer, so a
+        # solution that writes nothing returns the test data as its output
+        # and the checker accepts it — a silent, confident wrong verdict on
+        # every test. `problem_meta` refuses this at load time as well;
+        # this pins the check at the point of use, since `_run_once` is
+        # called directly.
+        binary = _compile("int main(){ return 0; }\n", self.tmp / "samename", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("SECRET-TEST-INPUT\n", encoding="utf-8")
+        dest = self.tmp / "same.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.txt", io_output="t.txt")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertIn("t.txt", str(ctx.exception))
+        # The specific damage: the test input must never reach `dest`.
+        self.assertFalse(dest.exists(), dest)
+
+    def test_file_io_staged_input_is_readable_under_a_strict_umask(self):
+        # Review finding: `run()` grants the real test file the "other" read
+        # bit the mapped subuid needs (`_ensure_sandbox_readable`), and
+        # `shutil.copyfile` recreates the staged copy at `0666 & ~umask`,
+        # throwing that heal away. At umask 077 the sandbox could not open
+        # its own input and the failure surfaced as isolate `status:XX`
+        # ("Permission denied") — i.e. the driver blaming isolate for a
+        # permission bit it set itself, on every file-IO run, for anyone
+        # with a hardened umask.
+        #
+        # The umask is set only around the `_run_once` call: the binary and
+        # the test file are created before it (as `run()` would, already
+        # healed), so the only file this window affects is the staged copy.
+        binary = _compile(
+            '#include <cstdio>\n'
+            'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+            '  int a, b; if (fscanf(fi, "%d %d", &a, &b) != 2) return 4;\n'
+            '  fclose(fi);\n'
+            '  FILE *fo = fopen("t.out", "w"); if (!fo) return 5;\n'
+            '  fprintf(fo, "%d\\n", a + b); fclose(fo); return 0; }\n',
+            self.tmp / "umask_io", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        run_matrix._ensure_sandbox_readable(test_in)
+        dest = self.tmp / "01.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        previous_umask = os.umask(0o077)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            os.umask(previous_umask)
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.crashed, r)
+        self.assertFalse(r.no_output, r)
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
+
+    def test_file_io_unreadable_output_is_a_matrix_error_not_a_bare_oserror(self):
+        # The other permission direction, and the other half of the same
+        # review finding. The solution owns its output file, so it can leave
+        # it -rw------- under the sandbox's subuid; we own only the staging
+        # directory, so we can neither read nor chmod it. Left bare, the
+        # PermissionError escaped `_run_once` and aborted the whole matrix
+        # mid-run on one careless solution (R1: no bare stdlib exception on
+        # solution-controlled state). It must NOT be reported as
+        # `no_output`: "unreadable" and "never written" are different facts.
+        binary = _compile(
+            '#include <cstdio>\n#include <sys/stat.h>\n'
+            'int main(){ umask(077);\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "hidden\\n"); fclose(f); return 0; }\n',
+            self.tmp / "secretive", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "secret.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        message = str(ctx.exception)
+        self.assertIn("t.out", message)          # names the file
+        self.assertIn("secretive", message)      # names the solution
+        self.assertIn("not readable", message)   # not "produced no output"
+
     def test_stdin_mode_is_unchanged(self):
         # The default path must behave exactly as before: this test passes
         # both before and after the file-IO change, and is here so that a

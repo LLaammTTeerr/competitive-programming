@@ -372,6 +372,26 @@ def load(path: str | Path) -> Problem:
         raise ProblemMetaError(f"{path}: missing required field in checker {exc}") from exc
     checker_name = _string(checker_name, path, "checker.name")
 
+    io_input = _io_name(io.get("input", "stdin"), path, "io.input",
+                        literal="stdin")
+    io_output = _io_name(io.get("output", "stdout"), path, "io.output",
+                         literal="stdout")
+    # Cross-field, so it cannot live in `_io_name` (which sees one value at a
+    # time). Measured, not theorised: with both names equal, `run_matrix`
+    # stages the test input under that name into the sandbox's working
+    # directory and then reads the *same* file back as the solution's answer,
+    # so a solution that writes nothing at all has the test input handed to
+    # the checker as its output. That is a silently confident wrong verdict —
+    # the one failure class this pipeline exists to prevent — and the
+    # sentinels cannot collide ("stdin" != "stdout"), so this only ever fires
+    # on a genuine file-IO mistake.
+    if io_input == io_output:
+        raise ProblemMetaError(
+            f"{path}: io.input and io.output are both {io_input!r} — the "
+            "solution would write its answer over the file it read the test "
+            "from, and a solution that wrote nothing would have the test "
+            "input itself checked as its answer. Give them different names.")
+
     return Problem(
         name=name,
         title=_object(raw.get("title", {}), path, "'title'"),
@@ -380,8 +400,8 @@ def load(path: str | Path) -> Problem:
         time_ms_computed=_integer(limits.get("time_ms_computed"), path,
                                   "limits.time_ms_computed", allow_none=True),
         memory_mb=memory_mb,
-        input=_io_name(io.get("input", "stdin"), path, "io.input", literal="stdin"),
-        output=_io_name(io.get("output", "stdout"), path, "io.output", literal="stdout"),
+        input=io_input,
+        output=io_output,
         checker_kind=checker_kind,
         checker_name=checker_name,
         constraints=constraints,
