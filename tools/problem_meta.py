@@ -146,6 +146,30 @@ def _string(value, path: Path, what: str) -> str:
     return value
 
 
+def _io_name(value, path: Path, what: str, *, literal: str) -> str:
+    """Validate an `io.input`/`io.output` value.
+
+    Either the exact sentinel (`"stdin"`/`"stdout"`) or a bare filename.
+    This value later drives an isolate `--dir` mount and a filename join
+    (Stage 3's file-IO support), so a path separator or a dot-segment is a
+    sandbox escape, not a style problem, and must be rejected here — before
+    it ever reaches those consumers — rather than trusted as free text.
+    """
+    name = _string(value, path, what)
+    if name == literal:
+        return name
+    if not name:
+        raise ProblemMetaError(f"{path}: {what} must not be empty")
+    if "/" in name or "\\" in name or "\0" in name:
+        raise ProblemMetaError(
+            f"{path}: {what} must be a bare filename with no path "
+            f"separator, got {name!r}")
+    if name in (".", "..") or name.startswith("../") or name.startswith("./"):
+        raise ProblemMetaError(
+            f"{path}: {what} must not contain a path segment, got {name!r}")
+    return name
+
+
 def _integer(value, path: Path, what: str, *, allow_none: bool = False):
     """`value` as a Python int, or `ProblemMetaError` naming what was found.
 
@@ -356,8 +380,8 @@ def load(path: str | Path) -> Problem:
         time_ms_computed=_integer(limits.get("time_ms_computed"), path,
                                   "limits.time_ms_computed", allow_none=True),
         memory_mb=memory_mb,
-        input=io.get("input", "stdin"),
-        output=io.get("output", "stdout"),
+        input=_io_name(io.get("input", "stdin"), path, "io.input", literal="stdin"),
+        output=_io_name(io.get("output", "stdout"), path, "io.output", literal="stdout"),
         checker_kind=checker_kind,
         checker_name=checker_name,
         constraints=constraints,

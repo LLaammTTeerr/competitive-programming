@@ -5,6 +5,10 @@ from pathlib import Path
 
 from tools.problem_meta import ProblemMetaError, load
 
+# Anchored to this file, not to the process's working directory — see
+# test_run_matrix.py / test_package_status.py, which document why.
+FIXTURE = Path(__file__).parent / "fixtures" / "mini"
+
 VALID = {
     "schema": 1,
     "name": "flight",
@@ -331,6 +335,51 @@ class TestRejectsCycles(unittest.TestCase):
         ]
         problem = load(write(ok))
         self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3", "g4"])
+
+
+class TestIoValidation(unittest.TestCase):
+    """`io.input`/`io.output` reach an isolate `--dir` mount and a filename
+    join later in the pipeline, so a path separator or a dot-segment is a
+    sandbox escape, not a style nit — these must never load."""
+
+    def _load_with_io(self, io):
+        problem = json.loads((FIXTURE / "problem.json").read_text(encoding="utf-8"))
+        problem["io"] = io
+        tmp = Path(tempfile.mkdtemp()) / "problem.json"
+        tmp.write_text(json.dumps(problem), encoding="utf-8")
+        return load(tmp)
+
+    def test_io_input_rejects_path_separator(self):
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "sub/dir.inp", "output": "x.out"})
+        self.assertIn("io.input", str(ctx.exception))
+
+    def test_io_output_rejects_dot_segment(self):
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "x.inp", "output": "../escape.out"})
+        self.assertIn("io.output", str(ctx.exception))
+
+    def test_io_input_rejects_bare_dot_segment(self):
+        # No "/" at all — this is the one case the separator check does not
+        # already catch, so it is the only test that actually exercises the
+        # dot-segment branch rather than the separator branch.
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "..", "output": "x.out"})
+        self.assertIn("io.input", str(ctx.exception))
+
+    def test_io_rejects_non_string(self):
+        with self.assertRaises(ProblemMetaError):
+            self._load_with_io({"input": 5, "output": "x.out"})
+
+    def test_io_rejects_empty_string(self):
+        with self.assertRaises(ProblemMetaError):
+            self._load_with_io({"input": "", "output": "x.out"})
+
+    def test_io_accepts_stdin_stdout_and_bare_filenames(self):
+        p = self._load_with_io({"input": "stdin", "output": "stdout"})
+        self.assertEqual((p.input, p.output), ("stdin", "stdout"))
+        p = self._load_with_io({"input": "flight.inp", "output": "flight.out"})
+        self.assertEqual((p.input, p.output), ("flight.inp", "flight.out"))
 
 
 if __name__ == "__main__":
