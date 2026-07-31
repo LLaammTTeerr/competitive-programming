@@ -24,6 +24,7 @@ from pathlib import Path
 
 from tools import run_matrix
 from tools.matrix_core import _SEVERITY
+from tools.package_status import PHASE_ORDER
 from tools.scan_solutions import VERDICTS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,9 +46,26 @@ RECIPE_MARKERS = {
 DUPLICATED_IN = ("preparing-tests", "reviewing-problems")
 
 
+def skill_text(skill: str) -> str:
+    return (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+
+
+def flatten(text: str) -> str:
+    """Collapse every run of whitespace to one space.
+
+    These files are hard-wrapped at ~76 columns, so any phrase long enough to
+    be worth pinning is split across a newline. Matching raw text would make a
+    test pass or fail on where a paragraph happened to wrap.
+    """
+    return re.sub(r"\s+", " ", text)
+
+
+def skill_dirs() -> set[str]:
+    return {p.name for p in SKILLS.iterdir() if (p / "SKILL.md").is_file()}
+
+
 def bash_blocks(skill: str) -> list[str]:
-    path = SKILLS / skill / "SKILL.md"
-    text = path.read_text(encoding="utf-8")
+    text = skill_text(skill)
     return [m.group("body") for m in _FENCE.finditer(text)
             if m.group("lang") == "bash"]
 
@@ -223,6 +241,181 @@ class TestFileIOProseMatchesTheDriver(unittest.TestCase):
         # solution can earn on its own merits.
         self.assertEqual(_SEVERITY[:2], ["FAIL", "NO_OUTPUT"], _SEVERITY)
         self.assertIn("NO_OUTPUT", self.text("validating-solutions"))
+
+
+class TestWritingStatementsRoutingTable(unittest.TestCase):
+    """The routing table `writing-statements` carries, pinned to the things
+    outside it that it names.
+
+    That file spent two stages as the terminus of every "the prose belongs
+    elsewhere" row in the other skills' boundary tables, with no table of its
+    own and no statement of where control went next. The table it now carries
+    names sibling skills and `PHASE_ORDER` phases — both of which live in
+    other files and can be renamed by someone who never opens this one. A
+    table naming a skill that cannot be loaded is worse than no table at all:
+    a router that finds nothing falls back to asking, while a router handed a
+    dead name follows it.
+
+    Every assertion below reads the filesystem or imports from
+    `package_status`, so it fails on a rename rather than on a second copy of
+    the same prose kept in this file.
+    """
+
+    SKILL = "writing-statements"
+    SECTIONS = ("## Am I the right skill?", "## Two passes, and where each one exits")
+
+    # Named in the `Use` column of the boundary table.
+    TABLE_NEIGHBOURS = ("shaping-problems", "preparing-tests",
+                        "reviewing-problems", "creating-problems",
+                        "solving-problems")
+    # Named in the routing prose but not offered as a pre-load alternative.
+    ALSO_REFERENCED = ("validating-solutions",)
+
+    # Phases the exit prose names, in the order it claims they run.
+    CLAIMED_PHASE_ORDER = ("statement", "constraints_header", "model_solution")
+
+    def body(self) -> str:
+        text = skill_text(self.SKILL)
+        # Extractor guard: an empty or truncated read would make several
+        # assertions below trivially pass.
+        self.assertGreater(len(text), 4000,
+                           f"{self.SKILL}/SKILL.md read back nearly empty")
+        return text
+
+    def section(self, heading: str) -> str:
+        text = self.body()
+        start = text.find(heading)
+        self.assertNotEqual(start, -1, f"{self.SKILL} has no {heading!r} section")
+        end = text.find("\n## ", start + len(heading))
+        return text[start:end if end != -1 else len(text)]
+
+    def use_cells(self) -> list[str]:
+        """The right-hand column of the boundary table, header and rule
+        dropped."""
+        rows = []
+        for line in self.section(self.SECTIONS[0]).splitlines():
+            line = line.strip()
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) != 2 or set(cells[0]) <= set("-: "):
+                continue
+            if cells == ["If it's really about", "Use"]:
+                continue
+            rows.append(cells[1])
+        return rows
+
+    def test_the_boundary_table_parses_into_rows(self):
+        # Guard for every table assertion below: a heading with no table
+        # under it, or a parser that matched nothing, would make them vacuous.
+        self.assertGreaterEqual(
+            len(self.use_cells()), 4,
+            f"{self.SKILL}'s boundary table did not parse into rows — either "
+            f"the table was removed or its shape changed")
+
+    def test_every_use_cell_names_a_skill_that_exists_on_disk(self):
+        real = skill_dirs()
+        for cell in self.use_cells():
+            names = re.findall(r"competitive-programming:([a-z][a-z-]*)", cell)
+            with self.subTest(row=cell):
+                self.assertTrue(
+                    names,
+                    f"{self.SKILL}: boundary table row routes somewhere "
+                    f"unnamed — every `Use` cell must name a "
+                    f"`competitive-programming:<skill>` destination")
+                for name in names:
+                    self.assertIn(
+                        name, real,
+                        f"{self.SKILL}'s boundary table routes to "
+                        f"{name!r}, which is not a skill directory. Skills "
+                        f"on disk: {sorted(real)}")
+
+    def test_the_table_offers_every_neighbour_a_statement_request_can_mean(self):
+        cells = " ".join(self.use_cells())
+        real = skill_dirs()
+        for name in self.TABLE_NEIGHBOURS:
+            with self.subTest(neighbour=name):
+                self.assertIn(name, real,
+                              f"{name} is no longer a skill directory — the "
+                              f"routing table and this list both need updating")
+                self.assertIn(f"competitive-programming:{name}", cells,
+                              f"{self.SKILL}'s boundary table dropped the row "
+                              f"routing to {name}")
+
+    def test_no_stale_skill_name_survives_anywhere_in_the_file(self):
+        # Bare backticked names in the exit prose (`preparing-tests`,
+        # `solving-problems`, ...) are not caught by the table check above.
+        # A token shaped like one of this plugin's skill names must be one:
+        # `sol-main`, `gen-max`, `ff-only` and `kitchen-sink` do not match,
+        # because their prefixes are not skill-name prefixes.
+        real = skill_dirs()
+        prefixes = {name.split("-")[0] for name in real}
+        shaped = re.compile(r"`((?:%s)-[a-z]+)`" % "|".join(sorted(prefixes)))
+        found = set(shaped.findall(self.body()))
+        self.assertTrue(found, f"{self.SKILL} names no sibling skill at all")
+        for name in sorted(found):
+            with self.subTest(reference=name):
+                self.assertIn(name, real,
+                              f"{self.SKILL} refers to `{name}`, which is not "
+                              f"a skill directory")
+
+    def test_every_referenced_skill_is_loadable(self):
+        real = skill_dirs()
+        text = self.body()
+        for name in self.TABLE_NEIGHBOURS + self.ALSO_REFERENCED:
+            with self.subTest(skill=name):
+                self.assertIn(name, real, f"{name} is not a skill directory")
+                self.assertIn(f"`{name}`", text,
+                              f"{self.SKILL} no longer names {name}, which its "
+                              f"routing depends on")
+
+    def test_the_exit_prose_names_phases_the_driver_actually_has(self):
+        prose = self.section(self.SECTIONS[1])
+        for phase in self.CLAIMED_PHASE_ORDER + ("samples",):
+            with self.subTest(phase=phase):
+                self.assertIn(phase, PHASE_ORDER,
+                              f"{phase!r} left package_status.PHASE_ORDER")
+                self.assertIn(f"`{phase}`", prose,
+                              f"{self.SKILL}'s exit prose no longer names the "
+                              f"{phase!r} phase")
+
+    def test_the_claimed_phase_sequence_matches_PHASE_ORDER(self):
+        # The exact failure this branch has already shipped once: a skill
+        # enumerating the phases in an order the driver does not use. The
+        # prose claims statement -> constraints_header -> model_solution, and
+        # that `samples` is the pipeline's last phase.
+        indices = [PHASE_ORDER.index(p) for p in self.CLAIMED_PHASE_ORDER]
+        self.assertEqual(
+            indices, sorted(indices),
+            f"{self.SKILL} claims the phases run in the order "
+            f"{self.CLAIMED_PHASE_ORDER}, but PHASE_ORDER is {PHASE_ORDER}")
+        self.assertEqual(
+            PHASE_ORDER[-1], "samples",
+            f"{self.SKILL} says the samples pass is the last phase before the "
+            f"audit; PHASE_ORDER now ends with {PHASE_ORDER[-1]!r}")
+
+    def test_the_statement_ambiguity_stop_is_not_reopened(self):
+        # Stage 2 shipped `creating-problems` drawing this as a STOP while
+        # `validating-solutions` routed onward to `writing-statements` and
+        # kept going. All four documents must keep saying the same thing, and
+        # the newest one is the one pointed at.
+        agree = {
+            "writing-statements":
+                "is a STOP, and it does not route here",
+            "validating-solutions":
+                "Do **not** hand off to `writing-statements` and carry on "
+                "validating",
+            "reviewing-problems": "## The one hard stop",
+            "creating-problems": "STOP: unresolvable HIGH",
+        }
+        for skill, claim in agree.items():
+            with self.subTest(skill=skill):
+                self.assertIn(
+                    claim, flatten(skill_text(skill)),
+                    f"{skill} no longer states the unresolvable HIGH "
+                    f"statement-ambiguity stop the same way the other three "
+                    f"do. This single edge is what the gate model hangs on — "
+                    f"fix the disagreement, do not relax this test.")
 
 
 if __name__ == "__main__":
