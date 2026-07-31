@@ -151,9 +151,13 @@ class TestFileIOProseMatchesTheDriver(unittest.TestCase):
     # Sentences that were true before file IO landed and are false now. They
     # are listed literally, because the failure mode being guarded is a
     # revert or a copy-paste from an old draft, not a paraphrase.
+    # Each one is the phrase as it actually stood, not a shortened key: the
+    # substring `"rejected loudly by"` on its own also matches a future
+    # document legitimately writing "rejected loudly by the validator", and a
+    # guard that fires on true sentences gets deleted rather than obeyed.
     RETIRED_CLAIMS = (
         "Only stdin/stdout problems are supported",
-        "rejected loudly by",
+        "rejected loudly by `run_matrix",
         "the file-IO guard",
         "it is a later feature, not a silent partial mode",
     )
@@ -168,15 +172,25 @@ class TestFileIOProseMatchesTheDriver(unittest.TestCase):
         return body
 
     def test_no_document_still_claims_file_io_is_rejected(self):
+        # Matched against `flat`, not `text`: these documents are hard-wrapped
+        # at ~76 columns, and the claims above are long enough that the
+        # originals were split across a newline in both skills that carried
+        # them — so a raw match would silently stop catching them the moment a
+        # phrase got specific enough to be worth pinning.
         for name in self.DOCUMENTS:
-            body = self.text(name)
+            body = self.flat(name)
             for claim in self.RETIRED_CLAIMS:
                 with self.subTest(document=name, claim=claim):
-                    self.assertNotIn(
-                        claim, body,
-                        f"{name} still carries a pre-file-IO claim. "
-                        f"run_matrix.run() accepts file-IO problems — the "
-                        f"refusal it describes was deleted.")
+                    # `assertTrue`, not `assertNotIn`: unittest renders the
+                    # container in an assertIn/assertNotIn failure with no
+                    # length cap, and these containers are whole normalized
+                    # documents (~10 KB of noise around the one fact that
+                    # matters, which is the claim named here).
+                    self.assertTrue(
+                        claim not in body,
+                        f"{name} still carries a pre-file-IO claim "
+                        f"{claim!r}. run_matrix.run() accepts file-IO "
+                        f"problems — the refusal it describes was deleted.")
 
     def flat(self, name: str) -> str:
         """`text`, with every run of whitespace collapsed to one space.
@@ -201,8 +215,12 @@ class TestFileIOProseMatchesTheDriver(unittest.TestCase):
             body = self.flat(name)
             for phrase in required:
                 with self.subTest(document=name, phrase=phrase):
-                    self.assertIn(
-                        phrase, body,
+                    # `assertTrue`, not `assertIn` — see above: `assertIn`
+                    # would print the whole ~10 KB normalized document into
+                    # the failure, burying the one line that says what is
+                    # wrong and which file to open.
+                    self.assertTrue(
+                        phrase in body,
                         f"{name} describes file IO without saying that "
                         f"{phrase!r} — the question every setter asks first.")
 
@@ -271,29 +289,39 @@ class TestWritingStatementsRoutingTable(unittest.TestCase):
     # Named in the routing prose but not offered as a pre-load alternative.
     ALSO_REFERENCED = ("validating-solutions",)
 
+    # The reciprocal direction. "check my statement" appears verbatim in
+    # `reviewing-problems`' own description, so a router can land there for a
+    # request that means `writing-statements` — and mediating the collision
+    # from one side only leaves the other side with no prompt to ask at all.
+    # `(skill, boundary-table heading)`.
+    RECIPROCAL = ("reviewing-problems", "## Am I the right skill?")
+
     # Phases the exit prose names, in the order it claims they run.
     CLAIMED_PHASE_ORDER = ("statement", "constraints_header", "model_solution")
 
-    def body(self) -> str:
-        text = skill_text(self.SKILL)
+    def body(self, skill: str | None = None) -> str:
+        skill = skill or self.SKILL
+        text = skill_text(skill)
         # Extractor guard: an empty or truncated read would make several
         # assertions below trivially pass.
         self.assertGreater(len(text), 4000,
-                           f"{self.SKILL}/SKILL.md read back nearly empty")
+                           f"{skill}/SKILL.md read back nearly empty")
         return text
 
-    def section(self, heading: str) -> str:
-        text = self.body()
+    def section(self, heading: str, skill: str | None = None) -> str:
+        skill = skill or self.SKILL
+        text = self.body(skill)
         start = text.find(heading)
-        self.assertNotEqual(start, -1, f"{self.SKILL} has no {heading!r} section")
+        self.assertNotEqual(start, -1, f"{skill} has no {heading!r} section")
         end = text.find("\n## ", start + len(heading))
         return text[start:end if end != -1 else len(text)]
 
-    def use_cells(self) -> list[str]:
+    def use_cells(self, skill: str | None = None,
+                  heading: str | None = None) -> list[str]:
         """The right-hand column of the boundary table, header and rule
         dropped."""
         rows = []
-        for line in self.section(self.SECTIONS[0]).splitlines():
+        for line in self.section(heading or self.SECTIONS[0], skill).splitlines():
             line = line.strip()
             if not line.startswith("|"):
                 continue
@@ -341,6 +369,29 @@ class TestWritingStatementsRoutingTable(unittest.TestCase):
                 self.assertIn(f"competitive-programming:{name}", cells,
                               f"{self.SKILL}'s boundary table dropped the row "
                               f"routing to {name}")
+
+        # And the same offer, back the other way. `reviewing-problems` claims
+        # "check my statement" verbatim in its own description, so it is a
+        # live destination for a request that means this skill; a router that
+        # lands there must be prompted to ask, exactly as one that lands here
+        # is prompted about `reviewing-problems`. The fix for that collision
+        # shipped in one direction only, and nothing was watching the other.
+        back_skill, back_heading = self.RECIPROCAL
+        self.assertIn(back_skill, real,
+                      f"{back_skill} is no longer a skill directory")
+        back_rows = self.use_cells(back_skill, back_heading)
+        # Same vacuity guard as `test_the_boundary_table_parses_into_rows`:
+        # a heading with no table under it must not pass silently.
+        self.assertGreaterEqual(
+            len(back_rows), 3,
+            f"{back_skill}'s boundary table under {back_heading!r} did not "
+            f"parse into rows — the table was removed or its shape changed")
+        self.assertIn(
+            f"competitive-programming:{self.SKILL}", " ".join(back_rows),
+            f"{back_skill}'s boundary table has no row routing back to "
+            f"{self.SKILL}, so the 'check my statement' collision — which "
+            f"{back_skill}'s own description claims verbatim — is mediated "
+            f"in one direction only")
 
     def test_no_stale_skill_name_survives_anywhere_in_the_file(self):
         # Bare backticked names in the exit prose (`preparing-tests`,

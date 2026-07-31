@@ -598,6 +598,17 @@ def close_isolate_box(handle: IsolateHandle) -> None:
     # (verified: see module docstring / task report). ignore_errors so a
     # teardown problem here still cannot mask a real error propagating.
     shutil.rmtree(handle.stage_dir, ignore_errors=True)
+    # ...but `ignore_errors=True` used to mean the one case that survives —
+    # a foreign-owned *subdirectory* whose contents this uid cannot unlink —
+    # was left on disk with the user told nothing at all. It is not
+    # removable without root, so silence means someone finds it weeks later
+    # and cannot explain it. Say so, on stderr, naming the path; still no
+    # raise, so a teardown problem cannot mask a real error propagating.
+    if handle.stage_dir.exists():
+        print(f"WARNING: could not remove the sandbox staging directory "
+              f"{handle.stage_dir} — it holds something created inside the "
+              f"sandbox that this user cannot delete. Remove it as root: "
+              f"sudo rm -rf {handle.stage_dir}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +746,55 @@ def _clear_stage_dir(stage_dir: Path) -> None:
                 "of it would let that run's leftovers decide this run's "
                 "verdict."
             ) from exc
+
+
+def _refuse_irregular_output(st: os.stat_result, source: Path, binary: Path,
+                             stdin_path: Path) -> None:
+    """Refuse to read the solution's output file unless it is a regular file.
+
+    Only reachable in file-IO mode, and that is the whole point: in stdin
+    mode `staged_out` is created by isolate itself, so nothing a solution
+    does can decide what kind of filesystem object sits at that name. File
+    IO handed the solution that choice, and `Path.read_bytes()` then does
+    whatever the solution picked — as **this driver's own uid, outside the
+    sandbox**, on a path the sandbox merely named. Two shapes, both measured
+    rather than theorised:
+
+    * `symlink("/etc/hostname", "t.out")` and exit 0. `read_bytes()` follows
+      it and returns the host file, which is then handed to the checker as
+      the solution's answer — and in pass 1 written into the jury's `.a`
+      answer key. Any file readable by the user running this pipeline is in
+      range; the sandbox's own confinement is irrelevant, because the read
+      does not happen inside it. Hence `os.lstat` at the call site, never
+      `os.stat`: following the link to discover it is a regular file is
+      exactly the bug.
+    * `mkfifo("t.out")` and exit 0. `read_bytes()` blocks on open forever.
+      Nothing times this read out, so the whole matrix hangs — and it hangs
+      *inside* the `try`, so `_run_once`'s `finally` never runs and the box
+      leaks too.
+
+    A directory is the third shape and needs no separate argument: it is
+    simply not something a solution's output may be.
+
+    This is the same family as the `PermissionError` case the branch already
+    closed — solution-controlled state reaching a bare stdlib call — and it
+    is refused the same way, with a `MatrixError` rather than by folding
+    into `no_output`. A solution that substituted a pipe for its output is
+    not a solution that produced no output, and reporting it as one would be
+    a confidently wrong verdict of exactly the kind this driver exists to
+    avoid.
+    """
+    if stat.S_ISREG(st.st_mode):
+        return
+    raise MatrixError(
+        f"the output file {source} that {binary} produced on {stdin_path} is "
+        f"not a regular file ({stat.filemode(st.st_mode)}) — a solution may "
+        "not substitute a symlink, FIFO, socket, device or directory for its "
+        "output. Reading one would either hand this driver's own view of the "
+        "filesystem to the checker as the solution's answer, or block "
+        "forever. That is not the same as producing no output at all, so it "
+        "is reported rather than judged."
+    )
 
 
 def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
@@ -888,12 +948,21 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                 mounts[resolved] = f"/host{len(mounts)}"
             return mounts[resolved]
 
+        file_io = io_input != "stdin" or io_output != "stdout"
+
         bin_label = _label(binary.parent)
-        stdin_label = _label(stdin_path.parent)
+        # The test directory is mounted ONLY in stdin mode, where `--stdin`
+        # has to name a path inside the box. In file-IO mode `--stdin` points
+        # at the staged copy (`{stage_label}/{staged_in.name}`) and this
+        # mount is referenced nowhere — dead weight that also handed the
+        # solution a readable `01.a` next to every `01.in`, i.e. the jury's
+        # answers. That exposure is not new (stdin mode has always mounted
+        # this directory, and still must), but in file-IO mode nothing is
+        # bought by it, so it goes.
+        stdin_label = _label(stdin_path.parent) if not file_io else None
         stage_label = _label(isolate.stage_dir)
         stage_dir_resolved = isolate.stage_dir.resolve()
 
-        file_io = io_input != "stdin" or io_output != "stdout"
         if file_io and io_input == io_output:
             # `problem_meta` refuses this at load time; this is the same
             # check at the point of use, because `_run_once` is also called
@@ -1008,34 +1077,40 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         # docstring above).
         source = staged_result if file_io else staged_out
         try:
-            data = source.read_bytes()
-            no_output = False
+            # `lstat`, never `stat`: this asks what the *solution* left at
+            # that name, and following a symlink is precisely the thing being
+            # refused two branches down.
+            source_st = os.lstat(source)
         except FileNotFoundError:
             # In file-IO mode this is the reportable outcome `no_output`; in
             # stdin mode isolate always created the file, so an absent one
             # is not a fact about the solution and stays unreported.
-            data = b""
-            no_output = file_io
-        except OSError as exc:
-            # The file exists but this process cannot read it — reachable in
-            # file-IO mode because the *solution* owns that file: a
-            # `umask(077)` in the solution leaves it `-rw-------` under the
-            # sandbox's subuid, which is neither our uid nor our group, and
-            # we own only the directory, so we cannot even chmod it. Left
-            # bare this escaped `_run_once` as `PermissionError` and took
-            # the whole matrix down mid-run on one careless solution.
-            # Deliberately NOT folded into `no_output`: "we could not read
-            # it" and "it was never written" are different facts about the
-            # solution, and conflating them is how this project has produced
-            # wrong verdicts before.
-            raise MatrixError(
-                f"could not read the output file {source} that {binary} "
-                f"produced on {stdin_path}: {exc} — the file exists but is "
-                "not readable by this process (a solution that restricts "
-                "its own output's permissions, e.g. umask(077), does this). "
-                "That is not the same as producing no output at all, so it "
-                "is reported rather than judged."
-            ) from exc
+            data, no_output = b"", file_io
+        else:
+            _refuse_irregular_output(source_st, source, binary, stdin_path)
+            try:
+                data, no_output = source.read_bytes(), False
+            except OSError as exc:
+                # The file exists but this process cannot read it — reachable
+                # in file-IO mode because the *solution* owns that file: a
+                # `umask(077)` in the solution leaves it `-rw-------` under
+                # the sandbox's subuid, which is neither our uid nor our
+                # group, and we own only the directory, so we cannot even
+                # chmod it. Left bare this escaped `_run_once` as
+                # `PermissionError` and took the whole matrix down mid-run on
+                # one careless solution. Deliberately NOT folded into
+                # `no_output`: "we could not read it" and "it was never
+                # written" are different facts about the solution, and
+                # conflating them is how this project has produced wrong
+                # verdicts before.
+                raise MatrixError(
+                    f"could not read the output file {source} that {binary} "
+                    f"produced on {stdin_path}: {exc} — the file exists but is "
+                    "not readable by this process (a solution that restricts "
+                    "its own output's permissions, e.g. umask(077), does this). "
+                    "That is not the same as producing no output at all, so it "
+                    "is reported rather than judged."
+                ) from exc
         stdout_dest.unlink(missing_ok=True)
         stdout_dest.write_bytes(data)
         staged_out.unlink(missing_ok=True)

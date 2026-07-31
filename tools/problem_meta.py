@@ -392,6 +392,35 @@ def load(path: str | Path) -> Problem:
             "from, and a solution that wrote nothing would have the test "
             "input itself checked as its answer. Give them different names.")
 
+    # The other cross-field property, and the other half of the same
+    # neighbourhood: the two sentinels are a *pair*. `run_matrix` decides
+    # between its two IO modes with a single OR (`io.input != "stdin" or
+    # io.output != "stdout"`), so `{"input": "prob.inp", "output": "stdout"}`
+    # runs the whole package in file-IO mode with `"stdout"` reinterpreted as
+    # a literal filename no solution will ever create. Every solution then
+    # comes back NO_OUTPUT and pass 1 aborts — loud, but the diagnostic talks
+    # about a missing file called `stdout` rather than about a half-converted
+    # `io` block, which is the actual mistake. Mixed IO is not a mode this
+    # pipeline supports; refusing it here, before anything is compiled, is
+    # cheaper than explaining it later.
+    stdin_sentinel = io_input == "stdin"
+    stdout_sentinel = io_output == "stdout"
+    if stdin_sentinel != stdout_sentinel:
+        # The field still holding a sentinel is the one that gets
+        # reinterpreted, because the OR has already switched the whole run
+        # into file-IO mode around it.
+        stranded = "io.input" if stdin_sentinel else "io.output"
+        raise ProblemMetaError(
+            f"{path}: io.input is {io_input!r} and io.output is "
+            f"{io_output!r} — mixed IO is not supported. A problem either "
+            'reads stdin and writes stdout ({"input": "stdin", "output": '
+            '"stdout"}) or reads and writes two named files ({"input": '
+            '"prob.inp", "output": "prob.out"}); there is no mode where one '
+            f"side is a sentinel and the other is a filename. As written, "
+            f"{stranded} would be treated as a literal filename, and every "
+            "solution would be judged against a file no solution writes. "
+            "This is a half-converted io block, not a filename problem.")
+
     return Problem(
         name=name,
         title=_object(raw.get("title", {}), path, "'title'"),

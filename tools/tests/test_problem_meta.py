@@ -388,6 +388,32 @@ class TestIoValidation(unittest.TestCase):
         self.assertIn("io.output", message)
         self.assertIn("t.txt", message)
 
+    def test_io_rejects_one_sentinel_and_one_filename(self):
+        # The other cross-field property. `run_matrix` picks its IO mode with
+        # a single OR (`io.input != "stdin" or io.output != "stdout"`), so a
+        # half-converted `io` block runs the entire package in file-IO mode
+        # with the surviving sentinel reinterpreted as a literal filename no
+        # solution will ever open or create. Every solution then comes back
+        # NO_OUTPUT and pass 1 aborts — loud, but with a diagnostic about a
+        # missing file called `stdout` rather than about the `io` block,
+        # which is where the mistake actually is. Refused at load time, in
+        # the same place as `input == output` and for the same reason: it is
+        # a property of the pair, not of either name.
+        for io, stranded in (({"input": "prob.inp", "output": "stdout"}, "io.output"),
+                             ({"input": "stdin", "output": "prob.out"}, "io.input")):
+            with self.subTest(io=io):
+                with self.assertRaises(ProblemMetaError) as ctx:
+                    self._load_with_io(io)
+                message = str(ctx.exception)
+                self.assertIn("io.input", message)
+                self.assertIn("io.output", message)
+                self.assertIn("mixed IO", message)
+                # It must name the side that gets reinterpreted — that is the
+                # whole difference between this message and the one the
+                # driver used to produce.
+                self.assertIn(f"As written, {stranded} would be treated as a "
+                              f"literal filename", message)
+
     def test_io_accepts_stdin_stdout_and_bare_filenames(self):
         p = self._load_with_io({"input": "stdin", "output": "stdout"})
         self.assertEqual((p.input, p.output), ("stdin", "stdout"))

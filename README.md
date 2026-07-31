@@ -77,7 +77,6 @@ unsandboxed. Generators, validators and checkers are not sandboxed; nothing in
 `tools/` executes a generator at all. This is a one-time machine setup, not a
 per-problem one:
 
-
 ```bash
 sudo apt install build-essential pkg-config libcap-dev libseccomp-dev libsystemd-dev
 git clone https://github.com/ioi/isolate.git && cd isolate

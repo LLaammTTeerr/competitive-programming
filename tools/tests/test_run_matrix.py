@@ -37,9 +37,12 @@ a message about staging rather than about the thing under test.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -1138,6 +1141,437 @@ class TestRunMatrixFixture(unittest.TestCase):
 
         self.assertFalse(r.crashed, r)
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "15")
+
+    # ------------------------------------------------------------------
+    # What the solution may leave at `io.output`. File IO handed the
+    # *solution* the choice of what kind of filesystem object sits at that
+    # name, and the driver then reads it as its own uid, OUTSIDE the
+    # sandbox. In stdin mode this surface does not exist at all: isolate
+    # creates `run.out` itself. All three shapes below must be reported
+    # (`MatrixError`), never read, never hung on, and never folded into
+    # `no_output` — "the solution substituted a pipe for its output" is not
+    # "the solution produced no output".
+    # ------------------------------------------------------------------
+
+    def test_file_io_symlinked_output_is_refused_instead_of_read(self):
+        # The exfiltration half. `symlink(<any absolute path>, "t.out")`
+        # needs no mount and no privilege — the sandbox only has to create
+        # the link; the *driver* is what dereferences it, running as the
+        # user who started the pipeline, with that user's whole filesystem
+        # in range. Whatever came back was handed to the checker as this
+        # solution's answer, and on the model solution's pass 1 it was
+        # written into the jury's `.a` answer key.
+        #
+        # The target here is a file next to the tests, standing in for a
+        # jury answer, with a marker that must never reach `dest`.
+        secret = self.tmp / "jury-answer.a"
+        secret.write_text("JURY-ANSWER-42\n", encoding="utf-8")
+        binary = _compile(
+            "#include <unistd.h>\n"
+            "int main(){ if (symlink(\"%s\", \"t.out\") != 0) return 6;\n"
+            "  return 0; }\n" % secret,
+            self.tmp / "symlinker", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "sym.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        message = str(ctx.exception)
+        self.assertIn("t.out", message)                 # names the file
+        self.assertIn("symlinker", message)             # names the solution
+        self.assertIn("not a regular file", message)
+        # The damage the guard exists to prevent: the target's contents must
+        # not have been read, and above all must not have reached the file
+        # the checker (and, in pass 1, the answer key) is built from.
+        self.assertFalse(dest.exists(), dest)
+
+    def test_file_io_fifo_output_does_not_hang_the_driver(self):
+        # The denial-of-service half, and the reason the guard cannot be a
+        # `try: read / except: report`: `open()` on a FIFO with no writer
+        # blocks forever. Nothing times that read out, it sits *inside*
+        # `_run_once`'s `try`, so the `finally` never runs and the box leaks
+        # on top of the hang. SIGALRM below is the regression signal: a
+        # driver that goes back to reading blindly fails this test in 30
+        # seconds instead of wedging CI until someone kills it.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n"
+            'int main(){ if (mkfifo("t.out", 0666) != 0) return 6;\n'
+            "  return 0; }\n",
+            self.tmp / "fifomaker", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "fifo.produced"
+
+        def _too_slow(signum, frame):
+            raise TimeoutError(
+                "_run_once blocked reading the solution's FIFO — the "
+                "regular-file guard is gone and the whole matrix would hang")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        previous = signal.signal(signal.SIGALRM, _too_slow)
+        signal.alarm(30)
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+            run_matrix.close_isolate_box(isolate)
+
+        message = str(ctx.exception)
+        self.assertIn("t.out", message)
+        self.assertIn("not a regular file", message)
+        self.assertFalse(dest.exists(), dest)
+
+    def test_file_io_directory_in_place_of_the_output_is_refused(self):
+        # The third shape, and the one with no exotic mechanism behind it:
+        # `read_bytes()` on a directory raises `IsADirectoryError`, an
+        # `OSError` — so before this guard it was reported through the
+        # *permissions* branch, whose message tells the setter their
+        # solution restricted its output's permissions. It did not. A
+        # directory is refused on its own terms.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n"
+            'int main(){ if (mkdir("t.out", 0755) != 0) return 6;\n'
+            "  return 0; }\n",
+            self.tmp / "dirmaker", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "dir.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        message = str(ctx.exception)
+        self.assertIn("t.out", message)
+        self.assertIn("not a regular file", message)
+        self.assertNotIn("umask", message)   # not the permissions diagnostic
+        self.assertFalse(dest.exists(), dest)
+
+    def test_a_regular_output_file_still_passes_the_shape_guard(self):
+        # The control for all three above: the guard must refuse only what
+        # is not a regular file. A guard that refused everything would make
+        # every test in this section pass and the feature useless.
+        binary = _compile(
+            "#include <cstdio>\n"
+            'int main(){ FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "42\\n"); fclose(f); return 0; }\n',
+            self.tmp / "regular", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+        dest = self.tmp / "reg.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, test_in, dest,
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.no_output, r)
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "42")
+
+    # ------------------------------------------------------------------
+    # Which host directories reach the box.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mounted_host_dirs(cmd) -> set[str]:
+        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
+        found = set()
+        for arg in cmd:
+            if not isinstance(arg, str) or not arg.startswith("--dir="):
+                continue
+            host = arg.split("=", 2)[2]
+            found.add(host[:-3] if host.endswith(":rw") else host)
+        return found
+
+    def _isolate_run_argv(self, call):
+        """Run `call()` with `subprocess.run` spied on; return the `--run` argv.
+
+        `_run_once` shells out three times per call (`--init`, `--run`,
+        `--cleanup`); only the middle one carries the mounts.
+        """
+        seen = []
+        real = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            seen.append(cmd)
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(run_matrix.subprocess, "run", spy):
+            call()
+        runs = [cmd for cmd in seen
+                if isinstance(cmd, list) and "--run" in cmd]
+        self.assertEqual(len(runs), 1,
+                         f"expected exactly one isolate --run, saw {seen!r}")
+        return runs[0]
+
+    def test_the_test_directory_is_not_mounted_in_file_io_mode(self):
+        # Pre-existing and correctly not a blocker, but free to remove here:
+        # the directory holding the tests also holds the jury's `.a` answer
+        # files, and mounting it lets a solution open `/host1/01.a` and print
+        # it back. stdin mode has to mount it — `--stdin` must name a path
+        # inside the box. File-IO mode does not: `--stdin` points at the
+        # staged copy in the staging directory, so the mount is referenced
+        # nowhere and buys nothing.
+        #
+        # The binary and the test live in *different* directories here on
+        # purpose: `_label` de-duplicates by resolved path, so a fixture
+        # with both in one directory would keep the mount alive through the
+        # binary and make this test vacuous.
+        bin_dir, test_dir = self.tmp / "bin", self.tmp / "tests"
+        bin_dir.mkdir()
+        test_dir.mkdir()
+        for d in (self.tmp, bin_dir, test_dir):
+            os.chmod(d, 0o777)
+        binary = _compile(
+            "#include <cstdio>\n"
+            'int main(){ FILE *fi = fopen("t.inp", "r"); if (!fi) return 3;\n'
+            "  int a, b; if (fscanf(fi, \"%d %d\", &a, &b) != 2) return 4;\n"
+            "  fclose(fi);\n"
+            '  FILE *fo = fopen("t.out", "w"); if (!fo) return 5;\n'
+            '  fprintf(fo, "%d\\n", a + b); fclose(fo); return 0; }\n',
+            bin_dir / "mountcheck", self.tmp)
+        test_in = test_dir / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        # The jury's answer, sitting where it always sits.
+        (test_dir / "01.a").write_text("5\n", encoding="utf-8")
+        dest = self.tmp / "m.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            argv = self._isolate_run_argv(
+                lambda: run_matrix._run_once(
+                    isolate, binary, test_in, dest,
+                    cpu_limit_s=2.0, wall_limit_s=6.0,
+                    mem_limit_kb=256 * 1024,
+                    io_input="t.inp", io_output="t.out"))
+            mounted = self._mounted_host_dirs(argv)
+            stage_dir = isolate.stage_dir.resolve()
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertNotIn(
+            str(test_dir.resolve()), mounted,
+            f"the test directory is still mounted in file-IO mode, so a "
+            f"solution can read the jury's answers: {sorted(mounted)}")
+        # ...and the two mounts that *are* load-bearing survive, so this is
+        # not passing because mounting broke altogether.
+        self.assertIn(str(bin_dir.resolve()), mounted, sorted(mounted))
+        self.assertIn(str(stage_dir), mounted, sorted(mounted))
+
+    def test_the_test_directory_is_still_mounted_in_stdin_mode(self):
+        # The control, and the reason the change above is scoped to file-IO
+        # mode: in stdin mode `--stdin` names a path inside the box, so this
+        # mount is what makes the run possible at all. Dropping it there
+        # would be a regression, not a fix.
+        bin_dir, test_dir = self.tmp / "bin", self.tmp / "tests"
+        bin_dir.mkdir()
+        test_dir.mkdir()
+        for d in (self.tmp, bin_dir, test_dir):
+            os.chmod(d, 0o777)
+        binary = _compile(
+            "#include <cstdio>\n"
+            'int main(){ int a, b; scanf("%d %d", &a, &b);\n'
+            '  printf("%d\\n", a + b); return 0; }\n',
+            bin_dir / "stdincheck", self.tmp)
+        test_in = test_dir / "01.in"
+        test_in.write_text("2 3\n", encoding="utf-8")
+        dest = self.tmp / "s2.produced"
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            argv = self._isolate_run_argv(
+                lambda: run_matrix._run_once(
+                    isolate, binary, test_in, dest,
+                    cpu_limit_s=2.0, wall_limit_s=6.0,
+                    mem_limit_kb=256 * 1024))
+            mounted = self._mounted_host_dirs(argv)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertIn(str(test_dir.resolve()), mounted, sorted(mounted))
+        self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
+
+    # ------------------------------------------------------------------
+    # `_clear_stage_dir`'s two error paths. Both were reachable and neither
+    # was covered: the review confirmed that turning the `except OSError`
+    # into a `continue`, and the `is_dir()` branch into a `pass`, each left
+    # the whole suite green. An error path nothing has ever triggered is not
+    # a handled error path.
+    # ------------------------------------------------------------------
+
+    def test_a_subdirectory_that_cannot_be_cleared_refuses_the_next_run(self):
+        # A solution may create a directory in the staging area, and it is
+        # owned by the mapped subuid of *its* box. Unlinking plain files
+        # there works regardless of owner (the staging directory is ours),
+        # but a subdirectory this uid cannot descend into cannot be removed
+        # at all — and a staging directory that cannot be guaranteed empty
+        # is one whose next verdict cannot be trusted. Refuse, don't guess.
+        #
+        # The directory is left *empty* at mode 0700 rather than filled with
+        # a file: both make `shutil.rmtree` fail identically (it cannot even
+        # open the directory to enumerate it), but only the empty one can be
+        # cleaned up afterwards without root — a non-empty foreign directory
+        # is exactly the undeletable litter this test would otherwise leave
+        # in the repository on every run.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
+            'int main(){ umask(0); if (mkdir("d", 0700) != 0) return 6;\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
+            self.tmp / "dirlitter", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        litter = isolate.stage_dir / "d"
+        try:
+            first = run_matrix._run_once(isolate, binary, test_in,
+                                         self.tmp / "c1.produced",
+                                         cpu_limit_s=2.0, wall_limit_s=6.0,
+                                         mem_limit_kb=256 * 1024,
+                                         io_input="t.inp", io_output="t.out")
+            # Vacuity guard: run 1 has to have actually worked, and actually
+            # left the directory behind, or run 2 raising would prove nothing.
+            self.assertFalse(first.no_output, first)
+            self.assertTrue(litter.is_dir(), f"{litter} was not created")
+
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, test_in,
+                                     self.tmp / "c2.produced",
+                                     cpu_limit_s=2.0, wall_limit_s=6.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+        finally:
+            # Removable because we own the staging directory and it is
+            # empty; nothing subuid-owned survives this test.
+            with contextlib.suppress(OSError):
+                litter.rmdir()
+            run_matrix.close_isolate_box(isolate)
+
+        message = str(ctx.exception)
+        self.assertIn(str(litter), message)      # names the entry
+        self.assertIn("staging", message)
+
+    def test_an_empty_foreign_subdirectory_is_cleared_before_the_next_run(self):
+        # The other branch: `is_dir()` -> `shutil.rmtree`. A plain
+        # `entry.unlink()` raises `IsADirectoryError` on a directory, so
+        # without this branch every solution that so much as calls `mkdir`
+        # would take the whole matrix down through the refusal above — a
+        # foreign-owned directory that CAN be removed must simply be
+        # removed, silently, like any other leftover.
+        maker = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
+            'int main(){ umask(0); if (mkdir("e", 0777) != 0) return 6;\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
+            self.tmp / "dirmaker2", self.tmp)
+        silent = _compile("int main(){ return 0; }\n",
+                          self.tmp / "silent3", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        test_in = self.tmp / "01.in"
+        test_in.write_text("x\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        leftover = isolate.stage_dir / "e"
+        try:
+            first = run_matrix._run_once(isolate, maker, test_in,
+                                         self.tmp / "e1.produced",
+                                         cpu_limit_s=2.0, wall_limit_s=6.0,
+                                         mem_limit_kb=256 * 1024,
+                                         io_input="t.inp", io_output="t.out")
+            self.assertFalse(first.no_output, first)
+            self.assertTrue(leftover.is_dir(), f"{leftover} was not created")
+
+            # A different binary, so the directory is not simply recreated.
+            second = run_matrix._run_once(isolate, silent, test_in,
+                                          self.tmp / "e2.produced",
+                                          cpu_limit_s=2.0, wall_limit_s=6.0,
+                                          mem_limit_kb=256 * 1024,
+                                          io_input="t.inp", io_output="t.out")
+            still_there = leftover.exists()
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertTrue(second.no_output, second)
+        self.assertFalse(still_there,
+                         f"{leftover} survived the next run's clear — a "
+                         f"foreign directory that CAN be removed must be")
+
+    def test_close_isolate_box_warns_about_a_staging_directory_it_cannot_remove(self):
+        # `shutil.rmtree(..., ignore_errors=True)` is right — teardown must
+        # never mask the error already propagating — but on its own it left
+        # a subuid-owned directory sitting in the user's repository, needing
+        # root to delete, with nothing said anywhere. The user learned
+        # nothing. Now it warns, on stderr, naming the path, and still does
+        # not raise.
+        #
+        # The obstruction here is built by hand and owned by *us*, so this
+        # test leaves nothing behind: a mode-0000 directory blocks its owner
+        # too, which is all `rmtree` needs, and unlike a real subuid-owned
+        # one it can be chmod'ed back.
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        stage = isolate.stage_dir
+        blocked = stage / "unremovable"
+        blocked.mkdir()
+        (blocked / "x").write_text("x", encoding="utf-8")
+        os.chmod(blocked, 0o000)
+
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(captured):
+                run_matrix.close_isolate_box(isolate)   # must not raise
+            survived = stage.exists()
+        finally:
+            os.chmod(blocked, 0o700)
+            shutil.rmtree(stage, ignore_errors=True)
+
+        self.assertTrue(survived,
+                        "the staging directory was removable after all — this "
+                        "test no longer reproduces the case it describes")
+        warning = captured.getvalue()
+        self.assertIn(str(stage), warning,
+                      "close_isolate_box left an undeletable staging "
+                      "directory behind without naming it")
+        self.assertEqual(len(warning.strip().splitlines()), 1,
+                         f"expected a one-line warning, got: {warning!r}")
+
+        # The control: a staging directory that comes away cleanly must say
+        # nothing at all, or the warning is noise on every single run.
+        clean = run_matrix.open_isolate_box(self.tmp)
+        quiet = io.StringIO()
+        with contextlib.redirect_stderr(quiet):
+            run_matrix.close_isolate_box(clean)
+        self.assertEqual(quiet.getvalue(), "",
+                         "close_isolate_box warns even when teardown worked")
 
     # ------------------------------------------------------------------
     # `_time_median` in file-IO mode. It calls `_run_once` `runs` times and
