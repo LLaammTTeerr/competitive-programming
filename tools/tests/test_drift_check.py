@@ -102,6 +102,30 @@ class TestCheck(unittest.TestCase):
         problems = check(PROBLEM, TEX.replace("input  = stdin", "input  = flight.inp"))
         self.assertIn("input", problems[0])
 
+    def test_detects_output_mismatch(self):
+        problems = check(PROBLEM, TEX.replace("output = stdout", "output = flight.out"))
+        self.assertIn("output", problems[0])
+
+    def test_matching_file_based_io_is_not_reported(self):
+        # A file-IO problem (Task 1's io.input/io.output sentinel-or-bare-
+        # filename validation) whose statement names the same files must not
+        # drift, even though neither side is "stdin"/"stdout".
+        problem = dataclasses.replace(PROBLEM, input="flight.inp", output="flight.out")
+        tex = TEX.replace("input  = stdin, output = stdout",
+                           "input  = flight.inp, output = flight.out")
+        self.assertEqual(check(problem, tex), [])
+
+    def test_mismatched_file_based_io_is_reported(self):
+        # The motivating case: the statement promises a filename but
+        # problem.json still says stdin/stdout (or a different filename) —
+        # this sends every solution to NO_OUTPUT with no explanation, so it
+        # must surface here rather than at grading time.
+        tex = TEX.replace("input  = stdin, output = stdout",
+                           "input  = flight.inp, output = flight.out")
+        issues = check(PROBLEM, tex)
+        self.assertTrue(any("input" in d for d in issues), issues)
+        self.assertTrue(any("output" in d for d in issues), issues)
+
 
 class TestMainErrorHandling(unittest.TestCase):
     def test_main_raises_drift_check_error_on_missing_statement_file(self):
@@ -266,6 +290,56 @@ Text with 100\% accuracy.
         # Should not find fake subtasks from the \% in text
         self.assertEqual(parsed["subtask_points"], [40, 60],
                         "Escaped \\% should not be treated as comment")
+
+    def test_commented_out_input_key_is_ignored(self):
+        """In the spirit of Finding 2 (commented-out \\subtask): a
+        commented-out `input =` line, superseded by a real one, must not
+        leak a stale value into the parsed key."""
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  % input = flight.inp, output = flight.out,
+  input  = stdin, output = stdout,
+  time   = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["input"], "stdin")
+        self.assertEqual(parsed["output"], "stdout")
+        self.assertEqual(check(PROBLEM, tex), [])
+
+    def test_input_word_inside_another_keys_value_is_ignored(self):
+        """In the spirit of Finding 3 (origin's bracketed value): the word
+        "input" appearing inside another key's braced value must not be
+        mistaken for the `input` key itself."""
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  note = {Đề bài dùng input = flight.inp trong bản nháp cũ},
+  input  = stdin, output = stdout,
+  time   = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["input"], "stdin")
+        self.assertEqual(parsed["output"], "stdout")
+        self.assertEqual(check(PROBLEM, tex), [])
 
 
 if __name__ == "__main__":
