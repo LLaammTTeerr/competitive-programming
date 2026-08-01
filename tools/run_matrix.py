@@ -161,9 +161,10 @@ two halves and both are load-bearing:
     to `/tmp`. If the chosen location is memory-backed it raises
     `MatrixError` rather than warning: this driver's standing doctrine is
     that it refuses to run rather than produce a confidently wrong
-    verdict, the same call already made for a missing sandbox and for
-    file-based IO, and a warning on stderr in the middle of a few hundred
-    runs is exactly the thing a caller reads past.
+    verdict, the same call already made for a missing sandbox and for an
+    `io.output` that would collide with the staged stdout, and a warning
+    on stderr in the middle of a few hundred runs is exactly the thing a
+    caller reads past.
 
   * `--fsize=OUTPUT_LIMIT_KB` bounds the output explicitly. Until this
     fix, tmpfs *accidentally* capped output at `memory_mb`; moving staging
@@ -394,7 +395,8 @@ def _stage_base(problem_dir: str | Path | None) -> Path:
     over: it scrolls past in the middle of a few hundred sandboxed runs,
     and the failure it precedes is a *wrong verdict on a correct
     solution*, which this driver already refuses to risk elsewhere (a
-    missing sandbox, file-based IO) rather than proceed through.
+    missing sandbox, a model solution that writes no output file at all)
+    rather than proceed through.
     """
     override = os.environ.get(STAGE_DIR_ENV)
     if override:
@@ -596,6 +598,17 @@ def close_isolate_box(handle: IsolateHandle) -> None:
     # (verified: see module docstring / task report). ignore_errors so a
     # teardown problem here still cannot mask a real error propagating.
     shutil.rmtree(handle.stage_dir, ignore_errors=True)
+    # ...but `ignore_errors=True` used to mean the one case that survives —
+    # a foreign-owned *subdirectory* whose contents this uid cannot unlink —
+    # was left on disk with the user told nothing at all. It is not
+    # removable without root, so silence means someone finds it weeks later
+    # and cannot explain it. Say so, on stderr, naming the path; still no
+    # raise, so a teardown problem cannot mask a real error propagating.
+    if handle.stage_dir.exists():
+        print(f"WARNING: could not remove the sandbox staging directory "
+              f"{handle.stage_dir} — it holds something created inside the "
+              f"sandbox that this user cannot delete. Remove it as root: "
+              f"sudo rm -rf {handle.stage_dir}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +646,14 @@ class RunResult:
     defaulting to 0 read as "exited 0" (looks like success); and `killed`
     alone can't tell a CPU-time kill from a wall-time kill, which matters
     for pass 1's diagnostic naming the *right* limit it tripped.
+
+    `no_output` means the process exited without being killed and never
+    created the problem's output file. Only reachable in file-IO mode — a
+    stdin/stdout run always has a stdout file, because isolate creates it
+    whether or not the solution writes a byte to it. It is not a crash: the
+    exit status was clean, so `crashed` is False and `exit_code` is whatever
+    the solution returned; it is a separate fact about the *artifact*, and
+    classifying it is the caller's job, not this dataclass's.
     """
 
     cpu_ms: int
@@ -644,6 +665,7 @@ class RunResult:
     peak_kb: int
     status: str
     message: str
+    no_output: bool = False
 
 
 def _parse_meta(text: str) -> dict[str, str]:
@@ -669,10 +691,116 @@ def _parse_meta(text: str) -> dict[str, str]:
 # such limit; flagged in the task report rather than left undisclosed.
 ISOLATE_PROCESSES = 1
 
+# The fixed name every `--run` writes its *stdout* to inside the staging
+# directory, in both IO modes. Named rather than inlined because file-IO
+# mode has to refuse a problem whose own `io.output` is this string: Task 1
+# accepts any bare filename, so the collision is reachable, and it would put
+# isolate and the solution on the same file with no error anywhere.
+STAGED_STDOUT_NAME = "run.out"
+
+
+def _clear_stage_dir(stage_dir: Path) -> None:
+    """Empty the private staging directory before a sandboxed run.
+
+    Called once at the top of every `_run_once`, in both IO modes. It
+    replaces what used to be three targeted unlinks (`run.out`, `io_input`,
+    `io_output`), and the difference is not tidiness — it is a verdict.
+
+    A solution may create files this driver has no name for. The mistake
+    file IO exists to diagnose *is* exactly that: a solution that writes
+    `output.txt` instead of the `io.output` `problem.json` declares. That
+    file lands in the staging directory owned by the mapped subuid of the
+    box it ran in, at the default `0644`. Every `_run_once` claims a
+    **fresh box id** (Task 9c), and a fresh box means a *different* subuid,
+    so the next run cannot open that leftover file for writing at all:
+    `fopen(..., "w")` fails EACCES, the solution exits nonzero, and the
+    driver reports RE. Measured on the Task 6 dogfood package before this
+    function existed: the wrong-filename solution was `NO_OUTPUT` on the
+    first test it ran and `RE` on the eleven after it. The same leak also
+    crosses *solutions* — the staging directory lives for the whole
+    `run()` — so one solution's litter could decide another's verdict.
+
+    This process can always unlink those files despite not owning them,
+    because unlinking is governed by the *directory's* permissions and this
+    driver owns the staging directory it created (verified directly; see
+    the task report). A foreign-owned *subdirectory* with contents is the
+    one case that can fail, and it raises `MatrixError` rather than being
+    swallowed: a staging directory this driver cannot guarantee is empty is
+    a staging directory whose next verdict cannot be trusted, and refusing
+    to run beats reporting confidently wrong results — the same call made
+    for a missing sandbox and a memory-backed staging location.
+    """
+    for entry in stage_dir.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise MatrixError(
+                f"could not clear {entry} out of the sandbox staging "
+                f"directory {stage_dir}: {exc} — a previous run left a file "
+                "or directory this process cannot remove, and running on top "
+                "of it would let that run's leftovers decide this run's "
+                "verdict."
+            ) from exc
+
+
+def _refuse_irregular_output(st: os.stat_result, source: Path, binary: Path,
+                             stdin_path: Path) -> None:
+    """Refuse to read the solution's output file unless it is a regular file.
+
+    Only reachable in file-IO mode, and that is the whole point: in stdin
+    mode `staged_out` is created by isolate itself, so nothing a solution
+    does can decide what kind of filesystem object sits at that name. File
+    IO handed the solution that choice, and `Path.read_bytes()` then does
+    whatever the solution picked — as **this driver's own uid, outside the
+    sandbox**, on a path the sandbox merely named. Two shapes, both measured
+    rather than theorised:
+
+    * `symlink("/etc/hostname", "t.out")` and exit 0. `read_bytes()` follows
+      it and returns the host file, which is then handed to the checker as
+      the solution's answer — and in pass 1 written into the jury's `.a`
+      answer key. Any file readable by the user running this pipeline is in
+      range; the sandbox's own confinement is irrelevant, because the read
+      does not happen inside it. Hence `os.lstat` at the call site, never
+      `os.stat`: following the link to discover it is a regular file is
+      exactly the bug.
+    * `mkfifo("t.out")` and exit 0. `read_bytes()` blocks on open forever.
+      Nothing times this read out, so the whole matrix hangs — and it hangs
+      *inside* the `try`, so `_run_once`'s `finally` never runs and the box
+      leaks too.
+
+    A directory is the third shape and needs no separate argument: it is
+    simply not something a solution's output may be.
+
+    This is the same family as the `PermissionError` case the branch already
+    closed — solution-controlled state reaching a bare stdlib call — and it
+    is refused the same way, with a `MatrixError` rather than by folding
+    into `no_output`. A solution that substituted a pipe for its output is
+    not a solution that produced no output, and reporting it as one would be
+    a confidently wrong verdict of exactly the kind this driver exists to
+    avoid.
+    """
+    if stat.S_ISREG(st.st_mode):
+        return
+    raise MatrixError(
+        f"the output file {source} that {binary} produced on {stdin_path} is "
+        f"not a regular file ({stat.filemode(st.st_mode)}) — a solution may "
+        "not substitute a symlink, FIFO, socket, device or directory for its "
+        "output. Reading one would either hand this driver's own view of the "
+        "filesystem to the checker as the solution's answer, or block "
+        "forever. That is not the same as producing no output at all, so it "
+        "is reported rather than judged."
+    )
+
 
 def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
               stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
-              mem_limit_kb: int) -> RunResult:
+              mem_limit_kb: int, *, io_input: str = "stdin",
+              io_output: str = "stdout") -> RunResult:
     """Run one process inside `isolate`'s sandbox and return its verdict.
 
     `binary`'s and `stdin_path`'s directories are mounted **read-only**
@@ -710,11 +838,85 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     buggy behaviour (foreign-owned, possibly not writable by us at all): it
     is simply replaced, not fought with.
 
-    The staged file itself is unlinked before the sandboxed run (in case a
-    previous call left stale content there) and after the copy-back (so
-    `isolate.stage_dir` doesn't accumulate one file per call across a whole
-    `run()`); both unlinks rely only on `stage_dir`'s own permissions,
-    which this process set to 0o777 when it created it.
+    The whole staging directory is emptied before the sandboxed run
+    (`_clear_stage_dir`, in both IO modes) so no call can ever see another
+    call's files, and the staged stdout is unlinked again after the
+    copy-back so `isolate.stage_dir` does not hold a large output for
+    longer than it must. Both rely only on `stage_dir`'s own permissions,
+    which this process set to 0o777 when it created it — never on the
+    permissions of the files themselves, which the sandboxed subuid owns.
+
+    **File-based IO** (`io_input`/`io_output` naming real files instead of
+    the `"stdin"`/`"stdout"` sentinels; Task 1 guarantees each is either a
+    sentinel or a bare filename, so neither is re-validated here). Three
+    things change and nothing else does — every existing call site passes
+    neither keyword and gets exactly the previous behaviour:
+
+      * The test input is *copied* into `isolate.stage_dir` under
+        `io_input`, because the solution opens it by relative name and the
+        directory it opens it in must be writable for `io_output`. There is
+        still exactly one `:rw` mount and it is still the same disk-backed
+        staging directory: a second, memory-backed writable mount for the
+        solution's output would recreate — a fourth time — the accounting
+        bug of charging a solution's output to its own `--cg-mem` (see the
+        module docstring's staging paragraph).
+      * `--chdir` points at that staging mount rather than at the binary's,
+        which is mounted read-only. A file-IO solution chdir'd into a
+        read-only mount cannot create its output file at all.
+      * The output is read back from `io_output` instead of from the staged
+        stdout. `--stdout` still points at `STAGED_STDOUT_NAME` in both
+        modes, so a file-IO solution's stray debug printing goes there, is
+        discarded, and is still capped by `--fsize`; `--stdin` is pointed at
+        the staged *copy* of the input, so a solution that reads stdin as
+        well as its file still sees the test data.
+
+    Two name collisions are refused with `MatrixError` rather than run,
+    because both are silent: `io_output == STAGED_STDOUT_NAME` would have
+    isolate and the solution writing the same file, and `io_input ==
+    io_output` would have the staged *input* read back as the solution's
+    answer (so a solution that writes nothing scores OK on every test).
+    `problem_meta` refuses the second at load time too; this one is the
+    check at the point of use.
+
+    Permissions cut both ways here and neither direction is hypothetical.
+    The staged copy of the input is re-granted the "other" read bit
+    (`_ensure_sandbox_readable`) that `run()` granted the original and that
+    `shutil.copyfile` drops, or a strict umask on the *driver's* side makes
+    every file-IO run fail as isolate `status:XX`. In the other direction
+    the solution owns its own output file and may leave it unreadable to
+    us (`umask(077)`); that is surfaced as `MatrixError` naming the file
+    and the solution, never as `no_output` — it is a different fact.
+
+    The staging directory is emptied *before* every run
+    (`_clear_stage_dir`) and deliberately **not** after it: it is the
+    pre-run clear that has to be load-bearing, since the contamination it
+    prevents is a run reading — or colliding with — an *earlier* run's
+    files (`_time_median` calls this three times, and every solution in a
+    whole `run()` shares one handle, hence one staging directory). Cleaning
+    up afterwards as well would leave that clear untested, because the
+    stale file would be gone either way.
+
+    It is a full clear rather than an unlink of the three names this driver
+    itself knows (`run.out`, `io_input`, `io_output`) because the Task 6
+    dogfood proved three names are not enough. A solution that writes *any
+    other* filename — the wrong-output-filename mistake this whole feature
+    exists to diagnose writes `output.txt` — leaves that file behind owned
+    by the mapped subuid of the box it ran in, and every box gets a *fresh*
+    box id, hence a different subuid (Task 9c). The next run therefore
+    cannot `fopen(..., "w")` that file at all: it fails EACCES, the
+    solution exits nonzero, and the driver reports **RE**. Measured on the
+    dogfood package: the wrong-filename solution came back `NO_OUTPUT` on
+    the first test it ran and `RE` on the eleven after it — a verdict that
+    depended on execution order, and worse, one solution's leftover file
+    silently changing a *different* solution's verdict. That is the same
+    cross-run contamination class as the box-reuse bug (9c) and the three
+    memory bugs above, relocated once more into the staging directory's
+    contents.
+
+    A file-IO run whose output file is absent afterwards returns
+    `no_output=True` (and an empty `stdout_dest`, rewritten like any other
+    run so a stale answer already in the repository cannot be read as this
+    run's). It is reported, not classified, here.
 
     Task 9c: every call gets its **own, freshly-`--init`ed box** — one is
     claimed from `isolate.box_id_counter`, `--init`ed before the sandboxed
@@ -746,13 +948,68 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                 mounts[resolved] = f"/host{len(mounts)}"
             return mounts[resolved]
 
+        file_io = io_input != "stdin" or io_output != "stdout"
+
         bin_label = _label(binary.parent)
-        stdin_label = _label(stdin_path.parent)
+        # The test directory is mounted ONLY in stdin mode, where `--stdin`
+        # has to name a path inside the box. In file-IO mode `--stdin` points
+        # at the staged copy (`{stage_label}/{staged_in.name}`) and this
+        # mount is referenced nowhere — dead weight that also handed the
+        # solution a readable `01.a` next to every `01.in`, i.e. the jury's
+        # answers. That exposure is not new (stdin mode has always mounted
+        # this directory, and still must), but in file-IO mode nothing is
+        # bought by it, so it goes.
+        stdin_label = _label(stdin_path.parent) if not file_io else None
         stage_label = _label(isolate.stage_dir)
         stage_dir_resolved = isolate.stage_dir.resolve()
 
-        staged_out = isolate.stage_dir / "run.out"
-        staged_out.unlink(missing_ok=True)
+        if file_io and io_input == io_output:
+            # `problem_meta` refuses this at load time; this is the same
+            # check at the point of use, because `_run_once` is also called
+            # directly (tests, and anything that builds its own arguments)
+            # and the consequence is silent: the solution's output file is
+            # the staged *input* file, so a solution that writes nothing
+            # hands the test data back as its answer and the checker
+            # accepts it.
+            raise MatrixError(
+                f"io.input and io.output are both {io_input!r}: the "
+                "solution's output file would be the file it read the test "
+                "from, so a solution that wrote nothing would have the test "
+                "input itself checked as its answer. Give them different "
+                "names."
+            )
+        if file_io and (io_input == STAGED_STDOUT_NAME
+                        or io_output == STAGED_STDOUT_NAME):
+            raise MatrixError(
+                f"io.input/io.output may not be named {STAGED_STDOUT_NAME!r}: "
+                "that is the fixed name this driver stages the sandboxed "
+                "process's stdout under, so isolate and the solution would "
+                "write the same file (io.input="
+                f"{io_input!r}, io.output={io_output!r}) — rename the "
+                "problem's IO files."
+            )
+
+        # Everything the previous run left behind goes first — not just the
+        # names this driver knows. See `_clear_stage_dir` and the docstring
+        # above for the measured verdict corruption that motivates it.
+        _clear_stage_dir(isolate.stage_dir)
+        staged_out = isolate.stage_dir / STAGED_STDOUT_NAME
+
+        # In file-IO mode the solution reads and writes real files in its
+        # cwd, which must be the ONE `:rw` mount.
+        staged_in = staged_result = None
+        if file_io:
+            staged_in = isolate.stage_dir / io_input
+            staged_result = isolate.stage_dir / io_output
+            shutil.copyfile(stdin_path, staged_in)
+            # `run()` already granted the original test file the "other"
+            # read bit the mapped subuid needs (`_ensure_sandbox_readable`);
+            # the copy is created fresh at `0666 & ~umask` and would throw
+            # that away. Under a strict umask (077) the sandbox then cannot
+            # open its own input, and it surfaces as isolate's status:XX —
+            # i.e. as this driver blaming isolate for a permission bit it
+            # set itself. Re-grant it on the copy.
+            _ensure_sandbox_readable(staged_in)
 
         cmd = [
             isolate.binary, "--cg", f"--box-id={box_id}", "--run",
@@ -764,8 +1021,9 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             opt = ":rw" if resolved == stage_dir_resolved else ""
             cmd.append(f"--dir={label}={resolved}{opt}")
         cmd += [
-            f"--chdir={bin_label}",
-            f"--stdin={stdin_label}/{stdin_path.name}",
+            f"--chdir={stage_label if file_io else bin_label}",
+            (f"--stdin={stage_label}/{staged_in.name}" if file_io
+             else f"--stdin={stdin_label}/{stdin_path.name}"),
             f"--stdout={stage_label}/{staged_out.name}",
             "--", f"{bin_label}/{binary.name}",
         ]
@@ -817,47 +1075,96 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         # Copy the sandboxed output back into the repository as *this*
         # process — never write it through a bind mount again (see
         # docstring above).
+        source = staged_result if file_io else staged_out
         try:
-            data = staged_out.read_bytes()
+            # `lstat`, never `stat`: this asks what the *solution* left at
+            # that name, and following a symlink is precisely the thing being
+            # refused two branches down.
+            source_st = os.lstat(source)
         except FileNotFoundError:
-            data = b""
+            # In file-IO mode this is the reportable outcome `no_output`; in
+            # stdin mode isolate always created the file, so an absent one
+            # is not a fact about the solution and stays unreported.
+            data, no_output = b"", file_io
+        else:
+            _refuse_irregular_output(source_st, source, binary, stdin_path)
+            try:
+                data, no_output = source.read_bytes(), False
+            except OSError as exc:
+                # The file exists but this process cannot read it — reachable
+                # in file-IO mode because the *solution* owns that file: a
+                # `umask(077)` in the solution leaves it `-rw-------` under
+                # the sandbox's subuid, which is neither our uid nor our
+                # group, and we own only the directory, so we cannot even
+                # chmod it. Left bare this escaped `_run_once` as
+                # `PermissionError` and took the whole matrix down mid-run on
+                # one careless solution. Deliberately NOT folded into
+                # `no_output`: "we could not read it" and "it was never
+                # written" are different facts about the solution, and
+                # conflating them is how this project has produced wrong
+                # verdicts before.
+                raise MatrixError(
+                    f"could not read the output file {source} that {binary} "
+                    f"produced on {stdin_path}: {exc} — the file exists but is "
+                    "not readable by this process (a solution that restricts "
+                    "its own output's permissions, e.g. umask(077), does this). "
+                    "That is not the same as producing no output at all, so it "
+                    "is reported rather than judged."
+                ) from exc
         stdout_dest.unlink(missing_ok=True)
         stdout_dest.write_bytes(data)
         staged_out.unlink(missing_ok=True)
 
         return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
                           crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
-                          status=status, message=message)
+                          status=status, message=message, no_output=no_output)
     finally:
         _cleanup_box(isolate.binary, box_id)
 
 
 def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                   stdout_dest: Path, cpu_limit_s: float, wall_limit_s: float,
-                  mem_limit_kb: int, runs: int) -> RunResult:
+                  mem_limit_kb: int, runs: int, *, io_input: str = "stdin",
+                  io_output: str = "stdout") -> RunResult:
     """Median the CPU/wall time over `runs` runs; any bad outcome wins.
 
-    `killed`/`oom`/`crashed` are all sticky-OR (never cleared once True) and
-    `exit_code`/`status`/`message` are sticky-first-nonempty — mirroring the
-    old driver's reasoning for the model solution specifically: a run that
-    fails once and happens to succeed on a later retry must not have that
-    failure silently overwritten, or a flaky answer file could pass as jury
-    truth, and the diagnostic for that failure must survive to be reported
-    even though it happened on an earlier iteration than the last one.
+    `killed`/`oom`/`crashed`/`no_output` are all sticky-OR (never cleared
+    once True) and `exit_code`/`status`/`message` are sticky-first-nonempty
+    — mirroring the old driver's reasoning for the model solution
+    specifically: a run that fails once and happens to succeed on a later
+    retry must not have that failure silently overwritten, or a flaky answer
+    file could pass as jury truth, and the diagnostic for that failure must
+    survive to be reported even though it happened on an earlier iteration
+    than the last one.
+
+    `no_output` joined that list when `run()` started passing real IO
+    filenames down here: dropping it was unreachable while every call was
+    stdin/stdout (isolate always creates a stdout file), and became live the
+    moment file-IO problems reached this function. It is sticky in both
+    directions that matter — a first run that wrote nothing must not be
+    erased by two later runs that did, and the flag must actually reach the
+    returned `RunResult`, or `_classify` never sees it and the whole
+    NO_OUTPUT verdict silently disappears on any re-timed (banded) run and
+    on the model solution's entire pass 1.
+
+    `io_input`/`io_output` are forwarded verbatim to `_run_once`, which owns
+    every file-IO behaviour and every refusal; nothing is interpreted here.
     """
     cpu_samples, wall_samples = [], []
-    killed = oom = crashed = False
+    killed = oom = crashed = no_output = False
     exit_code = 0
     status = message = ""
     peak = 0
     for _ in range(runs):
         r = _run_once(isolate, binary, stdin_path, stdout_dest,
-                      cpu_limit_s, wall_limit_s, mem_limit_kb)
+                      cpu_limit_s, wall_limit_s, mem_limit_kb,
+                      io_input=io_input, io_output=io_output)
         cpu_samples.append(r.cpu_ms)
         wall_samples.append(r.wall_ms)
         killed = killed or r.killed
         oom = oom or r.oom
         crashed = crashed or r.crashed
+        no_output = no_output or r.no_output
         exit_code = exit_code or r.exit_code
         status = status or r.status
         message = message or r.message
@@ -867,7 +1174,7 @@ def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         wall_ms=int(statistics.median(wall_samples)),
         killed=killed, oom=oom, crashed=crashed,
         exit_code=exit_code, peak_kb=peak,
-        status=status, message=message,
+        status=status, message=message, no_output=no_output,
     )
 
 
@@ -989,6 +1296,19 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
     so the checker never runs on one that exceeded it" is already
     `classify()`'s own stated doctrine for the TL case, and it applies just
     as much to a run that never produced valid output to check at all.
+
+    `no_output` (file-IO mode only: the process exited cleanly and never
+    created the problem's output file, typically because it wrote the wrong
+    filename) becomes the verdict `NO_OUTPUT`, and is checked *after*
+    `killed` and `crashed`, never before: a solution that segfaulted is RE,
+    and one that was stopped at the limit is TL — both would also leave no
+    output file, and reporting either as NO_OUTPUT would name the symptom
+    instead of the cause. Only a run that finished cleanly and still wrote
+    nothing is NO_OUTPUT. It is fed through `classify()` as a checker
+    verdict rather than returned directly, because `classify()` decides time
+    before correctness (`matrix_core`): a run that overran the limit without
+    being killed is TL, not NO_OUTPUT. The checker is never invoked on this
+    path, so it is never handed a nonexistent file.
     """
     if r.oom:
         return Outcome("ML", banded=False)
@@ -996,6 +1316,8 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
         verdict_src = ""  # unused: classify() returns TL before consulting it
     elif r.crashed:
         verdict_src = "RE"
+    elif r.no_output:
+        verdict_src = "NO_OUTPUT"
     else:
         verdict_src = _check(checker, test, out, ans)
     return classify(r.cpu_ms, r.killed, verdict_src, limits)
@@ -1004,17 +1326,15 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
 def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict:
     problem_dir, testlib_dir = Path(problem_dir), Path(testlib_dir)
     problem = load(problem_dir / "problem.json")
-    if problem.input != "stdin" or problem.output != "stdout":
-        raise MatrixError(
-            "file-based IO is not supported by this driver: "
-            f"io.input={problem.input!r}, io.output={problem.output!r} "
-            "(only io.input='stdin' / io.output='stdout' are handled; "
-            "vnolymp-style file-IO problems — e.g. flight.inp/flight.out — "
-            "would otherwise feed the model solution empty stdin, discard "
-            "its real output, and this driver would report a confident "
-            "wrong verdict instead of failing loudly. Supporting file IO "
-            "is a later feature, not something to run silently-wrong now.)"
-        )
+    # Both IO modes run through the same code from here on. `problem.input`
+    # and `problem.output` are either the sentinels "stdin"/"stdout" or bare
+    # filenames — `problem_meta.load` validated that, refused a path
+    # separator or a dot-segment, and refused input == output, so nothing is
+    # re-validated here. They are threaded, unchanged, into every sandboxed
+    # execution below; `_run_once` owns what they mean and owns the two
+    # remaining refusals (a name colliding with the staged stdout, and the
+    # same check on input == output for callers that build their own
+    # arguments).
     # Task 9b review, aggravating detail: an earlier version of this
     # function only discovered whether isolate was even usable *after*
     # already compiling every solution and touching the tree — so a
@@ -1099,7 +1419,9 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                 answer = test.with_suffix(".a")
                 r = _time_median(isolate, binaries[main_file], test, answer,
                                  MODEL_SAFETY_CPU_S, MODEL_SAFETY_WALL_S,
-                                 mem_limit_kb, runs)
+                                 mem_limit_kb, runs,
+                                 io_input=problem.input,
+                                 io_output=problem.output)
                 if r.killed:
                     # isolate's own `status:TO` fires for either a CPU-time
                     # kill or a wall-time kill, and this pass has two
@@ -1138,6 +1460,25 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                         f"model solution crashed on {test} ({detail}) — a "
                         "solution that exits abnormally cannot define the "
                         "jury's expected timing or answers")
+                if r.no_output:
+                    # File-IO mode only, and new with it: the model solution
+                    # exited 0 and never created `io.output`. Left unchecked
+                    # this writes an EMPTY `.a` answer file and carries on,
+                    # so pass 2 checks every solution — including the model
+                    # one — against a blank jury answer. That is precisely
+                    # the confidently-wrong matrix this driver refuses to
+                    # produce, and it is reachable the moment `run()` stops
+                    # rejecting file IO: the usual cause is a model solution
+                    # written for stdout, or one writing a filename that
+                    # disagrees with `problem.json`.
+                    raise MatrixError(
+                        f"model solution exited 0 on {test} without creating "
+                        f"its output file {problem.output!r} — the jury's "
+                        "answer file would be empty and every verdict below "
+                        "would be measured against it. Check that the model "
+                        "solution writes the filename problem.json declares "
+                        f"(io.input={problem.input!r}, "
+                        f"io.output={problem.output!r}).")
                 t_main[f"{group}/{test.stem}"] = r.cpu_ms
 
         limits = compute_limits(t_main)
@@ -1166,14 +1507,18 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                     out = build / f"{Path(name).stem}.{group}.{test.stem}.out"
                     answer = test.with_suffix(".a")
                     r = _run_once(isolate, binaries[name], test, out,
-                                 cpu_limit_s, wall_limit_s, mem_limit_kb)
+                                 cpu_limit_s, wall_limit_s, mem_limit_kb,
+                                 io_input=problem.input,
+                                 io_output=problem.output)
                     outcome = _classify(r, checker, test, out, answer, limits)
 
                     if outcome.banded:
                         first_run_ms = r.cpu_ms
                         r = _time_median(isolate, binaries[name], test, out,
                                          cpu_limit_s, wall_limit_s,
-                                         mem_limit_kb, runs)
+                                         mem_limit_kb, runs,
+                                         io_input=problem.input,
+                                         io_output=problem.output)
                         outcome = _classify(r, checker, test, out, answer, limits)
                         flags.append(
                             problem_dir, phase="validate-solutions", severity="medium",
@@ -1251,9 +1596,10 @@ def main(argv: list[str]) -> int:
         1 — the matrix ran and found holes and/or mismatches. This is a
             *result*, printed to stdout: the signal to keep reading.
         2 — the matrix could not be run at all (usage error, or any
-            `MatrixError`: a compile failure, a missing tests directory,
-            the file-IO guard, an unusable sandbox or staging location).
-            One line on stderr, nothing on stdout.
+            `MatrixError`: a compile failure, a missing tests directory, a
+            model solution that produced no output file, an unusable
+            sandbox or staging location).
+            A message on stderr, nothing on stdout.
 
     Before this, an uncaught `MatrixError` surfaced as a traceback and
     exited 1 as well, so an agent told "exit 1 means holes or mismatches"

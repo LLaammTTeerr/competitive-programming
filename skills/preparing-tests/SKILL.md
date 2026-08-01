@@ -30,16 +30,10 @@ this order".
 | If it's really about | Use |
 |---|---|
 | Is my suite strong enough? Will a wrong solution survive it? A zoo of deliberately-wrong solutions, the invocation matrix, `@expect` tags | `competitive-programming:validating-solutions` |
-| What N, what subtask ladder, is this problem original, what difficulty | `competitive-programming:shaping-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
+| What N, what subtask ladder, is this problem original, what difficulty | `competitive-programming:shaping-problems` |
 | The prose: story, `\InputFile`, `\Constraints` itemize, `\Examples` | `competitive-programming:writing-statements` |
-| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
-
-The plugin ships five skills: `solving-problems`, `running-contests`,
-`preparing-tests`, `validating-solutions`, `writing-statements`. The two
-marked Stage 2 above are **not among them** — they cannot be invoked. If
-the request really belongs to one, say that it is not built yet and stop,
-rather than offering a handoff that will fail; do not silently do that
-skill's job here either.
+| Auditing a finished package end to end — statement ambiguity, assumed definitions, unproven solution steps, no new phase to run | `competitive-programming:reviewing-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
 
 Ask only when genuinely ambiguous. **"Write me a validator" is not
 ambiguous. "Make my tests better" is** — that could mean the generators here
@@ -71,7 +65,7 @@ is the one `cd` in this file, and nothing later moves you. `python3 -m
 tools.*` requires it (see above) and takes `$PROBLEM` as an argument;
 every other command — compiling `validator.cpp` and `gen-*.cpp`, running
 the validator over test files, writing `files/` and `tests/` — names
-`$PROBLEM` explicitly in its paths, `"$PROBLEM/validator"` and
+`$PROBLEM` explicitly in its paths, `"$PROBLEM/files/validator"` and
 `"$PROBLEM/tests/g1/01.in"` rather than `./validator` and `tests/g1/01.in`.
 Every command block below is written that way and is runnable as-is from
 wherever you are. Do not rely on whatever directory the previous command
@@ -91,29 +85,66 @@ subtask binding, ordering doctrine, and the traps below, curated from the
 fork's own audit rather than duplicated from it.
 
 Compile everything the same way — with `$PROBLEM` spelled out on both
-sides, since the working directory is `$PLUGIN_ROOT`, not the problem:
+sides, since the working directory is `$PLUGIN_ROOT`, not the problem.
+**`validator.cpp` lives in `$PROBLEM/files/`, not `$PROBLEM/`** — confirmed
+against `tools/package_status.py`'s own `validator` phase check
+(`files / "validator.cpp"`) and against both on-disk packages
+(`flight/files/validator.cpp`, `tools/tests/fixtures/mini/files/validator.cpp`).
+A validator built at `$PROBLEM/validator.cpp` compiles and runs, but
+`package_status` will never see it as done — it checks one specific path,
+not "a validator exists somewhere in this directory":
 
 ```bash
-g++ -std=c++17 -O2 -Wpedantic -Werror -I"$TESTLIB" -I"$PROBLEM/files" \
-    "$PROBLEM/validator.cpp" -o "$PROBLEM/validator"
+g++ -std=c++17 -O2 -Wpedantic -Werror -I"$TESTLIB" \
+    "$PROBLEM/files/validator.cpp" -o "$PROBLEM/files/validator"
 ```
 
-`-I"$PROBLEM/files"` is not optional for the validator: the generated
-`constraints.h` lives in `$PROBLEM/files/`, and `#include "constraints.h"`
-searches the *including file's* directory (`$PROBLEM/`) — not `files/` —
-so without it the compile fails with `constraints.h: No such file or
-directory` no matter which directory you run from.
+No `-I"$PROBLEM/files"` is needed here, and none should be added: with
+`validator.cpp` and the generated `constraints.h` both in `$PROBLEM/files/`,
+`#include "constraints.h"` resolves against the *including file's own*
+directory — which already is `files/` — with no extra include path
+required. (An earlier version of this section put the validator at
+`$PROBLEM/` and, from that wrong premise, argued `-I"$PROBLEM/files"` was
+required to reach `constraints.h` from there — that reasoning no longer
+applies now that the validator and the header are colocated.)
 
 Never `-ffast-math` — testlib detects it at runtime and aborts.
 
-## Two things the pipeline assumes, stated up front
+## Two things about the pipeline, stated up front
 
-**Only stdin/stdout problems are supported.** `problem.json`'s `io.input` /
-`io.output` must be `"stdin"` / `"stdout"`. File-based IO (`flight.inp` /
-`flight.out`, the shape most VOI-style packages use) is rejected loudly by
-`run_matrix.py` — it is a later feature, not a silent partial mode. If the
-problem was scoped around file IO, that is a scoping decision to revisit
-with the user — not something to route around here.
+**Both IO modes are supported, and the test-data tools are the same in
+either.** `problem.json`'s `io.input` / `io.output` are either the sentinels
+`"stdin"` / `"stdout"` or a pair of bare filenames — file-based IO
+(`flight.inp` / `flight.out`, the shape most VOI-style packages use) runs
+end to end. `problem_meta.py` validates the pair at load and refuses a path
+separator, a dot-segment, or the two names being equal, so anything that
+reaches the sandbox is a plain filename inside its working directory.
+
+What that does **not** change is everything this skill builds:
+
+- **Generators and validators are unaffected.** They are stdin/stdout
+  testlib tools in both modes — a generator writes the test to stdout, a
+  validator reads it from stdin — and *nothing in `tools/` ever executes
+  either one* (`run_matrix.py`'s only subprocesses are `g++`, `isolate`,
+  the checker, and `git`). You run them yourself, exactly as the commands
+  below show, and the redirections below are correct for a file-IO problem
+  without a single change.
+- **The checker already takes three file paths** — `checker <input>
+  <output> <answer>` — which is testlib's interface regardless of how the
+  solution obtained its output. `run_matrix.py` hands it paths it has
+  already copied out of the sandbox, so a stock checker (`wcmp`, `ncmp`,
+  `rcmp6`) is the same choice in both modes.
+- **The solution is the only thing that differs**: it opens `io.input` and
+  `io.output` by relative name in its working directory, which the driver
+  arranges (`--chdir` into the one writable mount, the test staged there
+  under `io.input`). A model solution that writes to stdout in a file-IO
+  package makes `run_matrix.py` refuse outright rather than bank an empty
+  answer file, and any *other* solution that writes the wrong filename gets
+  the verdict `NO_OUTPUT` — see `validating-solutions`.
+- **The statement must agree.** `tools/drift_check.py` compares the
+  vnolymp `input =` / `output =` keys against `problem.json`, the same way
+  it compares bounds; a statement promising `flight.inp` while
+  `problem.json` says `stdin` is reported as drift.
 
 **Every *solution* run is measured under `ioi/isolate`**, not a bare
 `fork`/`exec`. There is no fallback runner, and `run_matrix.py` refuses to
@@ -163,7 +194,12 @@ below depends on the previous one existing first.
 Unique answer for every valid input → reach for a **stock checker** before
 writing anything: 21 ship in `$TESTLIB/checkers/`, most usefully `ncmp`
 (sequences of ints/longs), `wcmp` (tokens, any whitespace), `rcmp6` (real
-numbers to 6 significant digits — the natural choice for a float answer),
+numbers within `1e-6` **absolute *or* relative** error — its own `setName`
+says "max absolute or relative error", and `testlib.h`'s `doubleCompare`
+accepts a value that clears *either* test, not both; it is emphatically not
+"6 significant digits", which would be a relative-only rule. The natural
+choice for a float answer, and the one to name in the statement verbatim so
+the promised tolerance matches the enforced one),
 `yesno`, and `lcmp` (line-by-line). Multiple valid answers → a custom
 checker, only then.
 
@@ -310,7 +346,7 @@ Validate every test under its own `--group` before it ever reaches a
 solution:
 
 ```bash
-"$PROBLEM/validator" --testset tests --group g1 < "$PROBLEM/tests/g1/01.in"
+"$PROBLEM/files/validator" --testset tests --group g1 < "$PROBLEM/tests/g1/01.in"
 ```
 
 A test that validates against the wrong group's bounds, or against no group
@@ -325,7 +361,7 @@ a missing trailing newline, a stray extra token — and assert it exits
 nonzero, **before** the first generator is written:
 
 ```bash
-printf '1001 5\n' | "$PROBLEM/validator" --testset tests --group g1
+printf '1001 5\n' | "$PROBLEM/files/validator" --testset tests --group g1
 echo "exit: $?"   # expect nonzero — g1 caps n at 1000
 ```
 
@@ -344,17 +380,47 @@ anything a generator might later produce.
 ## Reaching check
 
 A bound in `problem.json` that no test attains is a hole — the suite claims
-a limit it never actually tests. Confirm every declared bound is hit,
-per group:
+a limit it never actually tests. Confirm every declared bound is hit, per
+group — **with one log file per test, never a single shared log for the
+whole group.**
+
+`--testOverviewLogFileName` opens its target with `"wb"` (confirmed against
+`testlib.h`'s own handling of that option): every invocation **truncates**
+the file rather than appending to it. Loop several tests over the same log
+path — the shape the previous version of this section itself showed — and
+only the *last* invocation's hits survive; every earlier test's contribution
+is silently overwritten, not merged. The result still looks clean (exit 0,
+a plausible-looking log with some hits in it), not obviously broken, which
+is what makes this dangerous rather than merely wrong: a group where every
+bound really is reached, but reached by different tests, reads back as
+"most bounds unreached" — indistinguishable, from the log alone, from a
+genuinely weak suite.
 
 ```bash
-"$PROBLEM/validator" --testset tests --group g1 \
-    --testOverviewLogFileName "$PROBLEM/g1-overview.log" < "$PROBLEM/tests/g1/01.in"
-# repeat per test, or loop over the group; then inspect the log for any
-# bound whose "hit" side never appears
+rm -rf "$PROBLEM/.reach-g1" && mkdir -p "$PROBLEM/.reach-g1"
+i=0
+ok=1
+for f in "$PROBLEM"/tests/g1/*.in; do
+    i=$((i+1))
+    "$PROBLEM/files/validator" --testset tests --group g1 \
+        --testOverviewLogFileName "$PROBLEM/.reach-g1/$i.log" < "$f" \
+        || { echo "validator REJECTED $f" >&2; ok=0; }
+done
+# A rejected test leaves an EMPTY log, and an empty log contributes nothing to
+# the union below — which reads back as "that bound is unreached". Skipping
+# this check manufactures the exact false finding this section exists to
+# prevent, so fix every rejection before reading the union at all.
+[ "$ok" = 1 ] || echo "UNION IS NOT EVIDENCE — fix the rejections first" >&2
+# union across every per-test log, not just the last one written
+cat "$PROBLEM"/.reach-g1/*.log | grep -E '": (min|max)-value-hit' | sort -u
+rm -rf "$PROBLEM/.reach-g1"   # scratch output, not a package artifact
 ```
 
-**This only sees bounds read as numbers.** A `readInt` / `readLong` /
+A bound whose `min-value-hit` or `max-value-hit` line never appears
+**anywhere in the union** — not merely absent from the last test's log —
+is genuinely unreached. Repeat per group.
+
+**Even fixed this way, it only sees bounds read as numbers.** A `readInt` / `readLong` /
 `readDouble` with a min and max registers `constant-bounds` plus a
 `min-value-hit` / `max-value-hit` line — that is what makes the log
 meaningful. A string read with `readToken(pattern, "A")` or `readLine`
@@ -369,6 +435,19 @@ log, checking nothing. This is `flight`'s own bound shape
 does nothing for it, and a clean run reads as "nothing to report" when the
 truth is "this mechanism cannot see this bound".
 
+**The same blindness applies to a subtask-tightened numeric bound enforced
+via `ensure()`** — exactly the pattern the Validator section above
+recommends (`if (validator.group() == "g1") ensure(n <= G1_N_MAX);`).
+`n` itself is still read once, against the *global* range, for the
+hit-tracker's bookkeeping — so `g1`'s tightened `n <= G1_N_MAX` never
+registers its own `max-value-hit`; only the (usually uninteresting) global
+max does. Confirmed empirically: a group whose every test genuinely reaches
+its subtask-tightened maximum still shows no `max-value-hit` line for that
+variable in the union above. `ensure()`-tightened bounds are the standard
+way this pipeline expresses subtask bounds, not an edge case, so treat
+every such bound as belonging to the fallback check below by default,
+rather than trusting a hit-tracker line that will never appear for it.
+
 For any length (or otherwise non-numeric) bound, fall back to inspecting
 the tests directly — confirm the minimum and maximum are each attained in
 each group, e.g. (assuming `A` is the sole token on line 1 of each test,
@@ -376,7 +455,7 @@ adjust the field/line selector to match your own format):
 
 ```bash
 awk 'FNR==1{print length($1)}' "$PROBLEM"/tests/g1/*.in | sort -n | sed -n '1p;$p'
-# first number is the shortest A in the group, second the longest;
+# first line is the shortest value in the group, second the longest;
 # compare both against the declared bound by hand
 ```
 

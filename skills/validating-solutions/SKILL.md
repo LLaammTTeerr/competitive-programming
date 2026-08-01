@@ -31,13 +31,8 @@ this order".
 |---|---|
 | The generator, validator, or checker itself — `registerGen`, `registerValidation`, `wcmp`/`ncmp`, the test data doesn't exist yet | `competitive-programming:preparing-tests` |
 | The model solution's own algorithm is wrong or too slow, no test suite involved yet | `competitive-programming:solving-problems` |
-| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` — **Stage 2, not built yet.** Say so and stop; do not attempt the handoff. |
-
-The plugin ships five skills: `solving-problems`, `running-contests`,
-`preparing-tests`, `validating-solutions`, `writing-statements`. The one
-marked Stage 2 above is **not among them** — it cannot be invoked. If the
-request really belongs to it, say that it is not built yet and stop,
-rather than offering a handoff that will fail.
+| Auditing a finished package end to end — statement ambiguity, assumed definitions, unproven solution steps, no new phase to run | `competitive-programming:reviewing-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
 
 Ask only when genuinely ambiguous. **"Write me a checker" is not ambiguous —
 that's `preparing-tests`. "Are these tests good enough?" is not ambiguous
@@ -103,8 +98,39 @@ with what you observe, `tools/matrix_core.py`'s `compute_limits` and
 - **Memory is kernel-enforced.** `--cg-mem` plus `cg-oom-killed` in isolate's
   own meta file *is* the ML signal — not a polled RSS reading compared
   against a limit after the fact.
-- **Only stdin/stdout problems are supported.** File IO is rejected loudly by
-  `run_matrix`, not silently mishandled.
+- **Both IO modes run.** `problem.json`'s `io.input` / `io.output` are either
+  the sentinels `"stdin"` / `"stdout"` or a pair of bare filenames
+  (`flight.inp` / `flight.out`, the shape most VOI-style packages use).
+  `problem_meta` refuses anything else at load: a path separator, a
+  dot-segment, or the two names being equal. In file-IO mode `run_matrix`
+  copies the test into the sandbox's working directory under `io.input`,
+  `--chdir`s there, and reads the answer back from `io.output`; a solution
+  writes and reads *relative* names, exactly as it would on the real judge.
+  Nothing else changes — the zoo, the tags, the limits, `holes` and
+  `mismatches` are all identical between the two modes. **Generators and
+  validators are unaffected** (they are stdin/stdout testlib tools, and
+  `run_matrix` never invokes either one — its only subprocesses are `g++`,
+  `isolate`, the checker, and `git`), and **the checker already takes three
+  file paths**, `checker <input> <output> <answer>`, in both modes.
+- **`NO_OUTPUT` is a verdict only file-IO problems can produce**, and only
+  the harness ever produces it: a run that exited **cleanly** and never
+  created `io.output` — nearly always a solution writing the wrong filename.
+  Three things follow that matter when you read the matrix:
+  - It is **not WA.** An empty output handed to the checker would come back
+    WA and send you hunting a correct algorithm for a bug that is a
+    filename. `_classify` short-circuits before the checker instead.
+  - It is **not declarable.** `@expect` accepts only `OK WA TL ML PE RE`
+    (`scan_solutions.VERDICTS`), and `NO_OUTPUT` is deliberately absent, the
+    same as `FAIL`. So a zoo solution that writes the wrong filename always
+    surfaces as a **mismatch** (`expected WA, got NO_OUTPUT`), never as a
+    hole, and the matrix exits 1. That is the designed outcome: NO_OUTPUT
+    means the harness could not evaluate the run at all, which is a fact
+    about the *package*, and it must not be silently absorbed into a tag.
+  - It is ranked directly after `FAIL` in `matrix_core._SEVERITY`, so it
+    wins the group verdict over TL/ML/RE/WA. A crash or a time-limit kill
+    also leaves no output file, and both are reported as themselves —
+    `_classify` checks `killed` and `crashed` *before* `no_output`, so
+    NO_OUTPUT never names a symptom whose cause is already known.
 - **`isolate` defaults to one process.** A multi-threaded or multi-process
   wrong solution is not judged on timing at all — `run_matrix` still records
   whatever CPU time isolate measured before the crash, but the crash itself
@@ -287,8 +313,13 @@ crash being read as a finding:
   stdout as it exits. That is the signal to keep reading, not to retry the
   command.
 - **2** — **the matrix could not be run at all**: a compile failure, a
-  missing `tests/<group>/` directory, the file-IO guard, an unusable
-  sandbox, or a staging location on a memory-backed filesystem. One line on
+  missing `tests/<group>/` directory, an unusable sandbox, a staging
+  location on a memory-backed filesystem, or one of the file-IO refusals —
+  an `io.output` colliding with the driver's own staged stdout (`run.out`),
+  `io.input` equal to `io.output`, an output file the driver cannot read
+  back, or **the model solution exiting 0 without creating `io.output`**
+  (that last one would write an empty `.a` and measure every later verdict
+  against it, so it refuses instead). A message on
   stderr, nothing on stdout. This is a defect in the *package or the
   machine*, not a finding about the test suite — fix what the message names
   and run it again.
@@ -329,9 +360,22 @@ Runs only when two `accepted`-class solutions disagree on some input X:
 2. Run the tiny-N exhaustive brute (the `accepted`, exhaustive, tiny-N zoo
    entry) on the shrunk case. Whichever solution it agrees with is right.
 3. If the brute cannot decide — or cannot even be written, because the
-   behaviour genuinely is not defined anywhere in the statement — that is
-   **statement ambiguity**, and the exit is `writing-statements`. Never
-   silently pick a side because one solution "looks more careful."
+   behaviour genuinely is not defined anywhere in the statement — that is an
+   **unresolvable HIGH `statement-ambiguity`**, and it is a **STOP, not a
+   route**. Record the flag with `changes_if_wrong` populated, halt here, and
+   surface the reading decision to the human through `creating-problems`,
+   which is what enforces the stop. Do **not** hand off to
+   `writing-statements` and carry on validating, and do not pick a reading
+   yourself because one solution "looks more careful": every artifact
+   downstream — validator, checker, model solution, tests — is built against
+   whichever reading gets picked, so continuing past this point risks all of
+   it on a coin flip. This is spec §7's one exception, the same hard stop
+   `reviewing-problems` reaches under "The one hard stop" and
+   `creating-problems` draws as `STOP` in its phase diagram; all three must
+   agree, because this single edge is what the whole gate model hangs on.
+   (An ambiguity the arbiter *can* settle is not this case — the statement
+   does define the behaviour, one solution simply misread it, and that is
+   step 2's route back to `solving-problems`.)
 4. **Hard stop after 3 rounds regardless of outcome**, escalating with the
    minimal case reached so far — an arbiter that can run forever is not an
    arbiter, it's a stall.

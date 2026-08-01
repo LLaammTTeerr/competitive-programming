@@ -1,8 +1,9 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: five skills — two for solving
-(one problem, one whole contest), three for setting one (test data, solution
-validation, statement) — plus the bundled Codeforces MCP server. This repository
+Claude Code plugin for competitive programming: eight skills — two for solving
+(one problem, one whole contest), six for setting one (shaping the constraints,
+test data, solution validation, statement, package review, and end-to-end
+orchestration) — plus the bundled Codeforces MCP server. This repository
 is also a **marketplace**, so it can be used in place or installed on another
 machine.
 
@@ -10,9 +11,12 @@ machine.
 |---|---|---|
 | Skill `solving-problems` | `competitive-programming:solving-problems` | Algorithm design and C++ for one problem on a stdin/stdout judge — constraints → complexity budget → design → edge cases → clean implementation, with stress testing against a brute-force oracle |
 | Skill `running-contests` | `competitive-programming:running-contests` | Drives a whole contest on any judge: binds to whatever judge MCP is installed, pulls the problem set, orders it, delegates each problem to `solving-problems`, submits, reads verdicts, and keeps going until every problem is solved |
+| Skill `shaping-problems` | `competitive-programming:shaping-problems` | Turns a problem idea into numbers: a novelty check, the intended difficulty, the N that separates the intended solution from the naive one, and a subtask ladder that pays for real partial insight |
 | Skill `preparing-tests` | `competitive-programming:preparing-tests` | Builds the test-data contract for a problem being set: checker, validator, generators (random / max-size / boundary / structured-adversarial / hand-written), and sample selection, driven by testlib and `tools/gen_constraints_header.py` / `tools/drift_check.py` |
 | Skill `validating-solutions` | `competitive-programming:validating-solutions` | Attacks a problem's test suite with a zoo of deliberately-wrong solutions plus alternative and exhaustive-arbiter `accepted` solutions, runs the invocation matrix (`tools/run_matrix.py`) under `ioi/isolate`, and reports holes and mismatches |
 | Skill `writing-statements` | `competitive-programming:writing-statements` | Authors, translates, and reviews problem statements for the vnolymp LaTeX template — the Vietnamese statement package for problems prepared on Polygon |
+| Skill `reviewing-problems` | `competitive-programming:reviewing-problems` | Audits a finished problem package before it ships: mechanical checks (drift, unreached bounds, holes, checker/validator disagreement) via `tools/review_checks.py`, plus judgement checks (ambiguity, assumed definitions, unproven invariants) run fresh from the statement, recorded to `flags.json` |
+| Skill `creating-problems` | `competitive-programming:creating-problems` | The umbrella over the other five setting skills: drives a problem from an idea, finished or half-formed, to a Polygon-ready package end to end, gated phase by phase with machine-readable evidence from `tools/package_status.py` |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 
 ## Layout
@@ -26,12 +30,16 @@ competitive-programming/
 ├── skills/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
 │   ├── running-contests/SKILL.md   (+ references/judges.md)
+│   ├── shaping-problems/SKILL.md
 │   ├── preparing-tests/SKILL.md
 │   ├── validating-solutions/SKILL.md
-│   └── writing-statements/SKILL.md
-├── tools/                    # Python pipeline the two test-authoring skills drive
+│   ├── writing-statements/SKILL.md
+│   ├── reviewing-problems/SKILL.md
+│   └── creating-problems/SKILL.md
+├── tools/                    # Python pipeline the setting skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  bootstrap_testlib.sh
+│   ├── package_status.py  review_checks.py
 │   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
     ├── pyproject.toml  uv.lock
@@ -87,6 +95,22 @@ sudo systemctl enable --now isolate.service
 Verify with `isolate --version`; if `--init` still fails, the likely cause is a
 missing subuid/subgid range or `isolate.service` not running — both above.
 
+**Both IO modes are supported.** A problem's `problem.json` sets
+`io.input` / `io.output` either to the sentinels `"stdin"` / `"stdout"` or to a
+pair of bare filenames (`flight.inp` / `flight.out`, the shape most VOI-style
+packages use); anything else — a path separator, a dot-segment, the two names
+being equal — is refused at load. In file-IO mode `run_matrix.py` stages the
+test into the sandbox's one writable mount under `io.input`, `--chdir`s there,
+and reads the answer back from `io.output`. **Generators and validators are
+unaffected**: they are stdin/stdout testlib tools in both modes, and nothing in
+`tools/` executes either one. **The checker is unaffected too** — testlib
+checkers already take three file paths (`checker <input> <output> <answer>`),
+which is what `run_matrix.py` has always handed them. The one genuinely new
+outcome is the verdict `NO_OUTPUT`: a solution that exits cleanly and never
+creates `io.output`, almost always because it wrote the wrong filename. Like
+`FAIL`, it is discovered by the harness and can never be declared in a
+solution's `@expect`.
+
 ## Installing
 
 **Same machine** — clone into `~/.claude/skills/`. Anything there with a
@@ -131,7 +155,7 @@ directory is not importable`.
 ```bash
 cd <this repo>
 claude plugin validate . --strict                 # manifests
-claude plugin details competitive-programming     # inventory: 5 skills, 1 MCP server
+claude plugin details competitive-programming     # inventory: 8 skills, 1 MCP server
 
 python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
 (cd mcp-server && uv run --extra dev pytest -q)        # server suite (subshell)
@@ -140,6 +164,13 @@ python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
   | uvx --from ./mcp-server cf-mcp
 ```
+
+**The tools suite is not parallel-safe: run it alone.** `run_matrix.py`
+derives its `isolate` box ids from the process pid, so a second concurrent
+run of the suite (or any other `run_matrix` invocation) collides on the same
+sandbox boxes and produces failures that belong to neither run — spurious,
+irreproducible, and convincing enough to have already misled several
+debugging attempts. One suite at a time on a machine.
 
 The tools suite **fails** rather than skips when `g++`, `isolate`, or the
 testlib cache is missing: `run_matrix.py` is the one module with no fallback
@@ -152,6 +183,19 @@ After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new sess
 > **Note on the `mcp` pin.** `pyproject.toml` requires `mcp>=1.2,<2`. The server uses
 > `mcp.server.fastmcp`, which 2.0 removed — an unpinned `>=1.2.0` resolves to 2.0 and
 > fails at import. Keep the upper bound until the server is ported.
+
+> **Note on `flags.json.lock`.** `tools/flags.py` takes an advisory `flock` on a
+> separate lock file beside every problem package's `flags.json`, so concurrent
+> writers (several `dispatching-parallel-agents` subagents appending flags at once)
+> don't race each other's read-modify-write. That lock file — `flags.json.lock` —
+> is never unlinked: `flags.json` itself is replaced with `os.replace` on every
+> write, so a lock held on it would be a lock on an unlinked inode the moment the
+> first writer finished, and `flock` is released by `os.close` (or process death)
+> regardless of whether the file is ever removed. It is left on disk deliberately
+> rather than cleaned up, which means it is a **permanent** byproduct of running
+> this pipeline. Problem repositories (e.g. the one `creating-problems` and its
+> siblings write packages into) should gitignore `flags.json.lock`; this repo
+> itself never creates one, since no problem package lives here.
 
 ## Author
 

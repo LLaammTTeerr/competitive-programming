@@ -117,6 +117,59 @@ def _array(value, path: Path, what: str) -> list:
     return value
 
 
+def _string(value, path: Path, what: str) -> str:
+    """`value` as a Python str, or `ProblemMetaError` naming what was found.
+
+    The ids and names in this document are not decoration: consumers put them
+    straight into filesystem paths and set membership. `subtasks[].id` becomes
+    `problem_dir / "tests" / s.id` in `package_status._tests`, and a JSON
+    number there raises `TypeError: argument should be a str or an os.PathLike`
+    from a module whose contract is that it never raises. `checker.name`
+    becomes `files / problem.checker_name` the same way. A `depends_on` entry
+    is tested with `in seen_s` and any unhashable entry — `[{"a": 1}]`, an
+    ordinary hand-edit slip — raises `TypeError: unhashable type: 'dict'` from
+    inside `load` itself, bypassing the `ProblemMetaError` contract that is
+    supposed to describe every way this file can be wrong.
+
+    `constraints[].id` is the third: `gen_constraints_header.identifier()`
+    calls `re.sub` on it, which rejects a non-str with `TypeError`.
+
+    Standing ruling R1 again — every way `problem.json` can be wrong arrives
+    as a `ProblemMetaError` naming the field, so the two modules that promise
+    never to raise can keep that promise without guarding defensively at
+    every use site.
+    """
+    if not isinstance(value, str):
+        raise ProblemMetaError(
+            f"{path}: {what} is {value!r} (JSON {_type_name(value)}), "
+            "expected a string")
+    return value
+
+
+def _io_name(value, path: Path, what: str, *, literal: str) -> str:
+    """Validate an `io.input`/`io.output` value.
+
+    Either the exact sentinel (`"stdin"`/`"stdout"`) or a bare filename.
+    This value later drives an isolate `--dir` mount and a filename join
+    (Stage 3's file-IO support), so a path separator or a dot-segment is a
+    sandbox escape, not a style problem, and must be rejected here — before
+    it ever reaches those consumers — rather than trusted as free text.
+    """
+    name = _string(value, path, what)
+    if name == literal:
+        return name
+    if not name:
+        raise ProblemMetaError(f"{path}: {what} must not be empty")
+    if "/" in name or "\\" in name or "\0" in name:
+        raise ProblemMetaError(
+            f"{path}: {what} must be a bare filename with no path "
+            f"separator, got {name!r}")
+    if name in (".", "..") or name.startswith("../") or name.startswith("./"):
+        raise ProblemMetaError(
+            f"{path}: {what} must not contain a path segment, got {name!r}")
+    return name
+
+
 def _integer(value, path: Path, what: str, *, allow_none: bool = False):
     """`value` as a Python int, or `ProblemMetaError` naming what was found.
 
@@ -190,6 +243,7 @@ def load(path: str | Path) -> Problem:
             raise ProblemMetaError(
                 f"{path}: constraint missing required field {exc}"
             ) from exc
+        cid = _string(cid, path, f"constraints[{i}].id")
         constraints.append(Constraint(
             id=cid, expr=expr,
             min=_integer(c.get("min"), path, f"constraint {cid!r} min",
@@ -213,6 +267,7 @@ def load(path: str | Path) -> Problem:
             raise ProblemMetaError(
                 f"{path}: subtask missing required field {exc}"
             ) from exc
+        sid = _string(sid, path, f"subtasks[{i}].id")
         # `except KeyError` around this comprehension could never have
         # caught the bounds case: a non-object bound raises AttributeError
         # from `.get`, not KeyError.
@@ -232,8 +287,12 @@ def load(path: str | Path) -> Problem:
             bounds=bounds,
             constraints_text=list(_array(s.get("constraints_text", []), path,
                                          f"subtask {sid!r} 'constraints_text'")),
-            depends_on=list(_array(s.get("depends_on", []), path,
-                                   f"subtask {sid!r} 'depends_on'")),
+            depends_on=[
+                _string(dep, path, f"subtask {sid!r} depends_on[{j}]")
+                for j, dep in enumerate(
+                    _array(s.get("depends_on", []), path,
+                           f"subtask {sid!r} 'depends_on'"))
+            ],
         ))
 
     seen_s: set[str] = set()
@@ -258,6 +317,40 @@ def load(path: str | Path) -> Problem:
                     f"{path}: subtask {s.id!r} bounds unknown constraint {cid!r}"
                 )
 
+    order: dict[str, int] = {}
+    visiting: set[str] = set()
+    subtask_by_id = {s.id: s for s in subtasks}
+
+    # Stack contains (phase, sid, trail) tuples.
+    # phase is "enter" (visiting node) or "leave" (cleanup after dependencies).
+    stack = [("enter", s.id, []) for s in subtasks]
+
+    while stack:
+        phase, sid, trail = stack.pop()
+
+        if phase == "leave":
+            visiting.discard(sid)
+            order[sid] = len(order)
+            continue
+
+        # phase == "enter"
+        if sid in order:
+            continue
+        if sid in visiting:
+            loop = trail[trail.index(sid):] + [sid]
+            raise ProblemMetaError(
+                f"{path}: subtask dependency cycle: {' -> '.join(loop)}"
+            )
+        visiting.add(sid)
+        subtask = subtask_by_id[sid]
+
+        # Push leave phase first (so it executes after dependencies are processed).
+        stack.append(("leave", sid, trail))
+
+        # Push dependencies in reverse order (to maintain left-to-right order when popped).
+        for dep in reversed(subtask.depends_on):
+            stack.append(("enter", dep, trail + [sid]))
+
     try:
         name = raw["name"]
     except KeyError as exc:
@@ -277,6 +370,56 @@ def load(path: str | Path) -> Problem:
         checker_name = checker["name"]
     except KeyError as exc:
         raise ProblemMetaError(f"{path}: missing required field in checker {exc}") from exc
+    checker_name = _string(checker_name, path, "checker.name")
+
+    io_input = _io_name(io.get("input", "stdin"), path, "io.input",
+                        literal="stdin")
+    io_output = _io_name(io.get("output", "stdout"), path, "io.output",
+                         literal="stdout")
+    # Cross-field, so it cannot live in `_io_name` (which sees one value at a
+    # time). Measured, not theorised: with both names equal, `run_matrix`
+    # stages the test input under that name into the sandbox's working
+    # directory and then reads the *same* file back as the solution's answer,
+    # so a solution that writes nothing at all has the test input handed to
+    # the checker as its output. That is a silently confident wrong verdict —
+    # the one failure class this pipeline exists to prevent — and the
+    # sentinels cannot collide ("stdin" != "stdout"), so this only ever fires
+    # on a genuine file-IO mistake.
+    if io_input == io_output:
+        raise ProblemMetaError(
+            f"{path}: io.input and io.output are both {io_input!r} — the "
+            "solution would write its answer over the file it read the test "
+            "from, and a solution that wrote nothing would have the test "
+            "input itself checked as its answer. Give them different names.")
+
+    # The other cross-field property, and the other half of the same
+    # neighbourhood: the two sentinels are a *pair*. `run_matrix` decides
+    # between its two IO modes with a single OR (`io.input != "stdin" or
+    # io.output != "stdout"`), so `{"input": "prob.inp", "output": "stdout"}`
+    # runs the whole package in file-IO mode with `"stdout"` reinterpreted as
+    # a literal filename no solution will ever create. Every solution then
+    # comes back NO_OUTPUT and pass 1 aborts — loud, but the diagnostic talks
+    # about a missing file called `stdout` rather than about a half-converted
+    # `io` block, which is the actual mistake. Mixed IO is not a mode this
+    # pipeline supports; refusing it here, before anything is compiled, is
+    # cheaper than explaining it later.
+    stdin_sentinel = io_input == "stdin"
+    stdout_sentinel = io_output == "stdout"
+    if stdin_sentinel != stdout_sentinel:
+        # The field still holding a sentinel is the one that gets
+        # reinterpreted, because the OR has already switched the whole run
+        # into file-IO mode around it.
+        stranded = "io.input" if stdin_sentinel else "io.output"
+        raise ProblemMetaError(
+            f"{path}: io.input is {io_input!r} and io.output is "
+            f"{io_output!r} — mixed IO is not supported. A problem either "
+            'reads stdin and writes stdout ({"input": "stdin", "output": '
+            '"stdout"}) or reads and writes two named files ({"input": '
+            '"prob.inp", "output": "prob.out"}); there is no mode where one '
+            f"side is a sentinel and the other is a filename. As written, "
+            f"{stranded} would be treated as a literal filename, and every "
+            "solution would be judged against a file no solution writes. "
+            "This is a half-converted io block, not a filename problem.")
 
     return Problem(
         name=name,
@@ -286,11 +429,11 @@ def load(path: str | Path) -> Problem:
         time_ms_computed=_integer(limits.get("time_ms_computed"), path,
                                   "limits.time_ms_computed", allow_none=True),
         memory_mb=memory_mb,
-        input=io.get("input", "stdin"),
-        output=io.get("output", "stdout"),
+        input=io_input,
+        output=io_output,
         checker_kind=checker_kind,
         checker_name=checker_name,
         constraints=constraints,
         subtasks=subtasks,
-        examples=list(_array(raw.get("examples", []), path, "'examples'")),
+        examples=[_object(e, path, f"examples[{i}]") for i, e in enumerate(_array(raw.get("examples", []), path, "'examples'"))],
     )

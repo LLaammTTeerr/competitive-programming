@@ -5,6 +5,10 @@ from pathlib import Path
 
 from tools.problem_meta import ProblemMetaError, load
 
+# Anchored to this file, not to the process's working directory — see
+# test_run_matrix.py / test_package_status.py, which document why.
+FIXTURE = Path(__file__).parent / "fixtures" / "mini"
+
 VALID = {
     "schema": 1,
     "name": "flight",
@@ -203,6 +207,218 @@ class TestRejectsNonIntegerBounds(unittest.TestCase):
         bad["constraints"][0]["max"] = 20.0
         with self.assertRaisesRegex(ProblemMetaError, "expected an integer"):
             load(write(bad))
+
+
+class TestRejectsCycles(unittest.TestCase):
+    def test_rejects_a_self_dependency(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["depends_on"] = ["g1"]
+        with self.assertRaisesRegex(ProblemMetaError, "g1"):
+            load(write(bad))
+
+    def test_rejects_a_two_node_cycle(self):
+        bad = json.loads(json.dumps(VALID))
+        bad["subtasks"][0]["depends_on"] = ["g2"]
+        bad["subtasks"][1]["depends_on"] = ["g1"]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(bad))
+
+    def test_accepts_a_diamond_which_is_not_a_cycle(self):
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"].append({"id": "g3", "points": 0, "bounds": {},
+                               "constraints_text": [], "depends_on": ["g1", "g2"]})
+        ok["subtasks"][1]["depends_on"] = ["g1"]
+        problem = load(write(ok))
+        self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3"])
+
+    def test_accepts_a_deep_reverse_chain_of_2000_subtasks(self):
+        """Regression test: deep chain (g1→g2→...→g2000) raises RecursionError on pre-fix recursive code.
+
+        This test builds a reverse-order dependency chain where each subtask depends on
+        the next, with g1 declared first. When visit(g1) is called, it recursively
+        walks g1→g2→...→g2000, which with the recursive implementation would exceed
+        Python's ~1000 recursion limit. The iterative implementation must handle this.
+        """
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = []
+        # Build reverse-order chain: g1 depends on g2, g2 depends on g3, ..., g1999 depends on g2000
+        for i in range(2000):
+            depends = [f"g{i + 2}"] if i < 1999 else []
+            ok["subtasks"].append({
+                "id": f"g{i + 1}",
+                "points": 100 if i == 1999 else 0,
+                "bounds": {},
+                "constraints_text": [],
+                "depends_on": depends
+            })
+        problem = load(write(ok))
+        self.assertEqual(len(problem.subtask_ids()), 2000)
+
+    def test_accepts_a_linear_chain_of_2000_subtasks_forward_order(self):
+        """Large-input smoke test: forward-order chain (g1, g2→g1, g3→g2, ...).
+
+        This variant does not trigger deep recursion because each subtask depends on
+        an already-visited node, so it passes both pre-fix and post-fix code.
+        Useful as a smoke test for large inputs but does NOT guard against recursion depth.
+        """
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = []
+        for i in range(2000):
+            depends = [] if i == 0 else [f"g{i}"]
+            ok["subtasks"].append({
+                "id": f"g{i + 1}",
+                "points": 0 if i > 0 else 100,
+                "bounds": {},
+                "constraints_text": [],
+                "depends_on": depends
+            })
+        problem = load(write(ok))
+        self.assertEqual(len(problem.subtask_ids()), 2000)
+
+    def test_rejects_a_cycle_at_depth_1500(self):
+        """Regression test: cycle detected at depth 1500 raises ProblemMetaError, not RecursionError.
+
+        Builds a deep reverse-order chain (g1→g2→...→g1500) with g1500 depending on itself.
+        With the recursive implementation, detecting the self-loop at depth 1500 would
+        require ~1500 nested calls before hitting the revisit check, exceeding Python's
+        recursion limit. The iterative implementation must handle this.
+        """
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = []
+        # Build reverse-order chain: g1 depends on g2, g2 depends on g3, ..., g1499 depends on g1500
+        for i in range(1500):
+            depends = [f"g{i + 2}"] if i < 1499 else [f"g{i + 1}"]  # g1500 depends on itself
+            ok["subtasks"].append({
+                "id": f"g{i + 1}",
+                "points": 100 if i == 1499 else 0,
+                "bounds": {},
+                "constraints_text": [],
+                "depends_on": depends
+            })
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(ok))
+
+    def test_rejects_a_cycle_not_involving_first_visited_subtask(self):
+        """A cycle among later subtasks must be detected."""
+        ok = json.loads(json.dumps(VALID))
+        # g1 has no dependencies (root)
+        # g2, g3, g4 form a cycle not involving g1
+        ok["subtasks"] = [
+            {"id": "g1", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": []},
+            {"id": "g2", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g3"]},
+            {"id": "g3", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g4"]},
+            {"id": "g4", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": ["g2"]},
+        ]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(ok))
+
+    def test_rejects_disjoint_components_one_cyclic(self):
+        """Two disconnected graphs, one acyclic and one cyclic."""
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = [
+            {"id": "g1", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": []},
+            {"id": "g2", "points": 50, "bounds": {}, "constraints_text": [], "depends_on": ["g1"]},
+            {"id": "g3", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g4"]},
+            {"id": "g4", "points": 0, "bounds": {}, "constraints_text": [], "depends_on": ["g3"]},
+        ]
+        with self.assertRaisesRegex(ProblemMetaError, "cycle"):
+            load(write(ok))
+
+    def test_accepts_fan_in_that_is_not_a_cycle(self):
+        """Multiple nodes depending on the same parent is not a cycle."""
+        ok = json.loads(json.dumps(VALID))
+        ok["subtasks"] = [
+            {"id": "g1", "points": 20, "bounds": {}, "constraints_text": [], "depends_on": []},
+            {"id": "g2", "points": 20, "bounds": {}, "constraints_text": [], "depends_on": ["g1"]},
+            {"id": "g3", "points": 20, "bounds": {}, "constraints_text": [], "depends_on": ["g1"]},
+            {"id": "g4", "points": 40, "bounds": {}, "constraints_text": [], "depends_on": ["g2", "g3"]},
+        ]
+        problem = load(write(ok))
+        self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3", "g4"])
+
+
+class TestIoValidation(unittest.TestCase):
+    """`io.input`/`io.output` reach an isolate `--dir` mount and a filename
+    join later in the pipeline, so a path separator or a dot-segment is a
+    sandbox escape, not a style nit — these must never load."""
+
+    def _load_with_io(self, io):
+        problem = json.loads((FIXTURE / "problem.json").read_text(encoding="utf-8"))
+        problem["io"] = io
+        tmp = Path(tempfile.mkdtemp()) / "problem.json"
+        tmp.write_text(json.dumps(problem), encoding="utf-8")
+        return load(tmp)
+
+    def test_io_input_rejects_path_separator(self):
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "sub/dir.inp", "output": "x.out"})
+        self.assertIn("io.input", str(ctx.exception))
+
+    def test_io_output_rejects_dot_segment(self):
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "x.inp", "output": "../escape.out"})
+        self.assertIn("io.output", str(ctx.exception))
+
+    def test_io_input_rejects_bare_dot_segment(self):
+        # No "/" at all — this is the one case the separator check does not
+        # already catch, so it is the only test that actually exercises the
+        # dot-segment branch rather than the separator branch.
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "..", "output": "x.out"})
+        self.assertIn("io.input", str(ctx.exception))
+
+    def test_io_rejects_non_string(self):
+        with self.assertRaises(ProblemMetaError):
+            self._load_with_io({"input": 5, "output": "x.out"})
+
+    def test_io_rejects_empty_string(self):
+        with self.assertRaises(ProblemMetaError):
+            self._load_with_io({"input": "", "output": "x.out"})
+
+    def test_io_rejects_the_same_name_for_input_and_output(self):
+        # Cross-field, so `_io_name` (one value at a time) cannot catch it.
+        # Measured in run_matrix: with both names equal the staged test
+        # input IS the file read back as the answer, so a solution that
+        # writes nothing has the test data checked as its output and passes
+        # every test. Refused at load time, before anything is compiled.
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "t.txt", "output": "t.txt"})
+        message = str(ctx.exception)
+        self.assertIn("io.input", message)
+        self.assertIn("io.output", message)
+        self.assertIn("t.txt", message)
+
+    def test_io_rejects_one_sentinel_and_one_filename(self):
+        # The other cross-field property. `run_matrix` picks its IO mode with
+        # a single OR (`io.input != "stdin" or io.output != "stdout"`), so a
+        # half-converted `io` block runs the entire package in file-IO mode
+        # with the surviving sentinel reinterpreted as a literal filename no
+        # solution will ever open or create. Every solution then comes back
+        # NO_OUTPUT and pass 1 aborts — loud, but with a diagnostic about a
+        # missing file called `stdout` rather than about the `io` block,
+        # which is where the mistake actually is. Refused at load time, in
+        # the same place as `input == output` and for the same reason: it is
+        # a property of the pair, not of either name.
+        for io, stranded in (({"input": "prob.inp", "output": "stdout"}, "io.output"),
+                             ({"input": "stdin", "output": "prob.out"}, "io.input")):
+            with self.subTest(io=io):
+                with self.assertRaises(ProblemMetaError) as ctx:
+                    self._load_with_io(io)
+                message = str(ctx.exception)
+                self.assertIn("io.input", message)
+                self.assertIn("io.output", message)
+                self.assertIn("mixed IO", message)
+                # It must name the side that gets reinterpreted — that is the
+                # whole difference between this message and the one the
+                # driver used to produce.
+                self.assertIn(f"As written, {stranded} would be treated as a "
+                              f"literal filename", message)
+
+    def test_io_accepts_stdin_stdout_and_bare_filenames(self):
+        p = self._load_with_io({"input": "stdin", "output": "stdout"})
+        self.assertEqual((p.input, p.output), ("stdin", "stdout"))
+        p = self._load_with_io({"input": "flight.inp", "output": "flight.out"})
+        self.assertEqual((p.input, p.output), ("flight.inp", "flight.out"))
 
 
 if __name__ == "__main__":

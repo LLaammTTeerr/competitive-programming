@@ -102,6 +102,30 @@ class TestCheck(unittest.TestCase):
         problems = check(PROBLEM, TEX.replace("input  = stdin", "input  = flight.inp"))
         self.assertIn("input", problems[0])
 
+    def test_detects_output_mismatch(self):
+        problems = check(PROBLEM, TEX.replace("output = stdout", "output = flight.out"))
+        self.assertIn("output", problems[0])
+
+    def test_matching_file_based_io_is_not_reported(self):
+        # A file-IO problem (Task 1's io.input/io.output sentinel-or-bare-
+        # filename validation) whose statement names the same files must not
+        # drift, even though neither side is "stdin"/"stdout".
+        problem = dataclasses.replace(PROBLEM, input="flight.inp", output="flight.out")
+        tex = TEX.replace("input  = stdin, output = stdout",
+                           "input  = flight.inp, output = flight.out")
+        self.assertEqual(check(problem, tex), [])
+
+    def test_mismatched_file_based_io_is_reported(self):
+        # The motivating case: the statement promises a filename but
+        # problem.json still says stdin/stdout (or a different filename) —
+        # this sends every solution to NO_OUTPUT with no explanation, so it
+        # must surface here rather than at grading time.
+        tex = TEX.replace("input  = stdin, output = stdout",
+                           "input  = flight.inp, output = flight.out")
+        issues = check(PROBLEM, tex)
+        self.assertTrue(any("input" in d for d in issues), issues)
+        self.assertTrue(any("output" in d for d in issues), issues)
+
 
 class TestMainErrorHandling(unittest.TestCase):
     def test_main_raises_drift_check_error_on_missing_statement_file(self):
@@ -266,6 +290,85 @@ Text with 100\% accuracy.
         # Should not find fake subtasks from the \% in text
         self.assertEqual(parsed["subtask_points"], [40, 60],
                         "Escaped \\% should not be treated as comment")
+
+    def test_commented_out_input_key_is_ignored(self):
+        """In the spirit of Finding 2 (commented-out \\subtask): a
+        commented-out override line, superseded by a real one, must not
+        leak a stale `input`/`output` value into the parsed keys.
+
+        The `%` must precede a throwaway token with no `=` ("superseded")
+        so that, once `_strip_comments` removes the whole line, nothing is
+        left behind — but if stripping were a no-op, the comma right after
+        "superseded" would hand the brace-aware comma-splitter a *clean*
+        standalone `input = flight.inp` token (no `%` glued to it, unlike
+        `% input = ...` where the `%` sticks to the key name and never
+        collides with `"input"` at all). That clean token would then
+        overwrite the real pair, since dict assignment is last-pair-wins.
+        Only real comment-stripping prevents that collision — so this test
+        is red exactly when `_strip_comments` is broken, not incidentally.
+        """
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  input  = stdin, output = stdout,
+  % superseded, input = flight.inp, output = flight.out,
+  time   = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["input"], "stdin")
+        self.assertEqual(parsed["output"], "stdout")
+        self.assertEqual(check(PROBLEM, tex), [])
+
+    def test_input_word_inside_another_keys_value_is_ignored(self):
+        """In the spirit of Finding 3 (origin's bracketed value): a comma
+        *inside* another key's braced value — the character brace-depth
+        tracking exists to protect — must not be treated as a top-level
+        separator, even when the text on either side of it reads exactly
+        like a real `input =` / `output =` pair.
+
+        Without brace-depth tracking, the comma-splitter would cut
+        `note = {bản nháp: input = flight.inp, output = flight.out, đã sửa}`
+        into pieces at every comma, including the ones inside the braces.
+        The piece right after each such internal comma —
+        ` input = flight.inp` and ` output = flight.out` — has no `%` or
+        `note =` prefix glued to it (that contamination lands on the
+        *previous* piece instead, split at the same broken comma), so it
+        parses as a clean, standalone `input`/`output` pair and overwrites
+        the real one below it. Only correct brace-depth tracking keeps the
+        whole `{...}` a single value and prevents that collision — so this
+        test is red exactly when brace-awareness is broken, not
+        incidentally (there is no top-level `]` inside the braces for the
+        *other* loop to trip on, unlike `test_origin_key_with_bracketed_value`).
+        """
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\begin{problem}[
+  input  = stdin, output = stdout,
+  note = {bản nháp: input = flight.inp, output = flight.out, đã sửa},
+  time   = 1, memory = 256,
+]{Title}
+Text.
+\begin{subtasks}
+  \subtask{40}{a}
+  \subtask{60}{b}
+\end{subtasks}
+\end{problem}
+\end{document}
+"""
+        parsed = parse_tex(tex)
+        self.assertEqual(parsed["input"], "stdin")
+        self.assertEqual(parsed["output"], "stdout")
+        self.assertEqual(check(PROBLEM, tex), [])
 
 
 if __name__ == "__main__":
