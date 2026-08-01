@@ -37,6 +37,7 @@ this order".
 | A diff, a PR, a set of commits | `/code-review` — that audits **changed lines**, with a base and a head SHA; this skill has no notion of a diff at all, only a directory on disk that may never have touched git |
 | Is my test suite strong enough against a zoo of deliberately-wrong solutions | `competitive-programming:validating-solutions` |
 | A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
+| Writing, translating or fixing up the `.tex` itself — the prose, the subtasks table, the `\exmpfile` lines | `competitive-programming:writing-statements` — that skill *authors*; this one only reads a finished statement and reports. "Check my statement" is claimed verbatim by both descriptions, so it is the one phrase worth asking about |
 
 Ask only when genuinely ambiguous. **"Review this problem before I ship it"
 is not ambiguous — that's here. "Review my last three commits" is** — that's

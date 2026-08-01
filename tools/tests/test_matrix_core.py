@@ -144,6 +144,13 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(out.verdict, "OK")
         self.assertFalse(out.banded)
 
+    def test_classify_passes_no_output_through_but_time_wins(self):
+        limits = Limits(t_main_ms=500, tl_ms=1000, kill_ms=2000)
+        self.assertEqual(classify(10, False, "NO_OUTPUT", limits).verdict, "NO_OUTPUT")
+        # A run that exceeded the limit is TL, never NO_OUTPUT — time is decided first.
+        self.assertEqual(classify(1500, False, "NO_OUTPUT", limits).verdict, "TL")
+        self.assertEqual(classify(10, True, "NO_OUTPUT", limits).verdict, "TL")
+
 
 class TestGroupVerdict(unittest.TestCase):
     def test_all_ok_is_ok(self):
@@ -164,6 +171,20 @@ class TestGroupVerdict(unittest.TestCase):
         from tools.matrix_core import group_verdict
         with self.assertRaises(ValueError):
             group_verdict([])
+
+    def test_no_output_ranks_just_below_fail(self):
+        from tools.matrix_core import group_verdict
+        self.assertEqual(group_verdict(["OK", "NO_OUTPUT", "WA"]), "NO_OUTPUT")
+        self.assertEqual(group_verdict(["FAIL", "NO_OUTPUT"]), "FAIL")
+
+    def test_no_output_outranks_every_solution_verdict(self):
+        from tools.matrix_core import group_verdict
+        for weaker in ("TL", "ML", "RE", "PE", "WA", "OK"):
+            self.assertEqual(group_verdict([weaker, "NO_OUTPUT"]), "NO_OUTPUT", weaker)
+
+    def test_no_output_is_not_declarable(self):
+        from tools.scan_solutions import VERDICTS
+        self.assertNotIn("NO_OUTPUT", VERDICTS)
 
 
 class TestCompare(unittest.TestCase):

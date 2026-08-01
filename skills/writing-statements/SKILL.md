@@ -24,6 +24,82 @@ problem directory outside the template checkout, what "done" means, and the
 conventions that keep twenty statements in a booklet looking like one
 document.
 
+This skill owns the **prose and the build** — the `.tex`, the Vietnamese,
+and a PDF that is actually right. It does not own the numbers those
+sentences quote (`shaping-problems`) and it does not own the data
+`\exmpfile` points at (`preparing-tests`).
+
+## Am I the right skill?
+
+Routing happens before a skill loads, so a description cannot ask a
+question. If the request plausibly means one of these instead, **ask before
+doing anything** — one question, options being each neighbour and "both, in
+this order".
+
+| If it's really about | Use |
+|---|---|
+| The numbers the prose quotes — what `N`, what subtask ladder, what difficulty, is this problem already known | `competitive-programming:shaping-problems` |
+| The sample data itself rather than the `\exmpfile` lines referencing it — checker, validator, generators, which tests become samples | `competitive-programming:preparing-tests` |
+| Auditing a finished package end to end with fresh context — is any sentence readable two ways, no new phase to run | `competitive-programming:reviewing-problems` |
+| A finished idea that needs the whole pipeline sequenced, with gates | `competitive-programming:creating-problems` |
+| Solving the problem rather than setting it | `competitive-programming:solving-problems` |
+
+Ask only when genuinely ambiguous. **"Translate this statement into
+Vietnamese" is not ambiguous — that's here. "Check my statement" is** —
+that could mean the build and the prose here, or the fresh-context
+ambiguity audit in `reviewing-problems`, whose own description claims those
+same three words. The difference is not cosmetic: this skill reads the
+statement as its author, `reviewing-problems` deliberately reads it as
+someone who has never seen it, and an author cannot perform that second
+reading on their own text — which is the whole reason they are separate.
+
+## Two passes, and where each one exits
+
+This skill is not a phase the pipeline visits once. `creating-problems`
+dispatches it **twice** — its phase diagram draws both edges — because a
+sample is test data and this skill will not author test data (see "Sample
+data belongs to whatever produces the tests" below).
+
+**Pass 1 — everything except `\Examples`.** Entered from
+`creating-problems` at the head of the pipeline, once `shaping-problems`
+has `problem.json` parsing. It finishes at the `statement` row of
+`PHASE_ORDER` in `tools/package_status.py`: a `.tex` under the problem
+directory. What follows there is `constraints_header` — a
+`python3 -m tools.gen_constraints_header` run owned by `preparing-tests`,
+not an authoring phase, which is why `creating-problems` does not draw it
+as a box — and then `model_solution`. So the exit is back to
+`creating-problems`, which dispatches those in that order. Working without
+the umbrella, hand to `solving-problems` for `sol-main.cpp` and say the
+constraints header still has to be generated. Do not wait for samples;
+they cannot exist yet.
+
+**Pass 2 — `\Examples` and `\Explanation`.** Entered from
+`preparing-tests` once it has picked 2–3 samples and handed the prose back,
+by way of `creating-problems`' loop-back edge. `samples` is the last row of
+`PHASE_ORDER`, so the exit from here is the final audit:
+`reviewing-problems`, dispatched by `creating-problems` with fresh context.
+
+**An unresolvable HIGH `statement-ambiguity` is a STOP, and it does not
+route here.** When the arbiter in `validating-solutions` cannot settle a
+disagreement because the behaviour genuinely is not defined anywhere in the
+statement, the pipeline **halts** and a human picks the reading. It is not
+handed back to this skill to be rewritten on a guess, because every
+artifact already built — validator, checker, model solution, tests — was
+built against whichever reading gets picked. `validating-solutions`' step 3
+("do not hand off to `writing-statements` and carry on validating"),
+`reviewing-problems`' "The one hard stop", and `creating-problems`' `STOP`
+node all say this, and this paragraph is the fourth copy on purpose: the
+edge only holds if every skill touching it agrees. This skill re-enters
+that case **after** the human has chosen a reading, never instead of them.
+
+That is a different thing from the ambiguities this skill finds while
+writing, which are handled under "Surface the ambiguities you find" below —
+make the minimum assumption, report it, name what changes if the author
+decides otherwise, and carry on. The test is whether a coherent statement
+can be written at all: if it can, the ambiguity is a finding; if nothing in
+any reading resolves it and the package downstream is already built on it,
+it is the stop.
+
 ## Get the template
 
 The package is not on CTAN. Clone it shallow (908K) and cache it, so a
@@ -171,8 +247,10 @@ before the setter does.
   \end{example}
   ```
 
-  Then hand off to test generation. Statements and tests converge from two
-  directions; this skill owns the prose and the build, not the data.
+  Then exit as pass 1 above — `solving-problems` and `preparing-tests` both
+  run before any sample exists — and expect a second dispatch to fill this
+  block in. Statements and tests converge from two directions; this skill
+  owns the prose and the build, not the data.
 
 ## Surface the ambiguities you find
 

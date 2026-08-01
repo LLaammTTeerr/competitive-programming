@@ -110,14 +110,41 @@ applies now that the validator and the header are colocated.)
 
 Never `-ffast-math` — testlib detects it at runtime and aborts.
 
-## Two things the pipeline assumes, stated up front
+## Two things about the pipeline, stated up front
 
-**Only stdin/stdout problems are supported.** `problem.json`'s `io.input` /
-`io.output` must be `"stdin"` / `"stdout"`. File-based IO (`flight.inp` /
-`flight.out`, the shape most VOI-style packages use) is rejected loudly by
-`run_matrix.py` — it is a later feature, not a silent partial mode. If the
-problem was scoped around file IO, that is a scoping decision to revisit
-with the user — not something to route around here.
+**Both IO modes are supported, and the test-data tools are the same in
+either.** `problem.json`'s `io.input` / `io.output` are either the sentinels
+`"stdin"` / `"stdout"` or a pair of bare filenames — file-based IO
+(`flight.inp` / `flight.out`, the shape most VOI-style packages use) runs
+end to end. `problem_meta.py` validates the pair at load and refuses a path
+separator, a dot-segment, or the two names being equal, so anything that
+reaches the sandbox is a plain filename inside its working directory.
+
+What that does **not** change is everything this skill builds:
+
+- **Generators and validators are unaffected.** They are stdin/stdout
+  testlib tools in both modes — a generator writes the test to stdout, a
+  validator reads it from stdin — and *nothing in `tools/` ever executes
+  either one* (`run_matrix.py`'s only subprocesses are `g++`, `isolate`,
+  the checker, and `git`). You run them yourself, exactly as the commands
+  below show, and the redirections below are correct for a file-IO problem
+  without a single change.
+- **The checker already takes three file paths** — `checker <input>
+  <output> <answer>` — which is testlib's interface regardless of how the
+  solution obtained its output. `run_matrix.py` hands it paths it has
+  already copied out of the sandbox, so a stock checker (`wcmp`, `ncmp`,
+  `rcmp6`) is the same choice in both modes.
+- **The solution is the only thing that differs**: it opens `io.input` and
+  `io.output` by relative name in its working directory, which the driver
+  arranges (`--chdir` into the one writable mount, the test staged there
+  under `io.input`). A model solution that writes to stdout in a file-IO
+  package makes `run_matrix.py` refuse outright rather than bank an empty
+  answer file, and any *other* solution that writes the wrong filename gets
+  the verdict `NO_OUTPUT` — see `validating-solutions`.
+- **The statement must agree.** `tools/drift_check.py` compares the
+  vnolymp `input =` / `output =` keys against `problem.json`, the same way
+  it compares bounds; a statement promising `flight.inp` while
+  `problem.json` says `stdin` is reported as drift.
 
 **Every *solution* run is measured under `ioi/isolate`**, not a bare
 `fork`/`exec`. There is no fallback runner, and `run_matrix.py` refuses to

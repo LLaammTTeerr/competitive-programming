@@ -5,6 +5,10 @@ from pathlib import Path
 
 from tools.problem_meta import ProblemMetaError, load
 
+# Anchored to this file, not to the process's working directory — see
+# test_run_matrix.py / test_package_status.py, which document why.
+FIXTURE = Path(__file__).parent / "fixtures" / "mini"
+
 VALID = {
     "schema": 1,
     "name": "flight",
@@ -331,6 +335,90 @@ class TestRejectsCycles(unittest.TestCase):
         ]
         problem = load(write(ok))
         self.assertEqual(problem.subtask_ids(), ["g1", "g2", "g3", "g4"])
+
+
+class TestIoValidation(unittest.TestCase):
+    """`io.input`/`io.output` reach an isolate `--dir` mount and a filename
+    join later in the pipeline, so a path separator or a dot-segment is a
+    sandbox escape, not a style nit — these must never load."""
+
+    def _load_with_io(self, io):
+        problem = json.loads((FIXTURE / "problem.json").read_text(encoding="utf-8"))
+        problem["io"] = io
+        tmp = Path(tempfile.mkdtemp()) / "problem.json"
+        tmp.write_text(json.dumps(problem), encoding="utf-8")
+        return load(tmp)
+
+    def test_io_input_rejects_path_separator(self):
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "sub/dir.inp", "output": "x.out"})
+        self.assertIn("io.input", str(ctx.exception))
+
+    def test_io_output_rejects_dot_segment(self):
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "x.inp", "output": "../escape.out"})
+        self.assertIn("io.output", str(ctx.exception))
+
+    def test_io_input_rejects_bare_dot_segment(self):
+        # No "/" at all — this is the one case the separator check does not
+        # already catch, so it is the only test that actually exercises the
+        # dot-segment branch rather than the separator branch.
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "..", "output": "x.out"})
+        self.assertIn("io.input", str(ctx.exception))
+
+    def test_io_rejects_non_string(self):
+        with self.assertRaises(ProblemMetaError):
+            self._load_with_io({"input": 5, "output": "x.out"})
+
+    def test_io_rejects_empty_string(self):
+        with self.assertRaises(ProblemMetaError):
+            self._load_with_io({"input": "", "output": "x.out"})
+
+    def test_io_rejects_the_same_name_for_input_and_output(self):
+        # Cross-field, so `_io_name` (one value at a time) cannot catch it.
+        # Measured in run_matrix: with both names equal the staged test
+        # input IS the file read back as the answer, so a solution that
+        # writes nothing has the test data checked as its output and passes
+        # every test. Refused at load time, before anything is compiled.
+        with self.assertRaises(ProblemMetaError) as ctx:
+            self._load_with_io({"input": "t.txt", "output": "t.txt"})
+        message = str(ctx.exception)
+        self.assertIn("io.input", message)
+        self.assertIn("io.output", message)
+        self.assertIn("t.txt", message)
+
+    def test_io_rejects_one_sentinel_and_one_filename(self):
+        # The other cross-field property. `run_matrix` picks its IO mode with
+        # a single OR (`io.input != "stdin" or io.output != "stdout"`), so a
+        # half-converted `io` block runs the entire package in file-IO mode
+        # with the surviving sentinel reinterpreted as a literal filename no
+        # solution will ever open or create. Every solution then comes back
+        # NO_OUTPUT and pass 1 aborts — loud, but with a diagnostic about a
+        # missing file called `stdout` rather than about the `io` block,
+        # which is where the mistake actually is. Refused at load time, in
+        # the same place as `input == output` and for the same reason: it is
+        # a property of the pair, not of either name.
+        for io, stranded in (({"input": "prob.inp", "output": "stdout"}, "io.output"),
+                             ({"input": "stdin", "output": "prob.out"}, "io.input")):
+            with self.subTest(io=io):
+                with self.assertRaises(ProblemMetaError) as ctx:
+                    self._load_with_io(io)
+                message = str(ctx.exception)
+                self.assertIn("io.input", message)
+                self.assertIn("io.output", message)
+                self.assertIn("mixed IO", message)
+                # It must name the side that gets reinterpreted — that is the
+                # whole difference between this message and the one the
+                # driver used to produce.
+                self.assertIn(f"As written, {stranded} would be treated as a "
+                              f"literal filename", message)
+
+    def test_io_accepts_stdin_stdout_and_bare_filenames(self):
+        p = self._load_with_io({"input": "stdin", "output": "stdout"})
+        self.assertEqual((p.input, p.output), ("stdin", "stdout"))
+        p = self._load_with_io({"input": "flight.inp", "output": "flight.out"})
+        self.assertEqual((p.input, p.output), ("flight.inp", "flight.out"))
 
 
 if __name__ == "__main__":

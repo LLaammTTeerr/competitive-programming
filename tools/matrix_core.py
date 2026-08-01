@@ -66,9 +66,14 @@ def classify(
 
 
 # Worst-first. FAIL is a package bug and must never be masked by a solution's
-# own failure; TL outranks WA because the judge stops before the checker runs.
-_SEVERITY = ["FAIL", "TL", "ML", "RE", "PE", "WA", "OK"]
+# own failure; NO_OUTPUT is the same category — the harness could not evaluate
+# the run at all (the process exited cleanly and never wrote its output file,
+# usually a wrong filename rather than a wrong algorithm), so it must not be
+# masked either. TL outranks WA because the judge stops before the checker runs.
+_SEVERITY = ["FAIL", "NO_OUTPUT", "TL", "ML", "RE", "PE", "WA", "OK"]
 
+# Verdicts an author can DECLARE for a solution. NO_OUTPUT and FAIL are
+# absent by design: both are discovered by the harness, never declared.
 _FAILING = {"WA", "TL", "ML", "PE", "RE"}
 
 

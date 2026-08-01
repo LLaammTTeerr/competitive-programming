@@ -95,6 +95,22 @@ sudo systemctl enable --now isolate.service
 Verify with `isolate --version`; if `--init` still fails, the likely cause is a
 missing subuid/subgid range or `isolate.service` not running — both above.
 
+**Both IO modes are supported.** A problem's `problem.json` sets
+`io.input` / `io.output` either to the sentinels `"stdin"` / `"stdout"` or to a
+pair of bare filenames (`flight.inp` / `flight.out`, the shape most VOI-style
+packages use); anything else — a path separator, a dot-segment, the two names
+being equal — is refused at load. In file-IO mode `run_matrix.py` stages the
+test into the sandbox's one writable mount under `io.input`, `--chdir`s there,
+and reads the answer back from `io.output`. **Generators and validators are
+unaffected**: they are stdin/stdout testlib tools in both modes, and nothing in
+`tools/` executes either one. **The checker is unaffected too** — testlib
+checkers already take three file paths (`checker <input> <output> <answer>`),
+which is what `run_matrix.py` has always handed them. The one genuinely new
+outcome is the verdict `NO_OUTPUT`: a solution that exits cleanly and never
+creates `io.output`, almost always because it wrote the wrong filename. Like
+`FAIL`, it is discovered by the harness and can never be declared in a
+solution's `@expect`.
+
 ## Installing
 
 **Same machine** — clone into `~/.claude/skills/`. Anything there with a
