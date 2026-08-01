@@ -125,6 +125,17 @@ Notes:
   Without it, large inputs read with `cin` may TLE.
 - Avoid `endl` in loops — it flushes every call. Use `"\n"`.
 - Clear or re-initialize any global state inside `solve()` between test cases.
+- **Producing a model solution for a problem package under construction**
+  (this skill dispatched as the `solving-problems` phase of
+  `competitive-programming:creating-problems`, rather than solving a problem
+  pulled from a judge) needs one more thing this template doesn't show: a
+  `/** ... */` metadata header — `@tag main`, `@expect`, `@algorithm`,
+  `@complexity` — that `tools/scan_solutions.py` requires before
+  `preparing-tests`/`validating-solutions` will recognize the file at all.
+  That format is specified in
+  `competitive-programming:validating-solutions`'s SKILL.md, "The metadata
+  block" section — read it and use its exact field set even though this
+  skill never produces one on its own.
 
 ## Code quality
 
