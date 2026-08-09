@@ -550,10 +550,19 @@ Add to `tools/tests/test_run_matrix.py`:
 > need `from tools import matrix_core`. Add it now so later tasks don't
 > churn the import block.
 >
-> **Note for the implementer:** every new test class in `test_run_matrix.py`
-> subclasses the existing `TestRunMatrixFixture` (`:174`), which provides
-> `self.tmp`, `self.problem_dir` (a scratch copy of the `mini` fixture) and
-> `self.testlib_dir`, and skips cleanly when `g++`/`isolate` are absent.
+> **Note for the implementer:** `test_run_matrix.py` offers two bases, and
+> picking the wrong one is expensive. `TestRunMatrixFixture` (`:174`) copies
+> the whole `mini` package into a scratch tree and provides `self.tmp`,
+> `self.problem_dir` and `self.testlib_dir` — use it **only** when the test
+> actually drives a full `run()` over a problem package. For a test that
+> needs no package (it compiles its own throwaway binary, or drives
+> `_run_once` directly), subclass the **light mixin** instead: it carries
+> only `self.tmp` and the `g++`/`isolate` skip guard. Task 2 got this wrong
+> and paid for it — `BoxLeasingTest` inherited ~50 unrelated tests to gain
+> 3, taking the suite from 289 to 342 and adding ~108s, doubled again by
+> the two-concurrent-suites acceptance run. Task 2's fix round introduces
+> the mixin; reuse it, do not re-derive it.
+>
 > Binaries are built with the **module-level** `_compile(src_text, out_path,
 > tmp_dir)` helper (`:140`) — there is no `self._compile`.
 
