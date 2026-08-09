@@ -138,8 +138,11 @@ does one probe `--init`/`--cleanup` at startup (to fail fast, before any
 compilation, if isolate is missing or unconfigured) but no longer holds a
 box open across the whole invocation — see `box_pool` for how each call
 leases its own id, and why a lease rather than a pid-derived id: two
-concurrently-running `run_matrix` invocations no longer collide on the
-same box.
+concurrently-running `run_matrix` invocations belonging to the *same
+user* no longer collide on the same box. Cross-user collision remains a
+live, deliberate limit of a per-user lock directory — see `box_pool`'s
+own module docstring for why, and `_init_box` for how that specific case
+is diagnosed rather than silently misattributed.
 
 Where the staging directory lives, and why it is not `/tmp`: the third
 relocation of one defect class. The staging directory 9b introduced was a
@@ -182,6 +185,7 @@ two halves and both are load-bearing:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -452,11 +456,18 @@ def _init_box(binary: str, box_id: int) -> None:
     """`isolate --init` for one box id, raising `MatrixError` on failure.
 
     Two failures with opposite fixes, so they get two messages. A busy box
-    means a *lease* was violated — either something else on this machine
-    uses isolate directly, or `$RUN_MATRIX_BOX_POOL` was raised past what
-    the lock directory coordinates. The old code folded this into the
-    install-is-broken message and sent three agents chasing a cgroup
-    misconfiguration that was never there.
+    means a *lease* was violated from outside this driver's own
+    coordination: another user's `run_matrix` (the pool is per-user, see
+    `box_pool`'s module docstring), another tool using isolate directly, or
+    a sibling `run_matrix` invocation whose `$RUN_MATRIX_BOX_LOCK_DIR`
+    diverges from this one's, so the two never see each other's leases at
+    all. (Not `$RUN_MATRIX_BOX_POOL` sized too large on one side: the lock
+    directory creates one lock file per id on demand, so no pool size can
+    outrun it — disproved empirically: a `POOL=2` holder on id 0 and a
+    concurrent `POOL=8` sweep of the same lock directory got `[1..7]`, never
+    0.) The old code folded a busy box into the install-is-broken message
+    and sent three agents chasing a cgroup misconfiguration that was never
+    there.
     """
     init = subprocess.run([binary, "--cg", f"--box-id={box_id}", "--init"],
                           capture_output=True, text=True)
@@ -464,15 +475,24 @@ def _init_box(binary: str, box_id: int) -> None:
         return
     detail = (init.stderr or init.stdout).strip()
     if _ISOLATE_BOX_BUSY in detail:
+        try:
+            lock_dir_repr = str(box_pool.lock_dir())
+        except box_pool.BoxPoolError:
+            # Formatting a diagnosis must not itself fail with an unrelated
+            # error at the worst possible moment — lock_dir() does a mkdir
+            # and can raise on its own.
+            lock_dir_repr = f"${box_pool.LOCK_DIR_ENV} (unresolvable right now)"
         raise MatrixError(
             f"isolate box {box_id} is already in use by another process "
             f"({detail}). This driver leases every box id through "
-            f"{box_pool.lock_dir()} before touching it, and that lease pool "
-            "is per-user — so the cause is something the pool cannot see: "
-            "another user running run_matrix on this machine, another tool "
-            "using isolate directly, or a stale run started before the "
-            "lease pool existed. This is not an installation problem — see "
-            "open_isolate_box's own diagnosis for that case instead."
+            f"{lock_dir_repr} before touching it, and that lease pool is "
+            "per-user — so the cause is something the pool cannot see: "
+            "another user running run_matrix on this machine, another "
+            "tool using isolate directly, or a sibling run_matrix "
+            f"invocation whose ${box_pool.LOCK_DIR_ENV} points somewhere "
+            "else, so the two are not coordinating through the same lock "
+            "directory. Nothing about cgroup delegation, the isolate "
+            "service, or the sandbox user's uid ranges needs changing."
         )
     raise MatrixError(
         f"isolate is installed at {binary} but `--init` failed for box "
@@ -498,6 +518,27 @@ def _cleanup_box(binary: str, box_id: int) -> None:
                     capture_output=True, text=True)
 
 
+@contextlib.contextmanager
+def _leased_box(**kwargs):
+    """`box_pool.lease()`, translating `BoxPoolError` into `MatrixError`.
+
+    `box_pool.BoxPoolError` is a bare `RuntimeError` — deliberately:
+    `box_pool` has no dependency on this module's error type. But
+    `main()` only catches `MatrixError` (see its own docstring: exit 2 is
+    the contract for "the matrix could not be run at all"). Left
+    unconverted, a pool-exhaustion timeout, an unwritable lock directory,
+    or a malformed `$RUN_MATRIX_BOX_POOL` would surface as an uncaught
+    traceback and exit 1 — the code reserved for "the matrix ran and found
+    holes" — reopening, one layer down, exactly the crash-read-as-a-finding
+    defect `main()` was written to prevent.
+    """
+    try:
+        with box_pool.lease(**kwargs) as box_id:
+            yield box_id
+    except box_pool.BoxPoolError as exc:
+        raise MatrixError(str(exc)) from exc
+
+
 def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     """Verify isolate is installed and usable, then prepare this
     invocation's isolate environment.
@@ -507,19 +548,31 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     the work being staged. See `_stage_base()` for why it must not be
     `/tmp` and why an unusable location raises rather than warns.
 
-    Raises `MatrixError` — naming the fix — for two distinct failure
+    Raises `MatrixError` — naming the fix — for three distinct failure
     families rather than letting a bare `FileNotFoundError` or
-    `subprocess.CalledProcessError` surface (R1: isolate's own failure
-    modes are as much "externally authored" surface as a checker's exit
-    code is):
+    `subprocess.CalledProcessError` (or `box_pool.BoxPoolError`) surface
+    (R1: isolate's own failure modes, and the lease pool's, are as much
+    "externally authored" surface as a checker's exit code is):
 
     1. isolate is not on PATH at all.
     2. isolate is on PATH but `--init` fails — the likely case being an
        installed-but-unconfigured sandbox (no cgroup delegation, no
        isolate-cg-keeper service, no subuid/subgid range for the `isolate`
-       user). This is diagnosed as a *different* message from case 1 so a
-       reader is not sent chasing a reinstall when the real problem is
-       configuration.
+       user) or a box id busy with another process. This is diagnosed as
+       a *different* message from case 1 (and the busy sub-case from the
+       unconfigured one) so a reader is not sent chasing a reinstall when
+       the real problem is configuration, or chasing configuration when
+       the real problem is a collision — see `_init_box`.
+    3. The probe box id could not be leased at all — `box_pool` exhausted
+       its pool waiting, or its lock directory could not be created or
+       written. `box_pool.lease()` raises its own `BoxPoolError` for this
+       (a bare `RuntimeError`, since `box_pool` has no dependency on this
+       module's error type); `_leased_box()` converts it to `MatrixError`
+       here so it still reaches `main()`'s `except MatrixError` rather
+       than escaping as an uncaught traceback that exits 1 — the code
+       `main()` reserves for "the matrix ran and found holes" — instead of
+       2, "the matrix could not be run at all". See `main()`'s own
+       docstring.
 
     This still does one `--init`/`--cleanup` probe cycle up front — so a
     missing/unconfigured sandbox is diagnosed here, before any compilation
@@ -551,7 +604,7 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     # before any compilation touches the tree. It leases an id like every
     # other box: probing an id another invocation is using is the exact
     # collision this pool exists to prevent.
-    with box_pool.lease() as probe_box_id:
+    with _leased_box() as probe_box_id:
         _init_box(binary, probe_box_id)
         _cleanup_box(binary, probe_box_id)
 
@@ -935,7 +988,7 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     box that lives only from just before this one `--run` to just after it
     can never observe another call's counters, on any field.
     """
-    with box_pool.lease() as box_id:
+    with _leased_box() as box_id:
         _init_box(isolate.binary, box_id)
         try:
             mounts: dict[Path, str] = {}

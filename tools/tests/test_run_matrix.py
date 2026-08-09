@@ -167,33 +167,56 @@ def _fixed_lease(box_id: int):
 
 @contextlib.contextmanager
 def _track_leased_box_ids():
-    """Record every box id `box_pool.lease` hands out during the block,
-    while still leasing for real.
+    """Record, for every box id `box_pool.lease` hands out during the
+    block, whether its isolate box directory still existed at the moment
+    the real lease released it — checked while the real `flock` is still
+    held, not after.
 
-    `test_boxes_are_cleaned_up_after_*` need to know which isolate box
-    directories a `run()` call touched so they can confirm those specific
-    directories are gone afterward. Snapshotting the whole of
-    `/var/local/lib/isolate/` before and after — the previous approach —
+    `test_boxes_are_cleaned_up_after_*` need to know that every box a
+    `run()` (or `_run_once`) call touched was torn down before that call's
+    lease let go of it. Two earlier approaches both got this wrong:
+
+    Snapshotting the whole of `/var/local/lib/isolate/` before and after
     assumed this process was the only thing using isolate for the whole
     window, which a second copy of this suite running at the same time
-    (Task 2's own acceptance criterion) violates: a sibling process
-    legitimately opening and closing *other*, correctly non-colliding
-    boxes changes the global directory listing without either side
-    leaking anything. Scoping to only the ids this call actually leased
-    avoids that false positive, and still goes through the real
-    `box_pool.lease` (real `flock`), so it stays safe to run concurrently.
+    (Task 2's own acceptance criterion) violates: `pool_size()` is as low
+    as 4 on a real machine, so a sibling suite's `BoxLeasingTest` draws
+    from the *same* few ids, not merely "other" ones, and can legitimately
+    hold one live at whatever instant the snapshot is taken.
+
+    Recording the ids and checking `box_dir.exists()` only *after* this
+    context manager (and so after `real_lease`) has released every flock
+    has the identical race in miniature: nothing stops a sibling process
+    from re-leasing one of those same ids the instant this process's flock
+    lets go of it, and then this test would see *the sibling's* live box
+    and misreport it as ours never having been cleaned up.
+
+    So the check has to happen inside the spy's own `finally`, which runs
+    after the caller's `with box_pool.lease() as box_id:` body returns
+    (i.e. after `_init_box`/the sandboxed run/`_cleanup_box` has already
+    completed — see `_run_once` and `open_isolate_box`) but *before*
+    `real_lease`'s own `__exit__` releases the flock. That is also the only
+    way this test can actually enforce "the lease wraps the whole
+    `--init`/`--run`/`--cleanup` cycle": an assertion made after release
+    cannot tell "cleaned up before the lease let go" from "cleaned up
+    whenever, by whoever, since" — moving `_cleanup_box` outside the
+    `with box_pool.lease()` in `run_matrix.py` must make this fail, and it
+    does (verified; see the task report).
     """
-    ids: set[int] = set()
+    records: list[tuple[int, bool]] = []
     real_lease = run_matrix.box_pool.lease
 
     @contextlib.contextmanager
     def _spy(**kwargs):
         with real_lease(**kwargs) as box_id:
-            ids.add(box_id)
-            yield box_id
+            try:
+                yield box_id
+            finally:
+                box_dir = Path(f"/var/local/lib/isolate/{box_id}")
+                records.append((box_id, box_dir.exists()))
 
     with mock.patch.object(run_matrix.box_pool, "lease", _spy):
-        yield ids
+        yield records
 
 
 def _testlib_dir() -> Path:
@@ -595,12 +618,22 @@ class TestRunMatrixFixture(unittest.TestCase):
         finally:
             run_matrix.close_isolate_box(isolate)
 
-    def _assert_boxes_gone(self, box_ids) -> None:
-        self.assertTrue(box_ids, "no box id was leased at all — sanity check")
-        for box_id in box_ids:
-            box_dir = Path(f"/var/local/lib/isolate/{box_id}")
-            self.assertFalse(box_dir.exists(),
-                             f"{box_dir} still present after run()")
+    def _assert_boxes_gone(self, records) -> None:
+        """Consumes `_track_leased_box_ids()`'s output: `(box_id,
+        still_present_when_its_lease_released)` pairs. The "still present"
+        half was recorded while that lease's flock was still held, so this
+        does not re-check the filesystem itself — doing so here, after
+        every lease in `records` has already been released, would reopen
+        the exact race `_track_leased_box_ids` exists to avoid (a sibling
+        process may have re-leased and be legitimately using that id by
+        now)."""
+        self.assertTrue(records, "no box id was leased at all — sanity check")
+        for box_id, still_present in records:
+            self.assertFalse(
+                still_present,
+                f"/var/local/lib/isolate/{box_id} still present when its "
+                "lease released — the lease did not wrap the whole "
+                "--init/--run/--cleanup cycle")
 
     def test_boxes_are_cleaned_up_after_a_real_run(self):
         # A box leaked under /var/local/lib/isolate/<id> is exactly the
@@ -1945,6 +1978,27 @@ class TestRunMatrixFixture(unittest.TestCase):
                                 str(self.testlib_dir)])
         self.assertEqual(code, 2)
 
+    def test_a_malformed_box_pool_env_exits_2_not_1(self):
+        # `box_pool.BoxPoolError` is a bare RuntimeError with no dependency
+        # on this module's error type, so it does not automatically become
+        # a MatrixError the way every other externally-authored failure in
+        # this file does (R1). Left unconverted it would escape main()'s
+        # `except MatrixError` entirely, crash with a traceback, and exit
+        # 1 — the exact code `validating-solutions` reads as "the matrix
+        # ran and found holes", reopening the crash-read-as-a-finding
+        # defect `main()`'s own docstring says it exists to prevent. This
+        # is the interface contract (`main()`'s exit code), so it is
+        # tested at `main()`, not at `run()` or `open_isolate_box()`
+        # directly — a MatrixError raised deep inside proves nothing about
+        # what actually reaches the caller.
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, {"RUN_MATRIX_BOX_POOL": "not-a-number"}):
+            with contextlib.redirect_stderr(captured):
+                code = run_matrix.main(["run_matrix.py", str(self.problem_dir),
+                                        str(self.testlib_dir)])
+        self.assertEqual(code, 2)
+        self.assertIn("RUN_MATRIX_BOX_POOL", captured.getvalue())
+
     def test_invocation_json_pins_the_testlib_revision(self):
         payload = run_matrix.run(self.problem_dir, self.testlib_dir)
         machine = payload["machine"]
@@ -1956,7 +2010,33 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertTrue(machine["cg_requested"])
 
 
-class BoxLeasingTest(TestRunMatrixFixture):
+class MinimalIsolateFixture(unittest.TestCase):
+    """Just enough to test box leasing directly: a scratch `self.tmp` and
+    the same hard-dependency skip guard `TestRunMatrixFixture` uses.
+
+    Deliberately does *not* copy the `mini` fixture or resolve the testlib
+    cache — `BoxLeasingTest`'s tests never touch a problem package.
+    Subclassing the full `TestRunMatrixFixture` for its ~50 unrelated
+    tests, just to get three new ones, doubled this file's runtime (289 ->
+    342 tests, ~108s longer) and doubled that again across the
+    two-concurrent-suites acceptance check, for no coverage this class
+    actually needs — a controller ruling on the Task 2 review. Tasks 3 and
+    5 should use this too rather than repeat the mistake.
+    """
+
+    def setUp(self):
+        if shutil.which("g++") is None:
+            raise _missing_dependency("g++ not found on PATH")
+        if shutil.which("isolate") is None:
+            raise _missing_dependency("isolate not found on PATH")
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="run_matrix_test_", dir=SCRATCH_ROOT))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class BoxLeasingTest(MinimalIsolateFixture):
     def test_isolate_handle_has_no_pid_derived_counter(self):
         # The pid-derived counter is the Cause-A defect itself. Its absence
         # is the invariant, so it is asserted rather than assumed.
