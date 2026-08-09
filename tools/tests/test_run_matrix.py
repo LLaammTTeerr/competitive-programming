@@ -1460,7 +1460,7 @@ class TestRunMatrixFixture(unittest.TestCase):
                     mem_limit_kb=256 * 1024,
                     io_input="t.inp", io_output="t.out"))
             mounted = self._mounted_host_dirs(argv)
-            stage_dir = isolate.stage_dir.resolve()
+            stage_root = isolate.stage_root.resolve()
         finally:
             run_matrix.close_isolate_box(isolate)
 
@@ -1471,7 +1471,16 @@ class TestRunMatrixFixture(unittest.TestCase):
         # ...and the two mounts that *are* load-bearing survive, so this is
         # not passing because mounting broke altogether.
         self.assertIn(str(bin_dir.resolve()), mounted, sorted(mounted))
-        self.assertIn(str(stage_dir), mounted, sorted(mounted))
+        # The rw mount is a fresh per-call directory under `stage_root`
+        # (Task 3), not `stage_root` itself, and its name isn't known ahead
+        # of the call — assert it's a direct child of `stage_root` instead
+        # of an exact path, and that `stage_root` itself was never handed to
+        # isolate (it is never a `--dir=` target on its own).
+        rw_mounts = [m for m in mounted if Path(m).parent == stage_root]
+        self.assertEqual(len(rw_mounts), 1,
+                         f"expected exactly one per-run mount under "
+                         f"{stage_root}, got {sorted(mounted)}")
+        self.assertNotIn(str(stage_root), mounted, sorted(mounted))
 
     def test_the_test_directory_is_still_mounted_in_stdin_mode(self):
         # The control, and the reason the change above is scoped to file-IO
@@ -1507,111 +1516,17 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
 
     # ------------------------------------------------------------------
-    # `_clear_stage_dir`'s two error paths. Both were reachable and neither
-    # was covered: the review confirmed that turning the `except OSError`
-    # into a `continue`, and the `is_dir()` branch into a `pass`, each left
-    # the whole suite green. An error path nothing has ever triggered is not
-    # a handled error path.
+    # `_remove_run_dir`'s two error paths (formerly `_clear_stage_dir`'s,
+    # before Task 3 moved cleanup from the top of the *next* run to the
+    # `finally` of the run that made the mess). Both are reachable and
+    # neither is skipped: the review of the old code confirmed that turning
+    # the `except OSError` into a `continue` left the whole suite green. An
+    # error path nothing has ever triggered is not a handled error path.
+    # Covered in the lighter `ReentrancyTest` fixture, which needs no
+    # package copy to exercise `_run_once` directly —
+    # `test_a_run_directory_that_cannot_be_removed_raises_from_its_own_run`
+    # and `test_a_removable_foreign_subdirectory_does_not_block_cleanup`.
     # ------------------------------------------------------------------
-
-    def test_a_subdirectory_that_cannot_be_cleared_refuses_the_next_run(self):
-        # A solution may create a directory in the staging area, and it is
-        # owned by the mapped subuid of *its* box. Unlinking plain files
-        # there works regardless of owner (the staging directory is ours),
-        # but a subdirectory this uid cannot descend into cannot be removed
-        # at all — and a staging directory that cannot be guaranteed empty
-        # is one whose next verdict cannot be trusted. Refuse, don't guess.
-        #
-        # The directory is left *empty* at mode 0700 rather than filled with
-        # a file: both make `shutil.rmtree` fail identically (it cannot even
-        # open the directory to enumerate it), but only the empty one can be
-        # cleaned up afterwards without root — a non-empty foreign directory
-        # is exactly the undeletable litter this test would otherwise leave
-        # in the repository on every run.
-        binary = _compile(
-            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
-            'int main(){ umask(0); if (mkdir("d", 0700) != 0) return 6;\n'
-            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
-            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
-            self.tmp / "dirlitter", self.tmp)
-        os.chmod(self.tmp, 0o777)
-        test_in = self.tmp / "01.in"
-        test_in.write_text("x\n", encoding="utf-8")
-
-        isolate = run_matrix.open_isolate_box(self.tmp)
-        litter = isolate.stage_dir / "d"
-        try:
-            first = run_matrix._run_once(isolate, binary, test_in,
-                                         self.tmp / "c1.produced",
-                                         cpu_limit_s=2.0, wall_limit_s=6.0,
-                                         mem_limit_kb=256 * 1024,
-                                         io_input="t.inp", io_output="t.out")
-            # Vacuity guard: run 1 has to have actually worked, and actually
-            # left the directory behind, or run 2 raising would prove nothing.
-            self.assertFalse(first.no_output, first)
-            self.assertTrue(litter.is_dir(), f"{litter} was not created")
-
-            with self.assertRaises(run_matrix.MatrixError) as ctx:
-                run_matrix._run_once(isolate, binary, test_in,
-                                     self.tmp / "c2.produced",
-                                     cpu_limit_s=2.0, wall_limit_s=6.0,
-                                     mem_limit_kb=256 * 1024,
-                                     io_input="t.inp", io_output="t.out")
-        finally:
-            # Removable because we own the staging directory and it is
-            # empty; nothing subuid-owned survives this test.
-            with contextlib.suppress(OSError):
-                litter.rmdir()
-            run_matrix.close_isolate_box(isolate)
-
-        message = str(ctx.exception)
-        self.assertIn(str(litter), message)      # names the entry
-        self.assertIn("staging", message)
-
-    def test_an_empty_foreign_subdirectory_is_cleared_before_the_next_run(self):
-        # The other branch: `is_dir()` -> `shutil.rmtree`. A plain
-        # `entry.unlink()` raises `IsADirectoryError` on a directory, so
-        # without this branch every solution that so much as calls `mkdir`
-        # would take the whole matrix down through the refusal above — a
-        # foreign-owned directory that CAN be removed must simply be
-        # removed, silently, like any other leftover.
-        maker = _compile(
-            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
-            'int main(){ umask(0); if (mkdir("e", 0777) != 0) return 6;\n'
-            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
-            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
-            self.tmp / "dirmaker2", self.tmp)
-        silent = _compile("int main(){ return 0; }\n",
-                          self.tmp / "silent3", self.tmp)
-        os.chmod(self.tmp, 0o777)
-        test_in = self.tmp / "01.in"
-        test_in.write_text("x\n", encoding="utf-8")
-
-        isolate = run_matrix.open_isolate_box(self.tmp)
-        leftover = isolate.stage_dir / "e"
-        try:
-            first = run_matrix._run_once(isolate, maker, test_in,
-                                         self.tmp / "e1.produced",
-                                         cpu_limit_s=2.0, wall_limit_s=6.0,
-                                         mem_limit_kb=256 * 1024,
-                                         io_input="t.inp", io_output="t.out")
-            self.assertFalse(first.no_output, first)
-            self.assertTrue(leftover.is_dir(), f"{leftover} was not created")
-
-            # A different binary, so the directory is not simply recreated.
-            second = run_matrix._run_once(isolate, silent, test_in,
-                                          self.tmp / "e2.produced",
-                                          cpu_limit_s=2.0, wall_limit_s=6.0,
-                                          mem_limit_kb=256 * 1024,
-                                          io_input="t.inp", io_output="t.out")
-            still_there = leftover.exists()
-        finally:
-            run_matrix.close_isolate_box(isolate)
-
-        self.assertTrue(second.no_output, second)
-        self.assertFalse(still_there,
-                         f"{leftover} survived the next run's clear — a "
-                         f"foreign directory that CAN be removed must be")
 
     def test_close_isolate_box_warns_about_a_staging_directory_it_cannot_remove(self):
         # `shutil.rmtree(..., ignore_errors=True)` is right — teardown must
@@ -1626,7 +1541,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         # too, which is all `rmtree` needs, and unlike a real subuid-owned
         # one it can be chmod'ed back.
         isolate = run_matrix.open_isolate_box(self.tmp)
-        stage = isolate.stage_dir
+        stage = isolate.stage_root
         blocked = stage / "unremovable"
         blocked.mkdir()
         (blocked / "x").write_text("x", encoding="utf-8")
@@ -1687,8 +1602,9 @@ class TestRunMatrixFixture(unittest.TestCase):
         # solution's stray files between runs, which Task 6's dogfood proved
         # is a defect, not a feature: the leftover is owned by one box's
         # subuid and no later box can reopen it, so it turned NO_OUTPUT into
-        # RE. `_clear_stage_dir` now wipes the directory before every run,
-        # and this test must not be the reason to reintroduce the leak.
+        # RE. Every `_run_once` call now gets its own fresh directory
+        # (Task 3), so that leak is unreachable rather than merely cleared,
+        # and this test must not be the reason to reintroduce it.
         silent = _compile("int main(){ return 0; }\n",
                           self.tmp / "silent_first", self.tmp)
         writer = _compile(
@@ -1955,14 +1871,16 @@ class TestRunMatrixFixture(unittest.TestCase):
     def test_stage_dir_is_not_on_a_memory_backed_filesystem(self):
         isolate = run_matrix.open_isolate_box(self.problem_dir)
         try:
-            fstype = run_matrix._filesystem_type(isolate.stage_dir)
+            fstype = run_matrix._filesystem_type(isolate.stage_root)
             self.assertNotIn(fstype, run_matrix.MEMORY_BACKED_FSTYPES,
-                             f"staging landed on {fstype} at {isolate.stage_dir}")
-            self.assertTrue(isolate.stage_dir.is_dir())
+                             f"staging landed on {fstype} at {isolate.stage_root}")
+            self.assertTrue(isolate.stage_root.is_dir())
         finally:
             run_matrix.close_isolate_box(isolate)
-        self.assertFalse(isolate.stage_dir.exists(),
+        self.assertFalse(isolate.stage_root.exists(),
                          "the staging directory outlived close_isolate_box")
+        self.assertFalse(isolate.meta_dir.exists(),
+                         "the meta directory outlived close_isolate_box")
 
     def test_matrix_error_exits_2_so_it_is_not_read_as_a_hole(self):
         # `validating-solutions` tells the agent that exit 1 means holes or
@@ -2038,6 +1956,241 @@ class MinimalIsolateFixture(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class ReentrancyTest(MinimalIsolateFixture):
+    def setUp(self):
+        super().setUp()
+        os.chmod(self.tmp, 0o777)
+        self.stdin_path = self.tmp / "in.txt"
+        self.stdin_path.write_text("\n", encoding="utf-8")
+
+    def test_handle_exposes_roots_not_single_files(self):
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            self.assertTrue(isolate.meta_dir.is_dir())
+            self.assertTrue(isolate.stage_root.is_dir())
+            self.assertFalse(hasattr(isolate, "meta_path"))
+            self.assertFalse(hasattr(isolate, "stage_dir"))
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def test_meta_dir_is_never_inside_the_sandbox_writable_root(self):
+        # A solution that could write its own meta file could write its own
+        # verdict. This is the invariant that forbids the obvious tidy-up of
+        # putting the meta file next to the staged output.
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            self.assertNotIn(isolate.stage_root.resolve(),
+                             isolate.meta_dir.resolve().parents)
+            self.assertNotEqual(isolate.stage_root.resolve(),
+                                isolate.meta_dir.resolve())
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def test_concurrent_runs_report_their_own_times_not_each_others(self):
+        # The shared-meta defect in its purest form: a fast and a slow run at
+        # once. With one meta file the fast run could read the slow run's
+        # numbers, or vice versa.
+        import concurrent.futures
+        fast = _compile("int main(){ return 0; }\n",
+                        self.tmp / "fast", self.tmp)
+        # 3e9 iterations, not the 4e8 a slower reference machine might use:
+        # measured directly on this box (Intel Core Ultra 7 258V, `nproc`
+        # 8), 4e8 volatile increments finished in ~106ms at -O2 — under the
+        # 200ms threshold below by construction, not because of anything
+        # sandboxed. 3e9 measured at ~720ms, comfortably clear of it.
+        slow = _compile("int main(){ volatile long s=0;"
+                        " for(long i=0;i<3000000000L;i++) s+=i; return 0; }\n",
+                        self.tmp / "slow", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                f_fast = pool.submit(run_matrix._run_once, isolate, fast,
+                                     self.stdin_path, self.tmp / "fast.out",
+                                     cpu_limit_s=30.0, wall_limit_s=60.0,
+                                     mem_limit_kb=256 * 1024)
+                f_slow = pool.submit(run_matrix._run_once, isolate, slow,
+                                     self.stdin_path, self.tmp / "slow.out",
+                                     cpu_limit_s=30.0, wall_limit_s=60.0,
+                                     mem_limit_kb=256 * 1024)
+                r_fast, r_slow = f_fast.result(), f_slow.result()
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertLess(r_fast.cpu_ms, 200, r_fast)
+        self.assertGreater(r_slow.cpu_ms, 200, r_slow)
+
+    def test_concurrent_runs_do_not_read_each_others_output(self):
+        import concurrent.futures
+        a = _compile('#include <cstdio>\nint main(){ puts("AAA"); }\n',
+                     self.tmp / "aaa", self.tmp)
+        b = _compile('#include <cstdio>\nint main(){ puts("BBB"); }\n',
+                     self.tmp / "bbb", self.tmp)
+        out_a, out_b = self.tmp / "a.out", self.tmp / "b.out"
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                fs = [pool.submit(run_matrix._run_once, isolate, binary,
+                                  self.stdin_path, dest, cpu_limit_s=30.0,
+                                  wall_limit_s=60.0, mem_limit_kb=256 * 1024)
+                      for binary, dest in ((a, out_a), (b, out_b))]
+                [f.result() for f in fs]
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertEqual(out_a.read_text().strip(), "AAA")
+        self.assertEqual(out_b.read_text().strip(), "BBB")
+
+    def test_two_concurrent_run_once_calls_never_share_a_box(self):
+        # The end-to-end Cause-A regression test: run the same binary from two
+        # threads and assert both produced a real verdict. Before the lease
+        # pool this raced on box ids and one side raised MatrixError.
+        import concurrent.futures
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                futures = [pool.submit(run_matrix._run_once, isolate, binary,
+                                       stdin_path, self.tmp / f"out{i}",
+                                       cpu_limit_s=5.0, wall_limit_s=10.0,
+                                       mem_limit_kb=256 * 1024)
+                           for i in range(2)]
+                results = [f.result() for f in futures]
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        for r in results:
+            self.assertFalse(r.crashed, r)
+            self.assertFalse(r.killed, r)
+
+    def test_run_directory_is_removed_after_a_successful_run(self):
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            run_matrix._run_once(isolate, binary, self.stdin_path,
+                                 self.tmp / "o.out", cpu_limit_s=5.0,
+                                 wall_limit_s=10.0, mem_limit_kb=256 * 1024)
+            self.assertEqual(list(isolate.stage_root.iterdir()), [])
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def test_a_solutions_stray_file_cannot_reach_the_next_run(self):
+        # The Task 6 dogfood defect: a solution writing an unexpected
+        # filename used to leave it behind, owned by that box's subuid, and
+        # the next run got EACCES and was reported RE. A fresh directory per
+        # run makes that unreachable rather than merely cleaned up.
+        litterer = _compile('#include <cstdio>\n'
+                            'int main(){ FILE*f=fopen("stray.txt","w");'
+                            ' fputs("x",f); fclose(f); return 0; }\n',
+                            self.tmp / "litterer", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            first = run_matrix._run_once(
+                isolate, litterer, self.stdin_path, self.tmp / "1.out",
+                cpu_limit_s=5.0, wall_limit_s=10.0, mem_limit_kb=256 * 1024,
+                io_input="t.inp", io_output="t.out")
+            second = run_matrix._run_once(
+                isolate, litterer, self.stdin_path, self.tmp / "2.out",
+                cpu_limit_s=5.0, wall_limit_s=10.0, mem_limit_kb=256 * 1024,
+                io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        # Both runs wrote the wrong filename, so both must report the same
+        # thing. Before per-run directories the first was NO_OUTPUT and the
+        # second RE, because the leftover file was owned by a subuid the
+        # second box could not write through.
+        self.assertTrue(first.no_output, first)
+        self.assertTrue(second.no_output, second)
+        self.assertFalse(second.crashed, second)
+
+    def test_a_run_directory_that_cannot_be_removed_raises_from_its_own_run(self):
+        # `_remove_run_dir`'s error branch, exercised end to end: a solution
+        # leaves an unremovable (0700, foreign-owned) subdirectory behind.
+        # Cleanup now happens in `_run_once`'s own `finally`, so the raise
+        # comes from the same call that made the mess, not from whatever
+        # call happens to run next — the opposite of the old
+        # `_clear_stage_dir`, which cleared on the way into the *next* call
+        # and so blamed an innocent bystander.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
+            'int main(){ umask(0); if (mkdir("d", 0700) != 0) return 6;\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
+            self.tmp / "dirlitter", self.tmp)
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        # Bound before the `try` so the `finally` below can never hit
+        # `UnboundLocalError` if something fails before either is assigned
+        # (e.g. the `assertRaises` itself, or the survivor-count assertion)
+        # — an `UnboundLocalError` there isn't an `OSError`, so
+        # `contextlib.suppress(OSError)` wouldn't catch it, and
+        # `close_isolate_box` would never run: for this fixture `stage_root`
+        # lives under `self.tmp`'s *parent* (see `_stage_base`), outside
+        # what `tearDown`'s `rmtree(self.tmp)` sweeps, so a failing run of
+        # this test would leak the very kind of undeletable litter this
+        # test exists to exercise.
+        run_dir = litter = None
+        try:
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix._run_once(isolate, binary, self.stdin_path,
+                                     self.tmp / "c1.produced",
+                                     cpu_limit_s=5.0, wall_limit_s=10.0,
+                                     mem_limit_kb=256 * 1024,
+                                     io_input="t.inp", io_output="t.out")
+            message = str(ctx.exception)
+            self.assertIn("staging directory", message)
+
+            # The run's own directory survives the failed removal (rmtree
+            # aborts partway rather than silently discarding the litter) —
+            # find it so the test can clean it up without leaving anything
+            # behind for the reviewer to explain.
+            survivors = list(isolate.stage_root.iterdir())
+            self.assertEqual(len(survivors), 1,
+                             f"expected exactly one surviving run_dir, "
+                             f"got {survivors}")
+            run_dir = survivors[0]
+            litter = run_dir / "d"
+            self.assertTrue(litter.is_dir(), f"{litter} was not created")
+        finally:
+            # Removable despite not being ours to read: rmdir only needs
+            # write+execute on the *parent*, which we own, and the target
+            # must be empty — both true here.
+            if litter is not None:
+                with contextlib.suppress(OSError):
+                    litter.rmdir()
+            if run_dir is not None:
+                with contextlib.suppress(OSError):
+                    run_dir.rmdir()
+            run_matrix.close_isolate_box(isolate)
+
+    def test_a_removable_foreign_subdirectory_does_not_block_cleanup(self):
+        # The non-error branch of `_remove_run_dir`: a subdirectory owned by
+        # the sandboxed subuid but left world-writable (0777) is not the
+        # undeletable case above, and must not be treated as one.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
+            'int main(){ umask(0); if (mkdir("e", 0777) != 0) return 6;\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
+            self.tmp / "dirmaker2", self.tmp)
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            result = run_matrix._run_once(isolate, binary, self.stdin_path,
+                                          self.tmp / "e1.produced",
+                                          cpu_limit_s=5.0, wall_limit_s=10.0,
+                                          mem_limit_kb=256 * 1024,
+                                          io_input="t.inp", io_output="t.out")
+            self.assertFalse(result.no_output, result)
+            self.assertEqual(list(isolate.stage_root.iterdir()), [],
+                             "a removable foreign subdirectory left the run "
+                             "directory behind")
+        finally:
+            run_matrix.close_isolate_box(isolate)
 
 
 class BoxLeasingTest(MinimalIsolateFixture):
