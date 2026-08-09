@@ -63,8 +63,9 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
 # specific package state; when any of these is newer than the artifact, the
 # artifact has not become wrong, it has become a statement about something
 # else — and the gate must not accept it as current. The custom checker (when
-# there is one) is included via `_matrix`'s `extra_files`, not listed here,
-# because it needs `problem.checker_name` to locate — see `_matrix` below.
+# there is one) is included via `extra_matrix_files`, not listed here,
+# because it needs `problem.checker_name` to locate — see that function
+# below, shared by both `_matrix` here and `review_checks._matrix()`.
 #
 # mtime is the signal, not a perfect one, and both of its failure directions
 # are known:
@@ -73,7 +74,7 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
 #     without changing content. Costs a re-run; never certifies anything
 #     false.
 #   * False "fresh" (dangerous — this is a false soundness claim, not an
-#     inconvenience): four ways this check can still miss a real edit.
+#     inconvenience): five ways this check can still miss a real edit.
 #       1. A *deletion* — removing a test or a solution — used to be
 #          invisible, since the old version of this walk only stat'd files.
 #          Fixed: directories are stat'd too, both the two top-level ones
@@ -106,7 +107,20 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
 #          finishes — but reachable by a script that runs the matrix and
 #          immediately mutates the package in the same process, which is
 #          exactly how this gap was found.
-#     (2), (3), and (4) are accepted gaps, not fixed here — flagged for a
+#       5. A *multi-file* custom checker: `extra_matrix_files` below only
+#          walks `files/<checker_name>` itself, not anything it
+#          `#include`s from elsewhere under `files/`. Editing an included
+#          helper changes verdicts on the next compile, and — unlike a
+#          validator or generator edit — nothing about that edit
+#          regenerates test data, so there is no downstream `tests/` walk
+#          to catch it the way there is for (2)'s sibling cases. Accepted,
+#          not fixed: single-file testlib checkers are the norm this
+#          pipeline is built around, and walking all of `files/` to close
+#          this one case would reopen false-staleness on ordinary
+#          validator/generator edits, which is the exact failure narrowing
+#          to just the checker file was meant to avoid. See
+#          `extra_matrix_files`'s docstring for the full trade.
+#     (2) through (5) are accepted gaps, not fixed here — flagged for a
 #     reader deciding how much to trust this gate, not concealed by a
 #     comment that only named the safe direction.
 #
@@ -183,6 +197,47 @@ def newest_source_mtime(problem_dir: Path,
     return newest
 
 
+def extra_matrix_files(problem_dir: Path, problem: Problem | None) -> tuple[Path, ...]:
+    """Source files `newest_source_mtime` must also walk, beyond
+    `_MATRIX_SOURCES`, because `problem.json` alone can't say where they
+    live.
+
+    Currently just the custom checker: it decides OK vs WA on every cell of
+    the matrix — as load-bearing as any solution or test, and edited
+    independently of both. `problem.checker_name` is only meaningful when
+    `checker_kind` is "custom" (a stock checker's `checker_name` names a
+    testlib checker this package does not own and cannot edit, so it is not
+    a source of *this* package's evidence going stale).
+
+    Narrow on purpose: `files/validator.cpp` or `files/gen-*.cpp` are not
+    included, because editing them does not change any recorded verdict
+    until the tests they produce are regenerated — and that regeneration is
+    already caught by the `tests/` walk `newest_source_mtime` does
+    unconditionally. Widening to all of `files/` would add false-staleness
+    for validator/generator edits with no gain.
+
+    That trade has a real, accepted gap of its own: if `files/<checker_name>`
+    `#include`s a local helper also under `files/`, editing *that* helper
+    changes verdicts on the next compile, and — unlike a validator or
+    generator edit — there is no downstream `tests/` regeneration to catch
+    it, since nothing about a checker helper regenerates test data. Not
+    fixed here: single-file testlib checkers are the norm this pipeline is
+    built around, and walking all of `files/` to close this one case would
+    reopen the validator/generator false-staleness this function exists to
+    avoid. A checker split across files is the case this gate cannot see.
+
+    Called identically by `package_status._matrix()` and
+    `review_checks._matrix()` — both need the *same* answer to "what else
+    counts as a matrix source", and duplicating this selection logic at
+    each call site (as an earlier version of this fix did, sharing only
+    `newest_source_mtime` itself) would leave exactly the kind of two
+    copies that can silently drift the shared walk was meant to prevent.
+    """
+    if problem is not None and problem.checker_kind == "custom":
+        return (problem_dir / "files" / problem.checker_name,)
+    return ()
+
+
 def _matrix(problem_dir: Path, problem: Problem | None) -> Phase:
     path = problem_dir / "invocation.json"
     if not path.exists():
@@ -197,24 +252,11 @@ def _matrix(problem_dir: Path, problem: Problem | None) -> Phase:
         artifact_mtime = path.stat().st_mtime
     except OSError as exc:
         return Phase("matrix", False, f"invocation.json unreadable: {exc}")
-    # A custom checker decides OK vs WA on every cell of the matrix — as
-    # load-bearing as any solution or test, and edited independently of
-    # both. `problem.checker_name` is only meaningful when `checker_kind`
-    # is "custom" (a stock checker's `checker_name` names a testlib
-    # checker this package does not own and cannot edit, so it is not a
-    # source of *this* package's evidence going stale). Narrow on purpose:
-    # `files/validator.cpp` or `files/gen-*.cpp` are not included, because
-    # editing them does not change any recorded verdict until the tests
-    # they produce are regenerated — and that regeneration is already
-    # caught by the `tests/` walk above. Widening to all of `files/` would
-    # add false-staleness for no gain.
-    extra_files: tuple[Path, ...] = ()
-    if problem is not None and problem.checker_kind == "custom":
-        extra_files = (problem_dir / "files" / problem.checker_name,)
     # Before the holes/mismatches verdict, deliberately: a stale artifact
     # reporting zero holes must not read as "clean" — the detail a reader
     # sees has to name the reason they cannot trust the number, not the
     # number itself.
+    extra_files = extra_matrix_files(problem_dir, problem)
     if newest_source_mtime(problem_dir, extra_files) > artifact_mtime:
         return Phase("matrix", False,
                      "invocation.json is stale: a solution, test, "

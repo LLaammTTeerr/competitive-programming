@@ -23,7 +23,8 @@ from pathlib import Path
 
 from tools.drift_check import check as drift
 from tools.gen_constraints_header import render
-from tools.package_status import newest_source_mtime, next_phase, status
+from tools.package_status import (extra_matrix_files, newest_source_mtime,
+                                  next_phase, status)
 from tools.problem_meta import Problem, ProblemMetaError, load
 from tools.scan_solutions import ScanError, scan
 
@@ -103,18 +104,18 @@ def _matrix(problem_dir: Path, problem: Problem | None) -> list[Finding]:
         return [Finding("matrix-hole", "low",
                         f"invocation.json unreadable: {exc}", str(path))]
     # The identical staleness claim `package_status._matrix()` makes about
-    # the same artifact — via the shared `newest_source_mtime`, not a copy
-    # of it, so the two checks cannot silently drift apart (see the task
-    # report: leaving this sibling gate without the freshness check
-    # `package_status` just got was the exact "fix the instance, not the
-    # class" mistake this project keeps re-paying for). Reported instead of
-    # the holes/mismatches findings below, not alongside them: those
-    # findings describe a package state `invocation.json` no longer speaks
-    # for, so surfacing them here would be citing evidence about a
-    # different tree as though it were current.
-    extra_files: tuple[Path, ...] = ()
-    if problem is not None and problem.checker_kind == "custom":
-        extra_files = (problem_dir / "files" / problem.checker_name,)
+    # the same artifact — via the shared `newest_source_mtime` *and* the
+    # shared `extra_matrix_files` (both live in `package_status`, not
+    # copied here), so the two checks cannot silently drift apart on either
+    # the walk or on what counts as a source to walk (see the task report:
+    # leaving this sibling gate without the freshness check `package_status`
+    # just got was the exact "fix the instance, not the class" mistake this
+    # project keeps re-paying for). Reported instead of the holes/mismatches
+    # findings below, not alongside them: those findings describe a package
+    # state `invocation.json` no longer speaks for, so surfacing them here
+    # would be citing evidence about a different tree as though it were
+    # current.
+    extra_files = extra_matrix_files(problem_dir, problem)
     if newest_source_mtime(problem_dir, extra_files) > artifact_mtime:
         return [Finding(
             "stale-matrix", "high",
