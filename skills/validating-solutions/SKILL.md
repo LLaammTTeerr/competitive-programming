@@ -313,10 +313,17 @@ always runs serially regardless of the pool size.
 
 Timing stays trustworthy because contention can only make a run look
 *slower*, never faster. A result measured close enough to TL that
-contention could have decided it is re-timed serially, with every other
-sandbox idle, and marked `"retimed_serially": true` in `invocation.json`; `machine.workers`
-and `machine.contention_bound` record how many sandboxes were live and what
-inflation factor the driver treated as ambiguous. Whenever more than one
+contention could have decided it is re-timed serially, with every worker
+*this invocation* spawned sitting idle, and marked `"retimed_serially": true`
+in `invocation.json`; `machine.workers` and `machine.contention_bound` record
+how many sandboxes were live and what inflation factor the driver treated as
+ambiguous. That idle guarantee only covers this process's own thread pool —
+the box-id lease is shared across every `run_matrix` invocation this user has
+running, so a sibling invocation can still be holding boxes and driving CPU
+contention while this process re-times. A run whose re-time is genuinely
+authoritative — measured with the machine actually quiet, not just this
+invocation's own workers — needs this to be the *only* `run_matrix`
+invocation running on the machine. Whenever more than one
 sandbox is live, a wall-clock kill is re-timed this way too, even when it
 lands well outside the ambiguity band, because a descheduled process racks
 up wall time without racking up CPU time — the one-sided argument only

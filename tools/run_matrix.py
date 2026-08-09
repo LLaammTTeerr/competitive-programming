@@ -277,9 +277,13 @@ MEMORY_BACKED_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 #     and it is the one this number is sized against.
 #   * It must be low enough that the runaway case stays survivable, because
 #     `_run_once` reads the staged file whole into this process's memory
-#     (`staged_out.read_bytes()`) before copying it back. 256 MB is a
+#     (`source.read_bytes()`) before copying it back. Per run, 256 MB is a
 #     bounded, recoverable read; an unbounded one is not, and neither is a
-#     `while(1) putchar()` allowed to fill the user's disk.
+#     `while(1) putchar()` allowed to fill the user's disk. That per-run
+#     bound is still what this constant is sized against — but pass 2 runs
+#     `_run_once` on `workers` threads inside this one process at once, so
+#     the driver's own peak from this read alone is `workers * 256 MB`, not
+#     256 MB: 2 GB at `RUN_MATRIX_BOX_POOL=8`.
 #   * 256 MB is also the output cap mainstream judges use (Codeforces),
 #     so a solution that trips this one would have tripped a real judge's.
 # Note the consequence for `.build/`: a runaway solution can leave a file
@@ -1472,15 +1476,22 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
     65.4s at 4 workers, 2.79x), so serialising it costs almost nothing.
 
     Two phases. The first fans out; the second re-times, **serially and with
-    every worker idle**, only those results that are undecidable under
-    contention: `needs_serial_retime` calls a CPU-time measurement
+    every one of this process's own workers idle** (this process's thread
+    pool has shut down by then — but the box-id lease is a cross-process
+    pool, so a sibling `run_matrix` invocation can still be holding boxes
+    and driving CPU contention elsewhere on the machine while this re-time
+    runs; "every worker idle" is a fact about this invocation, not a
+    guarantee about the machine), only those results that are undecidable
+    under contention: `needs_serial_retime` calls a CPU-time measurement
     undecidable when it lands close enough to TL that contention could have
     decided it (that set is tiny in practice — the plan's own analysis put
     it at 18 of 5508 results across the packages it measured, not
     re-verified by this task; `goldenseed` alone saw 1 of 546 — because
     contention is one-sided and a kernel *CPU*-time kill therefore still
     implies a genuine TL, see `matrix_core.needs_serial_retime`), and this
-    function additionally re-times any **wall-clock** kill unconditionally,
+    function additionally re-times any **wall-clock** kill whenever more
+    than one worker is live (the `workers > 1` gate below — at `workers ==
+    1` there is no contention to begin with, so nothing needs correcting),
     because `needs_serial_retime`'s CPU-time bound (`CONTENTION_BOUND`)
     says nothing about wall time: a descheduled process accrues wall time
     without accruing CPU time, so a solution that genuinely finishes under

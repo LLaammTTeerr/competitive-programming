@@ -19,9 +19,13 @@ So a lease: `flock(LOCK_EX|LOCK_NB)` on one lock file per id, held for the
 whole `--init`/`--run`/`--cleanup` cycle. `flock` is advisory and lives on
 the open file description, so the kernel releases it when the holder closes
 the fd *or dies*, including `kill -9` — there is no stale-lease cleanup to
-write, and none should be added. This is the same mechanism `tools/flags.py`
-already uses for its register, deliberately, so the project has one locking
-idiom rather than two.
+write, and none should be added. This is the same *primitive* `tools/flags.py`
+already uses for its register — `flock` on a file, deliberately, so the
+project reasons about one locking mechanism rather than two — but not the
+same *mode*: `flags.py` takes a blocking `LOCK_EX` and waits for the lock;
+this module takes `LOCK_EX | LOCK_NB` and polls in a loop instead (see
+`lease` below), because a lease has other ids to try before it is worth
+waiting on any one of them.
 
 The pool is also this pipeline's CPU admission control, and that is not a
 side effect — it is the second reason it exists as a shared pool rather
@@ -88,7 +92,12 @@ class BoxPoolError(RuntimeError):
 
 
 def pool_size() -> int:
-    """How many isolate boxes may be open on this machine at once.
+    """How many isolate boxes this user's `run_matrix` invocations may hold
+    open at once.
+
+    Per-user, not machine-wide (see the module docstring): a different user
+    running `run_matrix` on the same machine draws from their own lock
+    directory and is invisible to this bound.
 
     Defaults to half the CPUs because this number is a contention bound, not
     a throughput target: `run_matrix`'s timing verdicts are only sound while
