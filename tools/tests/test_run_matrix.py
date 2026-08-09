@@ -244,7 +244,19 @@ def _testlib_dir() -> Path:
     return path
 
 
-class TestRunMatrixFixture(unittest.TestCase):
+class PackageFixture(unittest.TestCase):
+    """Shared setup for tests that need a scratch copy of the `mini` problem
+    package: the hard-dependency skip guard, testlib cache resolution, and
+    the package-editing helpers built on top of them.
+
+    Deliberately carries **no** `test_*` methods of its own. `unittest`
+    collects inherited test methods, so a fixture class that also held
+    tests would have every one of them silently re-run by each subclass
+    that reuses this setup — see `TestRunMatrixFixture` and
+    `ParallelPassTest` below, which both subclass this rather than one
+    subclassing the other, for exactly that reason.
+    """
+
     def setUp(self):
         if shutil.which("g++") is None:
             raise _missing_dependency("g++ not found on PATH")
@@ -300,6 +312,57 @@ class TestRunMatrixFixture(unittest.TestCase):
             (solutions / name).write_text(source, encoding="utf-8")
         return self.problem_dir
 
+    def _assert_boxes_gone(self, records) -> None:
+        """Consumes `_track_leased_box_ids()`'s output: `(box_id,
+        still_present_when_its_lease_released)` pairs. The "still present"
+        half was recorded while that lease's flock was still held, so this
+        does not re-check the filesystem itself — doing so here, after
+        every lease in `records` has already been released, would reopen
+        the exact race `_track_leased_box_ids` exists to avoid (a sibling
+        process may have re-leased and be legitimately using that id by
+        now)."""
+        self.assertTrue(records, "no box id was leased at all — sanity check")
+        for box_id, still_present in records:
+            self.assertFalse(
+                still_present,
+                f"/var/local/lib/isolate/{box_id} still present when its "
+                "lease released — the lease did not wrap the whole "
+                "--init/--run/--cleanup cycle")
+
+    @staticmethod
+    def _mounted_host_dirs(cmd) -> set[str]:
+        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
+        found = set()
+        for arg in cmd:
+            if not isinstance(arg, str) or not arg.startswith("--dir="):
+                continue
+            host = arg.split("=", 2)[2]
+            found.add(host[:-3] if host.endswith(":rw") else host)
+        return found
+
+    def _isolate_run_argv(self, call):
+        """Run `call()` with `subprocess.run` spied on; return the `--run` argv.
+
+        `_run_once` shells out three times per call (`--init`, `--run`,
+        `--cleanup`); only the middle one carries the mounts.
+        """
+        seen = []
+        real = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            seen.append(cmd)
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(run_matrix.subprocess, "run", spy):
+            call()
+        runs = [cmd for cmd in seen
+                if isinstance(cmd, list) and "--run" in cmd]
+        self.assertEqual(len(runs), 1,
+                         f"expected exactly one isolate --run, saw {seen!r}")
+        return runs[0]
+
+
+class TestRunMatrixFixture(PackageFixture):
     def test_clean_matrix_has_no_holes_or_mismatches(self):
         payload = run_matrix.run(self.problem_dir, self.testlib_dir)
 
@@ -619,23 +682,6 @@ class TestRunMatrixFixture(unittest.TestCase):
             self._assert_boxes_gone(leased)
         finally:
             run_matrix.close_isolate_box(isolate)
-
-    def _assert_boxes_gone(self, records) -> None:
-        """Consumes `_track_leased_box_ids()`'s output: `(box_id,
-        still_present_when_its_lease_released)` pairs. The "still present"
-        half was recorded while that lease's flock was still held, so this
-        does not re-check the filesystem itself — doing so here, after
-        every lease in `records` has already been released, would reopen
-        the exact race `_track_leased_box_ids` exists to avoid (a sibling
-        process may have re-leased and be legitimately using that id by
-        now)."""
-        self.assertTrue(records, "no box id was leased at all — sanity check")
-        for box_id, still_present in records:
-            self.assertFalse(
-                still_present,
-                f"/var/local/lib/isolate/{box_id} still present when its "
-                "lease released — the lease did not wrap the whole "
-                "--init/--run/--cleanup cycle")
 
     def test_boxes_are_cleaned_up_after_a_real_run(self):
         # A box leaked under /var/local/lib/isolate/<id> is exactly the
@@ -1386,40 +1432,9 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "42")
 
     # ------------------------------------------------------------------
-    # Which host directories reach the box.
+    # Which host directories reach the box. (`_mounted_host_dirs` and
+    # `_isolate_run_argv` live on `PackageFixture`.)
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _mounted_host_dirs(cmd) -> set[str]:
-        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
-        found = set()
-        for arg in cmd:
-            if not isinstance(arg, str) or not arg.startswith("--dir="):
-                continue
-            host = arg.split("=", 2)[2]
-            found.add(host[:-3] if host.endswith(":rw") else host)
-        return found
-
-    def _isolate_run_argv(self, call):
-        """Run `call()` with `subprocess.run` spied on; return the `--run` argv.
-
-        `_run_once` shells out three times per call (`--init`, `--run`,
-        `--cleanup`); only the middle one carries the mounts.
-        """
-        seen = []
-        real = subprocess.run
-
-        def spy(cmd, *args, **kwargs):
-            seen.append(cmd)
-            return real(cmd, *args, **kwargs)
-
-        with mock.patch.object(run_matrix.subprocess, "run", spy):
-            call()
-        runs = [cmd for cmd in seen
-                if isinstance(cmd, list) and "--run" in cmd]
-        self.assertEqual(len(runs), 1,
-                         f"expected exactly one isolate --run, saw {seen!r}")
-        return runs[0]
 
     def test_the_test_directory_is_not_mounted_in_file_io_mode(self):
         # Pre-existing and correctly not a blocker, but free to remove here:
@@ -1934,7 +1949,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertTrue(machine["cg_requested"])
 
 
-class ParallelPassTest(TestRunMatrixFixture):
+class ParallelPassTest(PackageFixture):
     def tearDown(self):
         os.environ.pop("RUN_MATRIX_BOX_POOL", None)
         super().tearDown()
