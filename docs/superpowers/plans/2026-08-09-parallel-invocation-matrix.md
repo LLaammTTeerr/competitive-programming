@@ -1185,23 +1185,80 @@ class ParallelPassTest(TestRunMatrixFixture):
         self.assertEqual(serial["holes"], parallel["holes"])
         self.assertEqual(serial["mismatches"], parallel["mismatches"])
 
-    def test_pass_one_is_not_parallelised(self):
+    def test_pass_one_is_never_run_concurrently(self):
         # t_main defines TL. Running it under contention inflates TL and lets
         # genuinely-TLE solutions through, which manufactures holes. Asserted
-        # against the source because the cost of the mistake is a silently
-        # weaker problem, and no runtime signal reveals it.
-        import inspect
-        source = inspect.getsource(run_matrix.run)
-        pass_one = source.split("compute_limits")[0]
-        self.assertNotIn("ThreadPoolExecutor", pass_one)
-        self.assertNotIn("_run_pass2", pass_one)
+        # behaviourally — by watching how many runs are actually in flight —
+        # rather than by scraping the source for "ThreadPoolExecutor", so a
+        # refactor that keeps the property passes and one that loses it fails.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        lock = threading.Lock()
+        state = {"live": 0, "peak_pass1": 0, "peak_pass2": 0}
+        limits_known = threading.Event()
 
-    def test_a_banded_result_is_flagged_with_the_worker_count(self):
-        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
-        register = json.loads((self.problem_dir / "flags.json").read_text())
-        for record in register["flags"]:
-            if record["kind"] == "timing-band":
-                self.assertIn("worker", record["assumed"])
+        def watched(*args, **kwargs):
+            with lock:
+                state["live"] += 1
+                key = "peak_pass2" if limits_known.is_set() else "peak_pass1"
+                state[key] = max(state[key], state["live"])
+            try:
+                return real_run_once(*args, **kwargs)
+            finally:
+                with lock:
+                    state["live"] -= 1
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            # Pass 1 ends exactly here: compute_limits is what consumes it.
+            result = real_compute(*args, **kwargs)
+            limits_known.set()
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", watched), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertEqual(state["peak_pass1"], 1,
+                         "pass 1 must measure the model solution alone")
+        self.assertGreater(state["peak_pass2"], 1,
+                           "pass 2 did not actually run in parallel")
+
+    def test_a_retimed_result_is_flagged_with_the_worker_count(self):
+        # The band is unreachable on the `mini` fixture — two trivial
+        # solutions, TL pinned to the 1000 ms floor, so nothing can land in
+        # (1000, 2000]. Rather than assert inside a loop that never runs
+        # (a test that asserts nothing), the near-TL measurement is
+        # fabricated by stubbing the runner.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+
+        def near_tl(*args, **kwargs):
+            r = real_run_once(*args, **kwargs)
+            if seen["pass2"]:
+                return dataclasses.replace(r, cpu_ms=1200)  # TL < 1200 <= 1.5*TL
+            return r
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", near_tl), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertTrue(any(r["retimed_serially"] for r in payload["results"]))
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(banded, "a near-TL measurement produced no flag")
+        self.assertTrue(any("worker" in f["assumed"] or "worker" in f["what"]
+                            for f in banded))
 
     def test_a_matrix_error_in_one_worker_surfaces_from_run(self):
         # A worker's MatrixError must propagate out of the pool, not be
@@ -1225,9 +1282,16 @@ class ParallelPassTest(TestRunMatrixFixture):
 ```
 
 > **Note for the implementer:** `mock` is already imported in this file
-> (`:52`). The patch has to survive pass 1 — hence the `len(calls) > 3`
-> guard — because a failure raised during pass 1 would prove nothing about
-> the worker pool, which only exists in pass 2.
+> (`:52`); `threading` and `dataclasses` are not — add them. The exploding
+> patch has to survive pass 1 — hence the `len(calls) > 3` guard — because a
+> failure raised during pass 1 would prove nothing about the worker pool,
+> which only exists in pass 2.
+>
+> Two of these tests patch `run_matrix.compute_limits` purely as a
+> *marker* for where pass 1 ends (they call through to the real one and
+> change nothing), so `run()` must reference it as a module global —
+> `compute_limits(...)`, which is how it is imported today (`:198`). Do not
+> "tidy" that into a local alias.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
