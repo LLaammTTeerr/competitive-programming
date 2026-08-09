@@ -118,3 +118,63 @@ def compare(
                 mismatches.append(record)
 
     return holes, mismatches
+
+
+# How much a CPU-time measurement may be inflated by other sandboxes running
+# on the same machine. Measured under isolate on an 8-thread box, median of
+# the concurrent cohort against a serial baseline:
+#
+#   workers   2      3      4      6      8
+#   CPU-bound 1.08x  1.10x  1.15x  1.18x  1.27x
+#   mem-bound 1.04x  1.04x  1.21x  1.48x  1.65x (1.92x in a second run)
+#
+# 1.5 covers the 4-worker figures with real headroom. It must stay strictly
+# below 2.0 and that is not a style preference: `kill_ms` is always
+# `2 * tl_ms`, so a kernel kill implies a genuine over-limit run only while
+# `kill_ms / bound > tl_ms`. At bound >= 2 every killed run becomes
+# ambiguous, the serial tail swallows the whole speedup, and the argument
+# this function rests on stops holding.
+CONTENTION_BOUND = 1.5
+
+
+def needs_serial_retime(
+    time_ms: int, killed: bool, limits: Limits, bound: float = CONTENTION_BOUND
+) -> bool:
+    """Was this measurement taken close enough to TL that contention could
+    have decided it?
+
+    Contention is **one-sided**: isolate reports the sandboxed process's own
+    CPU time, and a neighbouring box can only add to it — nothing another
+    sandbox does makes a process consume less CPU than it would alone. So a
+    measurement `T` taken under a contention bound `F` implies a true serial
+    time in `[T/F, T]`, and only one interval is undecidable:
+
+        T <= tl_ms      -> true <= T <= tl_ms   -> genuinely not TL
+        T > F * tl_ms   -> true >= T/F > tl_ms  -> genuinely TL
+        otherwise       -> undecidable, re-time serially
+
+    `killed` short-circuits to False because isolate kills at `kill_ms`,
+    which `compute_limits` fixes at `2 * tl_ms`: a killed run's true time is
+    at least `2 * tl_ms / bound`, which exceeds `tl_ms` for every legal
+    bound. That single fact is what makes this scheme worth anything — TL
+    results are a small share of a matrix but the large majority of its
+    wall clock, and re-timing them all serially would give back the speedup.
+
+    This is deliberately NOT `classify`'s `banded` flag. That one marks
+    `(TL, kill]` — "too close to call on other hardware", a statement about
+    the *problem*, reported to the setter. This one marks "too close to call
+    on this hardware right now", a statement about the *measurement*,
+    resolved by re-measuring. Conflating them would change serial-mode
+    behaviour.
+    """
+    if bound < 1.0:
+        raise ValueError(f"contention bound must be at least 1.0, got {bound}")
+    if bound >= 2.0:
+        raise ValueError(
+            f"contention bound must be below 2.0, got {bound}: kill_ms is "
+            "2 * tl_ms, so at this bound a kernel kill no longer implies a "
+            "genuine over-limit run"
+        )
+    if killed:
+        return False
+    return limits.tl_ms < time_ms <= bound * limits.tl_ms
