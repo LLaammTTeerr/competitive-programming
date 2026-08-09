@@ -83,28 +83,28 @@ class BoxPoolTest(unittest.TestCase):
         self.assertEqual(path, Path(f"/tmp/run_matrix-boxes-{os.getuid()}"))
 
     def test_lease_yields_an_id_inside_the_pool(self):
-        with box_pool.lease() as box_id:
+        with box_pool.lease(timeout_s=5.0) as box_id:
             self.assertIn(box_id, range(2))
 
     def test_two_concurrent_leases_never_return_the_same_id(self):
-        with box_pool.lease() as a, box_pool.lease() as b:
+        with box_pool.lease(timeout_s=5.0) as a, box_pool.lease(timeout_s=5.0) as b:
             self.assertNotEqual(a, b)
 
     def test_lease_is_released_on_exit_and_the_id_is_reusable(self):
-        with box_pool.lease() as a:
+        with box_pool.lease(timeout_s=5.0) as a:
             first = a
-        with box_pool.lease() as b:
+        with box_pool.lease(timeout_s=5.0) as b:
             self.assertEqual(first, b)
 
     def test_lease_is_released_when_the_body_raises(self):
         with self.assertRaises(ValueError):
-            with box_pool.lease():
+            with box_pool.lease(timeout_s=5.0):
                 raise ValueError("boom")
-        with box_pool.lease() as a, box_pool.lease() as b:
+        with box_pool.lease(timeout_s=5.0) as a, box_pool.lease(timeout_s=5.0) as b:
             self.assertEqual({a, b}, {0, 1})
 
     def test_exhausted_pool_raises_rather_than_hanging_forever(self):
-        with box_pool.lease(), box_pool.lease():
+        with box_pool.lease(timeout_s=5.0), box_pool.lease(timeout_s=5.0):
             with self.assertRaises(box_pool.BoxPoolError) as ctx:
                 with box_pool.lease(timeout_s=0.5):
                     self.fail("a third lease was granted from a pool of two")
@@ -117,8 +117,8 @@ class BoxPoolTest(unittest.TestCase):
             with box_pool.lease(timeout_s=30.0) as box_id:
                 granted.append(box_id)
 
-        with box_pool.lease() as first:
-            inner = box_pool.lease()
+        with box_pool.lease(timeout_s=5.0) as first:
+            inner = box_pool.lease(timeout_s=5.0)
             inner.__enter__()                 # pool of two is now exhausted
             thread = threading.Thread(target=waiter)
             thread.start()
@@ -153,7 +153,7 @@ class BoxPoolTest(unittest.TestCase):
             "sys.path.insert(0, %r)\n"
             "from tools import box_pool\n"
             "with contextlib.ExitStack() as stack:\n"
-            "    ids = [stack.enter_context(box_pool.lease()) for _ in range(%d)]\n"
+            "    ids = [stack.enter_context(box_pool.lease(timeout_s=30.0)) for _ in range(%d)]\n"
             "    print(','.join(map(str, ids)), flush=True)\n"
             "    time.sleep(30)\n"
         ) % (str(Path(__file__).resolve().parents[2]), pool_size - 1)
@@ -190,7 +190,7 @@ class BoxPoolTest(unittest.TestCase):
             "import sys,time\n"
             "sys.path.insert(0, %r)\n"
             "from tools import box_pool\n"
-            "with box_pool.lease() as b:\n"
+            "with box_pool.lease(timeout_s=30.0) as b:\n"
             "    print(b, flush=True)\n"
             "    time.sleep(30)\n"
         ) % str(Path(__file__).resolve().parents[2])
@@ -214,7 +214,7 @@ class BoxPoolTest(unittest.TestCase):
         os.chmod(self.tmp, 0o500)    # r-x: no new files can be opened inside
         try:
             with self.assertRaises(box_pool.BoxPoolError) as ctx:
-                with box_pool.lease():
+                with box_pool.lease(timeout_s=5.0):
                     self.fail("a lease was granted from an unwritable lock dir")
             self.assertIn("cannot open the box-lease file", str(ctx.exception))
         finally:
@@ -226,7 +226,7 @@ class BoxPoolTest(unittest.TestCase):
             side_effect=OSError(errno.EIO, "Input/output error"),
         ):
             with self.assertRaises(box_pool.BoxPoolError) as ctx:
-                with box_pool.lease():
+                with box_pool.lease(timeout_s=5.0):
                     self.fail("a lease was granted despite a broken flock() call")
         self.assertIn("cannot lock the box-lease file", str(ctx.exception))
 
