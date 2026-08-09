@@ -746,8 +746,22 @@ Two placement rules are load-bearing and must not be simplified:
 
 - [ ] **Step 1: Write the failing tests**
 
+> **Which test base to subclass — read this before writing the class.**
+> `tools/tests/test_run_matrix.py` offers two, and picking the heavy one by
+> reflex is expensive. **`MinimalIsolateFixture`** gives `self.tmp` and the
+> `g++`/`isolate` skip guard and nothing else — no `mini` package copy, no
+> testlib resolution. **`TestRunMatrixFixture`** additionally copies the
+> whole `mini` package and resolves testlib, and is only warranted when a
+> test actually calls `run()` over a package. Every test in this task drives
+> `_run_once` directly and compiles its own throwaway binary, so
+> `MinimalIsolateFixture` is the right base for `ReentrancyTest` — the
+> class below is written against it. Task 2 learned this the hard way: a
+> class that subclassed the heavy fixture to gain 3 tests inherited ~50
+> unrelated ones, taking the suite from 289 to 342 and adding ~108s, doubled
+> again by the two-concurrent-suites acceptance run.
+
 ```python
-class ReentrancyTest(TestRunMatrixFixture):
+class ReentrancyTest(MinimalIsolateFixture):
     def setUp(self):
         super().setUp()
         os.chmod(self.tmp, 0o777)
