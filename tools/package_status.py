@@ -73,7 +73,7 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
 #     without changing content. Costs a re-run; never certifies anything
 #     false.
 #   * False "fresh" (dangerous — this is a false soundness claim, not an
-#     inconvenience): three ways this check can still miss a real edit.
+#     inconvenience): four ways this check can still miss a real edit.
 #       1. A *deletion* — removing a test or a solution — used to be
 #          invisible, since the old version of this walk only stat'd files.
 #          Fixed: directories are stat'd too, both the two top-level ones
@@ -88,9 +88,27 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
 #          `status()`-never-raises consequence, not a choice made for this
 #          check specifically), so content invisible to us cannot bump
 #          `newest`.
-#     (2) and (3) are accepted gaps, not fixed here — flagged for a reader
-#     deciding how much to trust this gate, not concealed by a comment that
-#     only named the safe direction.
+#       4. A change landing inside the same mtime *tick* as the artifact
+#          write, not just the same wall-clock second. Measured on this
+#          filesystem: ~4 ms granularity, not 1s — an edit and the
+#          `invocation.json` write can round to the identical mtime even
+#          though the edit happened after. `>=` is not the fix: pass 1's
+#          own `.a` rewrites already share a tick with the final
+#          `invocation.json` write on a fast run (see the
+#          "Checked against `run_matrix.run()`" note below), so `>=` would
+#          flag a normal clean run as stale, which is the failure that
+#          makes a gate worthless — see the "equal mtime is not stale"
+#          test for why strict `>` is the one that has to stay. The
+#          granularity itself is filesystem-dependent (ext4 measured here;
+#          other filesystems, or a coarser one under a container overlay,
+#          could be wider or narrower). Not reachable by a human editing
+#          a file — nobody edits a solution 4 ms after a matrix run
+#          finishes — but reachable by a script that runs the matrix and
+#          immediately mutates the package in the same process, which is
+#          exactly how this gap was found.
+#     (2), (3), and (4) are accepted gaps, not fixed here — flagged for a
+#     reader deciding how much to trust this gate, not concealed by a
+#     comment that only named the safe direction.
 #
 # `generated_at` inside the payload was considered and rejected as the
 # source of truth: it records when the matrix ran, not what it ran against,
