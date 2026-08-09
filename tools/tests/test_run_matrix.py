@@ -1516,15 +1516,15 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
 
     # ------------------------------------------------------------------
-    # `_remove_run_dir`'s two error paths (formerly `_clear_stage_dir`'s,
-    # before Task 3 moved cleanup from the top of the *next* run to the
-    # `finally` of the run that made the mess). Both are reachable and
-    # neither is skipped: the review of the old code confirmed that turning
-    # the `except OSError` into a `continue` left the whole suite green. An
+    # `_remove_run_dir`'s two paths (formerly `_clear_stage_dir`'s, before
+    # Task 3 moved cleanup from the top of the *next* run to the `finally`
+    # of the run that made the mess). Both are reachable and neither is
+    # skipped: the review of the old code confirmed that turning the
+    # `except OSError` into a `continue` left the whole suite green. An
     # error path nothing has ever triggered is not a handled error path.
     # Covered in the lighter `ReentrancyTest` fixture, which needs no
     # package copy to exercise `_run_once` directly —
-    # `test_a_run_directory_that_cannot_be_removed_raises_from_its_own_run`
+    # `test_an_unremovable_run_directory_warns_and_keeps_the_verdict`
     # and `test_a_removable_foreign_subdirectory_does_not_block_cleanup`.
     # ------------------------------------------------------------------
 
@@ -1988,6 +1988,81 @@ class ReentrancyTest(MinimalIsolateFixture):
         finally:
             run_matrix.close_isolate_box(isolate)
 
+    # ------------------------------------------------------------------
+    # Argv-level capture, mirroring `TestRunMatrixFixture`'s identically
+    # named helpers (duplicated rather than inherited: `ReentrancyTest`
+    # deliberately does not subclass the heavy fixture — see the class
+    # docstring on `MinimalIsolateFixture`).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mounted_host_dirs(cmd) -> set[str]:
+        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
+        found = set()
+        for arg in cmd:
+            if not isinstance(arg, str) or not arg.startswith("--dir="):
+                continue
+            host = arg.split("=", 2)[2]
+            found.add(host[:-3] if host.endswith(":rw") else host)
+        return found
+
+    def _isolate_run_argv(self, call):
+        """Run `call()` with `subprocess.run` spied on; return the `--run`
+        argv. `_run_once` shells out three times per call (`--init`,
+        `--run`, `--cleanup`); only the middle one carries the mounts."""
+        seen = []
+        real = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            seen.append(cmd)
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(run_matrix.subprocess, "run", spy):
+            call()
+        runs = [cmd for cmd in seen
+                if isinstance(cmd, list) and "--run" in cmd]
+        self.assertEqual(len(runs), 1,
+                         f"expected exactly one isolate --run, saw {seen!r}")
+        return runs[0]
+
+    def test_meta_file_is_never_mounted_into_the_sandbox(self):
+        # CRITICAL on review: `test_meta_dir_is_never_inside_the_sandbox_
+        # writable_root` above only compares *handle fields*
+        # (`isolate.meta_dir` vs `isolate.stage_root`), which is a weak
+        # proxy for the invariant `IsolateHandle`'s docstring actually
+        # claims — "never passed to --dir". A future tidy-up computing
+        # `meta_path = run_dir / "meta"` would leave both of that test's
+        # assertions green while putting the driver's only account of the
+        # run inside the solution's own `:rw` mount — the silent
+        # verdict-rewrite the docstring exists to forbid. This checks the
+        # fact that actually matters: the resolved `--meta=` argument
+        # isolate is invoked with never lies under any `--dir=` target in
+        # the same argv. (Demonstrated to actually catch that regression —
+        # and to show the handle-level test above does *not* — in the task
+        # report.)
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial3", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            argv = self._isolate_run_argv(
+                lambda: run_matrix._run_once(
+                    isolate, binary, self.stdin_path, self.tmp / "o3.out",
+                    cpu_limit_s=5.0, wall_limit_s=10.0,
+                    mem_limit_kb=256 * 1024))
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        meta_args = [a for a in argv
+                    if isinstance(a, str) and a.startswith("--meta=")]
+        self.assertEqual(len(meta_args), 1, argv)
+        meta_path = Path(meta_args[0].split("=", 1)[1]).resolve()
+        mounted = {Path(h).resolve() for h in self._mounted_host_dirs(argv)}
+        self.assertTrue(mounted, "no --dir= mounts found in argv, test is vacuous")
+        for host in mounted:
+            self.assertNotEqual(meta_path, host, (meta_path, host))
+            self.assertNotIn(host, meta_path.parents,
+                             f"{meta_path} is inside mounted directory {host}")
+
     def test_concurrent_runs_report_their_own_times_not_each_others(self):
         # The shared-meta defect in its purest form: a fast and a slow run at
         # once. With one meta file the fast run could read the slow run's
@@ -2078,6 +2153,24 @@ class ReentrancyTest(MinimalIsolateFixture):
         finally:
             run_matrix.close_isolate_box(isolate)
 
+    def test_meta_file_is_removed_after_a_successful_run(self):
+        # Minor #3 on review: the `meta_path.unlink` in `_run_once`'s
+        # `finally` had no coverage of its own — undetected, meta files
+        # would accumulate under `meta_dir` across every run of a matrix
+        # (1792 runs on a full package is the review's own reference
+        # figure), silent because nothing reads `meta_dir` back except this
+        # one unlink.
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial2", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            run_matrix._run_once(isolate, binary, self.stdin_path,
+                                 self.tmp / "o2.out", cpu_limit_s=5.0,
+                                 wall_limit_s=10.0, mem_limit_kb=256 * 1024)
+            self.assertEqual(list(isolate.meta_dir.iterdir()), [])
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
     def test_a_solutions_stray_file_cannot_reach_the_next_run(self):
         # The Task 6 dogfood defect: a solution writing an unexpected
         # filename used to leave it behind, owned by that box's subuid, and
@@ -2107,14 +2200,19 @@ class ReentrancyTest(MinimalIsolateFixture):
         self.assertTrue(second.no_output, second)
         self.assertFalse(second.crashed, second)
 
-    def test_a_run_directory_that_cannot_be_removed_raises_from_its_own_run(self):
+    def test_an_unremovable_run_directory_warns_and_keeps_the_verdict(self):
         # `_remove_run_dir`'s error branch, exercised end to end: a solution
         # leaves an unremovable (0700, foreign-owned) subdirectory behind.
-        # Cleanup now happens in `_run_once`'s own `finally`, so the raise
-        # comes from the same call that made the mess, not from whatever
-        # call happens to run next — the opposite of the old
-        # `_clear_stage_dir`, which cleared on the way into the *next* call
-        # and so blamed an innocent bystander.
+        # Human ruling on review, reversing this task's original design: the
+        # identical fact — a foreign-owned subdirectory this uid cannot
+        # remove — is only a one-line stderr warning when `close_isolate_box`
+        # meets it at teardown, so `_run_once`'s own `finally` meeting the
+        # *same* fact minutes earlier must not abort the whole matrix over
+        # it. `validating-solutions` runs hostile code on purpose;
+        # `mkdir("d", 0700)` is an expected input class from that, not an
+        # infrastructure fault, and this run's own `RunResult` is not in
+        # doubt — its meta file was private, already read and parsed, and
+        # its output already copied back before the `finally` ever runs.
         binary = _compile(
             "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
             'int main(){ umask(0); if (mkdir("d", 0700) != 0) return 6;\n'
@@ -2125,29 +2223,32 @@ class ReentrancyTest(MinimalIsolateFixture):
         isolate = run_matrix.open_isolate_box(self.tmp)
         # Bound before the `try` so the `finally` below can never hit
         # `UnboundLocalError` if something fails before either is assigned
-        # (e.g. the `assertRaises` itself, or the survivor-count assertion)
-        # — an `UnboundLocalError` there isn't an `OSError`, so
-        # `contextlib.suppress(OSError)` wouldn't catch it, and
-        # `close_isolate_box` would never run: for this fixture `stage_root`
-        # lives under `self.tmp`'s *parent* (see `_stage_base`), outside
-        # what `tearDown`'s `rmtree(self.tmp)` sweeps, so a failing run of
-        # this test would leak the very kind of undeletable litter this
-        # test exists to exercise.
+        # (e.g. the survivor-count assertion) — an `UnboundLocalError` there
+        # isn't an `OSError`, so `contextlib.suppress(OSError)` wouldn't
+        # catch it, and `close_isolate_box` would never run: for this
+        # fixture `stage_root` lives under `self.tmp`'s *parent* (see
+        # `_stage_base`), outside what `tearDown`'s `rmtree(self.tmp)`
+        # sweeps, so a failing run of this test would leak the very kind of
+        # undeletable litter this test exists to exercise.
         run_dir = litter = None
         try:
-            with self.assertRaises(run_matrix.MatrixError) as ctx:
-                run_matrix._run_once(isolate, binary, self.stdin_path,
-                                     self.tmp / "c1.produced",
-                                     cpu_limit_s=5.0, wall_limit_s=10.0,
-                                     mem_limit_kb=256 * 1024,
-                                     io_input="t.inp", io_output="t.out")
-            message = str(ctx.exception)
-            self.assertIn("staging directory", message)
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                result = run_matrix._run_once(
+                    isolate, binary, self.stdin_path, self.tmp / "c1.produced",
+                    cpu_limit_s=5.0, wall_limit_s=10.0, mem_limit_kb=256 * 1024,
+                    io_input="t.inp", io_output="t.out")
+
+            # The verdict is not swallowed by the cleanup failure — this is
+            # the property the human ruling exists to protect.
+            self.assertFalse(result.no_output, result)
+            self.assertFalse(result.crashed, result)
 
             # The run's own directory survives the failed removal (rmtree
             # aborts partway rather than silently discarding the litter) —
             # find it so the test can clean it up without leaving anything
-            # behind for the reviewer to explain.
+            # behind for the reviewer to explain, and so the warning's path
+            # claim below can be checked against a real path.
             survivors = list(isolate.stage_root.iterdir())
             self.assertEqual(len(survivors), 1,
                              f"expected exactly one surviving run_dir, "
@@ -2155,6 +2256,21 @@ class ReentrancyTest(MinimalIsolateFixture):
             run_dir = survivors[0]
             litter = run_dir / "d"
             self.assertTrue(litter.is_dir(), f"{litter} was not created")
+
+            # Minor #2 on review: the deleted `_clear_stage_dir`-era test
+            # asserted the message names the offending path, so the
+            # "remove it as root" instruction stays actionable; that
+            # property moves to the warning text here.
+            warning = captured.getvalue()
+            self.assertIn("WARNING", warning)
+            self.assertIn(str(run_dir), warning,
+                          "the warning does not name the leftover directory")
+            self.assertIn(str(binary), warning,
+                          "the warning does not name the binary responsible")
+            self.assertIn(str(self.stdin_path), warning,
+                          "the warning does not name the test that produced it")
+            self.assertIn("root", warning.lower(),
+                          "the warning drops the 'remove it as root' instruction")
         finally:
             # Removable despite not being ours to read: rmdir only needs
             # write+execute on the *parent*, which we own, and the target

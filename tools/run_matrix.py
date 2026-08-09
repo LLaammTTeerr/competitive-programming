@@ -987,15 +987,23 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     Task 3: `run_dir` and `meta_path` are private to *this call*, not to
     the `run()` invocation — see `IsolateHandle` for why a single shared
     meta file and staging directory made two concurrent calls unsafe. The
-    `finally` below always removes `run_dir` via `_remove_run_dir`; if that
-    raises (a solution left something this process cannot delete), it
-    replaces this call's own return value — or replaces/chains onto
-    whatever the `try` body itself was already raising — with that
-    `MatrixError`. That is deliberate, not an oversight: it attributes an
-    unremovable directory to the run that created it rather than losing the
-    failure or reporting it against a later, innocent call (see
-    `_remove_run_dir`), at the cost of this call's own verdict being
-    discarded on that path even when the sandboxed run itself succeeded.
+    `finally` below always attempts to remove `run_dir` via
+    `_remove_run_dir`; if that raises `MatrixError` (a solution left a
+    foreign-owned subdirectory this process cannot delete — `validating-
+    solutions` runs hostile code on purpose, and `mkdir(dir, 0700)` is an
+    expected input class from that, not an infrastructure fault), the
+    `finally` catches it and warns on stderr instead of letting it
+    propagate. It does **not** discard this call's own `RunResult` (a human
+    ruling reversing an earlier version of this docstring — see the task
+    report): the identical fact is only a one-line warning when
+    `close_isolate_box` meets it at the end of the whole invocation, and
+    nothing about a leftover directory makes any field of the `RunResult`
+    already computed above suspect — the meta file was private to this
+    run, already read and parsed, and the output already copied back to
+    `stdout_dest`. Per-run directories mean the litter cannot contaminate a
+    *later* verdict by construction (unlike the pre-Task-3 shared staging
+    directory), so the only remaining cost of leaving it for the warning to
+    name is disk, not correctness.
     """
     with _leased_box() as box_id:
         # Created before `_init_box`, not after: if `mkdtemp`/`chmod` here
@@ -1032,7 +1040,7 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
             # bought by it, so it goes.
             stdin_label = _label(stdin_path.parent) if not file_io else None
             stage_label = _label(run_dir)
-            stage_dir_resolved = run_dir.resolve()
+            run_dir_resolved = run_dir.resolve()
 
             if file_io and io_input == io_output:
                 # `problem_meta` refuses this at load time; this is the same
@@ -1090,7 +1098,7 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                 f"--cg-mem={mem_limit_kb}", f"--fsize={OUTPUT_LIMIT_KB}",
             ]
             for resolved, label in mounts.items():
-                opt = ":rw" if resolved == stage_dir_resolved else ""
+                opt = ":rw" if resolved == run_dir_resolved else ""
                 cmd.append(f"--dir={label}={resolved}{opt}")
             cmd += [
                 f"--chdir={stage_label if file_io else bin_label}",
@@ -1191,9 +1199,30 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                               crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
                               status=status, message=message, no_output=no_output)
         finally:
-            meta_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                meta_path.unlink(missing_ok=True)
             _cleanup_box(isolate.binary, box_id)
-            _remove_run_dir(run_dir)
+            try:
+                _remove_run_dir(run_dir)
+            except MatrixError as exc:
+                # Warn, don't abort (human ruling, reversing the brief's
+                # original "raise from this call's own finally" design —
+                # see the docstring above). The identical fact — a
+                # foreign-owned subdirectory this uid cannot remove — was
+                # already a one-line stderr warning at the whole-invocation
+                # level (`close_isolate_box`); treating it as a
+                # whole-matrix-aborting MatrixError here, minutes earlier,
+                # for the exact same fact was two responses to one
+                # condition. The RunResult already computed above is not
+                # in doubt: its meta file was private to this run, written,
+                # read, and parsed, and its output was already copied back
+                # to `stdout_dest` before this `finally` ever runs — the
+                # leftover directory says nothing about any of that.
+                print(
+                    f"WARNING: {exc} — this happened while running "
+                    f"{binary} on {stdin_path}; that run's own verdict is "
+                    "unaffected and is still being reported. Remove it as "
+                    f"root: sudo rm -rf {run_dir}", file=sys.stderr)
 
 
 def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
