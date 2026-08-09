@@ -165,12 +165,63 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
   | uvx --from ./mcp-server cf-mcp
 ```
 
-**The tools suite is not parallel-safe: run it alone.** `run_matrix.py`
-derives its `isolate` box ids from the process pid, so a second concurrent
-run of the suite (or any other `run_matrix` invocation) collides on the same
-sandbox boxes and produces failures that belong to neither run — spurious,
-irreproducible, and convincing enough to have already misled several
-debugging attempts. One suite at a time on a machine.
+**The tools suite is parallel-safe.** `run_matrix.py` leases every isolate
+box id from a per-user `flock` pool (`/run/user/<uid>/run_matrix-boxes`,
+falling back to `/tmp/run_matrix-boxes-<uid>`, overridable with
+`$RUN_MATRIX_BOX_LOCK_DIR`), so several invocations — or several
+`dispatching-parallel-agents` subagents, or two copies of the test suite —
+can run at once without colliding. That guarantee is about correctness —
+no two of this user's invocations can land on the same box or clobber
+each other's staged output — not about timing isolation: a sibling invocation's
+sandboxes still compete for the same CPUs while yours run. Pass 2 also runs
+on that same pool, so the pool size is simultaneously the box allocator and
+this user's CPU
+admission control. Measured, not projected: `goldenseed` (13 solutions, 42
+graded tests, 546 results) ran in 182.4s serial vs. 65.4s at 4 workers — 2.79x —
+with verdicts, holes, mismatches, and TL/kill limits identical between the
+two runs, and 1 of 546 results re-timed serially.
+
+The pool is per-user, and that bound is worth knowing: two *different*
+users running `run_matrix` on the same machine can still land on the same
+isolate box id. That collision is caught loudly by isolate's own lock — the
+driver names it and stops, rather than reporting a wrong verdict — but it
+is not prevented.
+
+`$RUN_MATRIX_BOX_POOL` sets the pool size; it defaults to half the CPUs.
+That default is a correctness bound, not a throughput setting: CPU time
+inflates under contention (measured on an 8-thread box, 1.15–1.21x at 4
+concurrent sandboxes and up to 1.92x at 8), and the driver's ambiguity rule
+is only sound while inflation stays below 2x. `pool_size()` accepts any
+value up to isolate's own box-id ceiling with no check against the core
+count, so raising it past `nproc` is an operator hazard, not a safety net —
+nothing bounds wall-time inflation the way `CONTENTION_BOUND` bounds CPU
+time, so oversubscription is where wall-clock kills start showing up. The
+same is true of memory: each sandbox is capped at the problem's own
+`memory_mb` via `--cg-mem`, but `pool_size()` sandboxes run at once, so this
+driver's own peak memory footprint from live sandboxes is
+`workers × memory_mb`, with nothing here checking that sum against the
+machine's physical RAM — raising `$RUN_MATRIX_BOX_POOL` multiplies memory
+pressure exactly as it multiplies CPU pressure. Raise
+it only on a machine with the resources to match, and set it to `1` for a
+fully quiesced authoritative run *provided this is the only `run_matrix`
+invocation on the machine* — a sibling invocation running at
+`RUN_MATRIX_BOX_POOL=4` will happily sweep the other three lease ids while
+yours holds the one it was given, so `POOL=1` only quiesces the machine
+when nothing else is drawing from the same pool.
+
+Pass 1 — the model solution's timings, from which TL is derived — is
+always serial regardless of the pool size *within this invocation*: this
+process never runs more than one pass-1 timing at a time. That does not
+mean the core it runs on is otherwise idle — a sibling `run_matrix`
+invocation can still be running its own boxes concurrently and inflating
+this process's measured `t_main`. That is the safe direction to be wrong
+in, though: an inflated TL makes a genuinely-too-slow solution measure
+under a looser limit and pass, and `compare()` records exactly that
+pattern — `@expect TL` met by an `OK` result — as a **hole**. It is a
+false alarm worth double-checking (the solution may not actually be too
+slow; contention noise can produce the same signature), not a silent
+failure: it lands in `invocation.json`'s `holes` list and trips exit code
+1, so it gets looked at rather than passing unseen.
 
 The tools suite **fails** rather than skips when `g++`, `isolate`, or the
 testlib cache is missing: `run_matrix.py` is the one module with no fallback

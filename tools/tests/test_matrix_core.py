@@ -1,6 +1,7 @@
 import unittest
 
-from tools.matrix_core import Limits, classify, compute_limits
+from tools import matrix_core
+from tools.matrix_core import Limits, classify, compute_limits, needs_serial_retime
 
 
 class TestComputeLimits(unittest.TestCase):
@@ -229,6 +230,52 @@ class TestCompare(unittest.TestCase):
         holes, mismatches = compare(expected, actual)
         self.assertEqual(len(mismatches), 1)
         self.assertIsNone(mismatches[0]["actual"])
+
+
+class NeedsSerialRetimeTest(unittest.TestCase):
+    def setUp(self):
+        self.limits = Limits(t_main_ms=500, tl_ms=1000, kill_ms=2000)
+
+    def test_comfortably_under_the_limit_is_never_ambiguous(self):
+        # Contention only inflates, so a measurement already under TL was
+        # under TL serially too.
+        self.assertFalse(needs_serial_retime(400, False, self.limits))
+
+    def test_exactly_at_the_limit_is_not_ambiguous(self):
+        self.assertFalse(needs_serial_retime(1000, False, self.limits))
+
+    def test_just_over_the_limit_is_ambiguous(self):
+        self.assertTrue(needs_serial_retime(1001, False, self.limits))
+
+    def test_the_top_of_the_band_is_ambiguous(self):
+        self.assertTrue(needs_serial_retime(1500, False, self.limits))
+
+    def test_past_the_band_is_not_ambiguous(self):
+        # 1501/1.5 = 1000.7 > TL, so it was over the limit serially too.
+        self.assertFalse(needs_serial_retime(1501, False, self.limits))
+
+    def test_a_kernel_kill_is_never_ambiguous(self):
+        # Killed at kill_ms = 2*TL; even at the bound, 2*TL/1.5 = 1.33*TL.
+        self.assertFalse(needs_serial_retime(2000, True, self.limits))
+
+    def test_a_bound_of_one_makes_nothing_ambiguous(self):
+        # bound=1.0 is serial mode: measurements are exact.
+        self.assertFalse(needs_serial_retime(1500, False, self.limits, bound=1.0))
+
+    def test_a_bound_at_or_past_two_is_rejected(self):
+        # kill_ms is always 2*tl_ms, so at bound >= 2 a kernel kill stops
+        # implying a genuine TL and the whole scheme is unsound.
+        with self.assertRaises(ValueError) as ctx:
+            needs_serial_retime(1500, False, self.limits, bound=2.0)
+        self.assertIn("kill", str(ctx.exception))
+
+    def test_a_bound_below_one_is_rejected(self):
+        with self.assertRaises(ValueError):
+            needs_serial_retime(1500, False, self.limits, bound=0.9)
+
+    def test_the_default_bound_is_under_two(self):
+        self.assertLess(matrix_core.CONTENTION_BOUND, 2.0)
+        self.assertGreaterEqual(matrix_core.CONTENTION_BOUND, 1.0)
 
 
 if __name__ == "__main__":

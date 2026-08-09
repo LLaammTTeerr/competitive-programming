@@ -38,6 +38,7 @@ a message about staging rather than about the thing under test.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -46,12 +47,13 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools import flags, run_matrix
+from tools import flags, matrix_core, run_matrix
 from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
@@ -148,6 +150,77 @@ def _compile(src_text: str, out_path: Path, tmp_dir: Path) -> Path:
     return out_path
 
 
+def _fixed_lease(box_id: int):
+    """Stand in for `box_pool.lease`, always handing out the same id.
+
+    Box ids now come from `box_pool`'s per-user lease pool rather than a
+    value this module derives itself, so tests that need a *specific* box
+    id (an out-of-range one to force a real `--init` failure, or a known
+    one to check its box directory is gone afterward) patch
+    `run_matrix.box_pool.lease` with this rather than a function this
+    module no longer has. Only safe for an id no real lease would ever
+    hand out (`box_pool`'s pool never exceeds 65536 ids) — anything within
+    the real range must go through `_track_leased_box_ids` instead, or two
+    copies of this suite running at once will genuinely collide on it,
+    since this bypasses the real `flock` entirely.
+    """
+    return contextlib.nullcontext(box_id)
+
+
+@contextlib.contextmanager
+def _track_leased_box_ids():
+    """Record, for every box id `box_pool.lease` hands out during the
+    block, whether its isolate box directory still existed at the moment
+    the real lease released it — checked while the real `flock` is still
+    held, not after.
+
+    `test_boxes_are_cleaned_up_after_*` need to know that every box a
+    `run()` (or `_run_once`) call touched was torn down before that call's
+    lease let go of it. Two earlier approaches both got this wrong:
+
+    Snapshotting the whole of `/var/local/lib/isolate/` before and after
+    assumed this process was the only thing using isolate for the whole
+    window, which a second copy of this suite running at the same time
+    (Task 2's own acceptance criterion) violates: `pool_size()` is as low
+    as 4 on a real machine, so a sibling suite's `BoxLeasingTest` draws
+    from the *same* few ids, not merely "other" ones, and can legitimately
+    hold one live at whatever instant the snapshot is taken.
+
+    Recording the ids and checking `box_dir.exists()` only *after* this
+    context manager (and so after `real_lease`) has released every flock
+    has the identical race in miniature: nothing stops a sibling process
+    from re-leasing one of those same ids the instant this process's flock
+    lets go of it, and then this test would see *the sibling's* live box
+    and misreport it as ours never having been cleaned up.
+
+    So the check has to happen inside the spy's own `finally`, which runs
+    after the caller's `with box_pool.lease() as box_id:` body returns
+    (i.e. after `_init_box`/the sandboxed run/`_cleanup_box` has already
+    completed — see `_run_once` and `open_isolate_box`) but *before*
+    `real_lease`'s own `__exit__` releases the flock. That is also the only
+    way this test can actually enforce "the lease wraps the whole
+    `--init`/`--run`/`--cleanup` cycle": an assertion made after release
+    cannot tell "cleaned up before the lease let go" from "cleaned up
+    whenever, by whoever, since" — moving `_cleanup_box` outside the
+    `with box_pool.lease()` in `run_matrix.py` must make this fail, and it
+    does (verified; see the task report).
+    """
+    records: list[tuple[int, bool]] = []
+    real_lease = run_matrix.box_pool.lease
+
+    @contextlib.contextmanager
+    def _spy(**kwargs):
+        with real_lease(**kwargs) as box_id:
+            try:
+                yield box_id
+            finally:
+                box_dir = Path(f"/var/local/lib/isolate/{box_id}")
+                records.append((box_id, box_dir.exists()))
+
+    with mock.patch.object(run_matrix.box_pool, "lease", _spy):
+        yield records
+
+
 def _testlib_dir() -> Path:
     """Resolve the cached testlib checkout, failing if it cannot be reached.
 
@@ -171,7 +244,19 @@ def _testlib_dir() -> Path:
     return path
 
 
-class TestRunMatrixFixture(unittest.TestCase):
+class PackageFixture(unittest.TestCase):
+    """Shared setup for tests that need a scratch copy of the `mini` problem
+    package: the hard-dependency skip guard, testlib cache resolution, and
+    the package-editing helpers built on top of them.
+
+    Deliberately carries **no** `test_*` methods of its own. `unittest`
+    collects inherited test methods, so a fixture class that also held
+    tests would have every one of them silently re-run by each subclass
+    that reuses this setup — see `TestRunMatrixFixture` and
+    `ParallelPassTest` below, which both subclass this rather than one
+    subclassing the other, for exactly that reason.
+    """
+
     def setUp(self):
         if shutil.which("g++") is None:
             raise _missing_dependency("g++ not found on PATH")
@@ -227,6 +312,57 @@ class TestRunMatrixFixture(unittest.TestCase):
             (solutions / name).write_text(source, encoding="utf-8")
         return self.problem_dir
 
+    def _assert_boxes_gone(self, records) -> None:
+        """Consumes `_track_leased_box_ids()`'s output: `(box_id,
+        still_present_when_its_lease_released)` pairs. The "still present"
+        half was recorded while that lease's flock was still held, so this
+        does not re-check the filesystem itself — doing so here, after
+        every lease in `records` has already been released, would reopen
+        the exact race `_track_leased_box_ids` exists to avoid (a sibling
+        process may have re-leased and be legitimately using that id by
+        now)."""
+        self.assertTrue(records, "no box id was leased at all — sanity check")
+        for box_id, still_present in records:
+            self.assertFalse(
+                still_present,
+                f"/var/local/lib/isolate/{box_id} still present when its "
+                "lease released — the lease did not wrap the whole "
+                "--init/--run/--cleanup cycle")
+
+    @staticmethod
+    def _mounted_host_dirs(cmd) -> set[str]:
+        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
+        found = set()
+        for arg in cmd:
+            if not isinstance(arg, str) or not arg.startswith("--dir="):
+                continue
+            host = arg.split("=", 2)[2]
+            found.add(host[:-3] if host.endswith(":rw") else host)
+        return found
+
+    def _isolate_run_argv(self, call):
+        """Run `call()` with `subprocess.run` spied on; return the `--run` argv.
+
+        `_run_once` shells out three times per call (`--init`, `--run`,
+        `--cleanup`); only the middle one carries the mounts.
+        """
+        seen = []
+        real = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            seen.append(cmd)
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(run_matrix.subprocess, "run", spy):
+            call()
+        runs = [cmd for cmd in seen
+                if isinstance(cmd, list) and "--run" in cmd]
+        self.assertEqual(len(runs), 1,
+                         f"expected exactly one isolate --run, saw {seen!r}")
+        return runs[0]
+
+
+class TestRunMatrixFixture(PackageFixture):
     def test_clean_matrix_has_no_holes_or_mismatches(self):
         payload = run_matrix.run(self.problem_dir, self.testlib_dir)
 
@@ -369,7 +505,8 @@ class TestRunMatrixFixture(unittest.TestCase):
         # unconfigured" case this driver must diagnose separately, since a
         # genuinely unconfigured sandbox cannot be produced on this
         # already-configured machine without root to break it.
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=999_999):
+        with mock.patch.object(run_matrix.box_pool, "lease",
+                               lambda **kw: _fixed_lease(999_999)):
             with self.assertRaises(run_matrix.MatrixError) as ctx:
                 run_matrix.open_isolate_box(self.tmp)
         message = str(ctx.exception)
@@ -444,8 +581,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         # wrong one. This test must FAIL against the single-persistent-box
         # code this task replaces (confirmed: see the task report for the
         # actual failing-before transcript) and PASS now that every
-        # `_run_once` call draws its own fresh box from the same
-        # `IsolateHandle` via `box_id_counter`.
+        # `_run_once` call leases its own fresh box from `box_pool`.
         hog = _compile(
             "#include <cstring>\n#include <cstdlib>\n"
             "int main(){ for(;;){ char*p=(char*)malloc(8*1024*1024); "
@@ -528,28 +664,24 @@ class TestRunMatrixFixture(unittest.TestCase):
         stdin_path.write_text("\n", encoding="utf-8")
         out_path = self.tmp / "ok.out"
 
-        box_dir = Path("/var/local/lib/isolate/54323")
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=54323):
-            isolate = run_matrix.open_isolate_box(self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
         try:
-            # itertools.count(54323)'s first next() yields 54323 itself, so
-            # this first _run_once call is guaranteed to use box 54323.
-            with mock.patch.object(run_matrix, "_parse_meta",
-                                   side_effect=RuntimeError("boom")):
-                with self.assertRaises(RuntimeError):
-                    run_matrix._run_once(isolate, binary, stdin_path, out_path,
-                                         cpu_limit_s=1.0, wall_limit_s=3.0,
-                                         mem_limit_kb=256 * 1024)
-            self.assertFalse(box_dir.exists(),
-                             f"{box_dir} still present after _run_once raised")
+            # `_run_once` leases its own box id now (no more
+            # `box_id_counter` to seed) — record whichever id the real
+            # `box_pool.lease` hands out (still under its real flock, so
+            # this test does not collide with a concurrently running
+            # second copy of this same suite the way a hardcoded id with
+            # no locking would) and check that one's directory afterward.
+            with _track_leased_box_ids() as leased:
+                with mock.patch.object(run_matrix, "_parse_meta",
+                                       side_effect=RuntimeError("boom")):
+                    with self.assertRaises(RuntimeError):
+                        run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                             cpu_limit_s=1.0, wall_limit_s=3.0,
+                                             mem_limit_kb=256 * 1024)
+            self._assert_boxes_gone(leased)
         finally:
             run_matrix.close_isolate_box(isolate)
-
-    def _isolate_boxes(self) -> set[str]:
-        base = Path("/var/local/lib/isolate")
-        if not base.is_dir():
-            return set()
-        return {p.name for p in base.iterdir()}
 
     def test_boxes_are_cleaned_up_after_a_real_run(self):
         # A box leaked under /var/local/lib/isolate/<id> is exactly the
@@ -563,23 +695,28 @@ class TestRunMatrixFixture(unittest.TestCase):
         # claimed to cover but did not.
         #
         # Task 9c: `run()` now opens and closes a *different* box for every
-        # single sandboxed execution (see IsolateHandle.box_id_counter), so
-        # checking only the mocked base id would only ever pin the first
-        # of several boxes a real run opens. Snapshotting the whole
-        # directory before and after is the check that actually covers
-        # every box this invocation touched, not just the first.
-        before = self._isolate_boxes()
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=54321):
+        # single sandboxed execution, each leased from `box_pool`, so
+        # checking only one fixed id would only ever pin the first of
+        # several boxes a real run opens. `_track_leased_box_ids` records
+        # every id this invocation actually leased so all of them are
+        # checked, not just the first — and, unlike snapshotting the whole
+        # of `/var/local/lib/isolate/`, does not misreport a leak when a
+        # concurrently running second copy of this suite is using the same
+        # small pool of ids (`pool_size()` is 4 here, so "other" ids are
+        # not guaranteed): each `(box_id, exists)` is recorded while this
+        # invocation still holds that id's flock, so no sibling can have
+        # taken it yet at the moment of observation. See
+        # `_track_leased_box_ids`'s own docstring for the full reasoning.
+        with _track_leased_box_ids() as leased:
             run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertEqual(self._isolate_boxes(), before,
-                             "a box was left behind after a clean run")
+        self._assert_boxes_gone(leased)
 
-            (self.problem_dir / "tests" / "g1" / "01.in").write_text(
-                "0 0\n", encoding="utf-8")
+        (self.problem_dir / "tests" / "g1" / "01.in").write_text(
+            "0 0\n", encoding="utf-8")
+        with _track_leased_box_ids() as leased:
             payload = run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
-            self.assertEqual(self._isolate_boxes(), before,
-                             "a box was left behind after a hole-firing run")
+        self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
+        self._assert_boxes_gone(leased)
 
     def test_boxes_are_cleaned_up_after_run_raises(self):
         # Task 9b review finding D: the test above never actually drives
@@ -591,12 +728,10 @@ class TestRunMatrixFixture(unittest.TestCase):
         (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
             _MAIN_HEADER + "int main(){ int *p = nullptr; *p = 1; return 0; }\n",
             encoding="utf-8")
-        before = self._isolate_boxes()
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=54322):
+        with _track_leased_box_ids() as leased:
             with self.assertRaises(run_matrix.MatrixError):
                 run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertEqual(self._isolate_boxes(), before,
-                             "a box was left behind after run() raised")
+        self._assert_boxes_gone(leased)
 
     def test_crashing_model_solution_is_diagnosed_as_crashed_not_exited_0(self):
         # Task 9b review finding A: a signal death (status SG) carries no
@@ -1297,40 +1432,9 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "42")
 
     # ------------------------------------------------------------------
-    # Which host directories reach the box.
+    # Which host directories reach the box. (`_mounted_host_dirs` and
+    # `_isolate_run_argv` live on `PackageFixture`.)
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _mounted_host_dirs(cmd) -> set[str]:
-        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
-        found = set()
-        for arg in cmd:
-            if not isinstance(arg, str) or not arg.startswith("--dir="):
-                continue
-            host = arg.split("=", 2)[2]
-            found.add(host[:-3] if host.endswith(":rw") else host)
-        return found
-
-    def _isolate_run_argv(self, call):
-        """Run `call()` with `subprocess.run` spied on; return the `--run` argv.
-
-        `_run_once` shells out three times per call (`--init`, `--run`,
-        `--cleanup`); only the middle one carries the mounts.
-        """
-        seen = []
-        real = subprocess.run
-
-        def spy(cmd, *args, **kwargs):
-            seen.append(cmd)
-            return real(cmd, *args, **kwargs)
-
-        with mock.patch.object(run_matrix.subprocess, "run", spy):
-            call()
-        runs = [cmd for cmd in seen
-                if isinstance(cmd, list) and "--run" in cmd]
-        self.assertEqual(len(runs), 1,
-                         f"expected exactly one isolate --run, saw {seen!r}")
-        return runs[0]
 
     def test_the_test_directory_is_not_mounted_in_file_io_mode(self):
         # Pre-existing and correctly not a blocker, but free to remove here:
@@ -1373,7 +1477,7 @@ class TestRunMatrixFixture(unittest.TestCase):
                     mem_limit_kb=256 * 1024,
                     io_input="t.inp", io_output="t.out"))
             mounted = self._mounted_host_dirs(argv)
-            stage_dir = isolate.stage_dir.resolve()
+            stage_root = isolate.stage_root.resolve()
         finally:
             run_matrix.close_isolate_box(isolate)
 
@@ -1384,7 +1488,16 @@ class TestRunMatrixFixture(unittest.TestCase):
         # ...and the two mounts that *are* load-bearing survive, so this is
         # not passing because mounting broke altogether.
         self.assertIn(str(bin_dir.resolve()), mounted, sorted(mounted))
-        self.assertIn(str(stage_dir), mounted, sorted(mounted))
+        # The rw mount is a fresh per-call directory under `stage_root`
+        # (Task 3), not `stage_root` itself, and its name isn't known ahead
+        # of the call — assert it's a direct child of `stage_root` instead
+        # of an exact path, and that `stage_root` itself was never handed to
+        # isolate (it is never a `--dir=` target on its own).
+        rw_mounts = [m for m in mounted if Path(m).parent == stage_root]
+        self.assertEqual(len(rw_mounts), 1,
+                         f"expected exactly one per-run mount under "
+                         f"{stage_root}, got {sorted(mounted)}")
+        self.assertNotIn(str(stage_root), mounted, sorted(mounted))
 
     def test_the_test_directory_is_still_mounted_in_stdin_mode(self):
         # The control, and the reason the change above is scoped to file-IO
@@ -1420,111 +1533,17 @@ class TestRunMatrixFixture(unittest.TestCase):
         self.assertEqual(dest.read_text(encoding="utf-8").strip(), "5")
 
     # ------------------------------------------------------------------
-    # `_clear_stage_dir`'s two error paths. Both were reachable and neither
-    # was covered: the review confirmed that turning the `except OSError`
-    # into a `continue`, and the `is_dir()` branch into a `pass`, each left
-    # the whole suite green. An error path nothing has ever triggered is not
-    # a handled error path.
+    # `_remove_run_dir`'s two paths (formerly `_clear_stage_dir`'s, before
+    # Task 3 moved cleanup from the top of the *next* run to the `finally`
+    # of the run that made the mess). Both are reachable and neither is
+    # skipped: the review of the old code confirmed that turning the
+    # `except OSError` into a `continue` left the whole suite green. An
+    # error path nothing has ever triggered is not a handled error path.
+    # Covered in the lighter `ReentrancyTest` fixture, which needs no
+    # package copy to exercise `_run_once` directly —
+    # `test_an_unremovable_run_directory_warns_and_keeps_the_verdict`
+    # and `test_a_removable_foreign_subdirectory_does_not_block_cleanup`.
     # ------------------------------------------------------------------
-
-    def test_a_subdirectory_that_cannot_be_cleared_refuses_the_next_run(self):
-        # A solution may create a directory in the staging area, and it is
-        # owned by the mapped subuid of *its* box. Unlinking plain files
-        # there works regardless of owner (the staging directory is ours),
-        # but a subdirectory this uid cannot descend into cannot be removed
-        # at all — and a staging directory that cannot be guaranteed empty
-        # is one whose next verdict cannot be trusted. Refuse, don't guess.
-        #
-        # The directory is left *empty* at mode 0700 rather than filled with
-        # a file: both make `shutil.rmtree` fail identically (it cannot even
-        # open the directory to enumerate it), but only the empty one can be
-        # cleaned up afterwards without root — a non-empty foreign directory
-        # is exactly the undeletable litter this test would otherwise leave
-        # in the repository on every run.
-        binary = _compile(
-            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
-            'int main(){ umask(0); if (mkdir("d", 0700) != 0) return 6;\n'
-            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
-            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
-            self.tmp / "dirlitter", self.tmp)
-        os.chmod(self.tmp, 0o777)
-        test_in = self.tmp / "01.in"
-        test_in.write_text("x\n", encoding="utf-8")
-
-        isolate = run_matrix.open_isolate_box(self.tmp)
-        litter = isolate.stage_dir / "d"
-        try:
-            first = run_matrix._run_once(isolate, binary, test_in,
-                                         self.tmp / "c1.produced",
-                                         cpu_limit_s=2.0, wall_limit_s=6.0,
-                                         mem_limit_kb=256 * 1024,
-                                         io_input="t.inp", io_output="t.out")
-            # Vacuity guard: run 1 has to have actually worked, and actually
-            # left the directory behind, or run 2 raising would prove nothing.
-            self.assertFalse(first.no_output, first)
-            self.assertTrue(litter.is_dir(), f"{litter} was not created")
-
-            with self.assertRaises(run_matrix.MatrixError) as ctx:
-                run_matrix._run_once(isolate, binary, test_in,
-                                     self.tmp / "c2.produced",
-                                     cpu_limit_s=2.0, wall_limit_s=6.0,
-                                     mem_limit_kb=256 * 1024,
-                                     io_input="t.inp", io_output="t.out")
-        finally:
-            # Removable because we own the staging directory and it is
-            # empty; nothing subuid-owned survives this test.
-            with contextlib.suppress(OSError):
-                litter.rmdir()
-            run_matrix.close_isolate_box(isolate)
-
-        message = str(ctx.exception)
-        self.assertIn(str(litter), message)      # names the entry
-        self.assertIn("staging", message)
-
-    def test_an_empty_foreign_subdirectory_is_cleared_before_the_next_run(self):
-        # The other branch: `is_dir()` -> `shutil.rmtree`. A plain
-        # `entry.unlink()` raises `IsADirectoryError` on a directory, so
-        # without this branch every solution that so much as calls `mkdir`
-        # would take the whole matrix down through the refusal above — a
-        # foreign-owned directory that CAN be removed must simply be
-        # removed, silently, like any other leftover.
-        maker = _compile(
-            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
-            'int main(){ umask(0); if (mkdir("e", 0777) != 0) return 6;\n'
-            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
-            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
-            self.tmp / "dirmaker2", self.tmp)
-        silent = _compile("int main(){ return 0; }\n",
-                          self.tmp / "silent3", self.tmp)
-        os.chmod(self.tmp, 0o777)
-        test_in = self.tmp / "01.in"
-        test_in.write_text("x\n", encoding="utf-8")
-
-        isolate = run_matrix.open_isolate_box(self.tmp)
-        leftover = isolate.stage_dir / "e"
-        try:
-            first = run_matrix._run_once(isolate, maker, test_in,
-                                         self.tmp / "e1.produced",
-                                         cpu_limit_s=2.0, wall_limit_s=6.0,
-                                         mem_limit_kb=256 * 1024,
-                                         io_input="t.inp", io_output="t.out")
-            self.assertFalse(first.no_output, first)
-            self.assertTrue(leftover.is_dir(), f"{leftover} was not created")
-
-            # A different binary, so the directory is not simply recreated.
-            second = run_matrix._run_once(isolate, silent, test_in,
-                                          self.tmp / "e2.produced",
-                                          cpu_limit_s=2.0, wall_limit_s=6.0,
-                                          mem_limit_kb=256 * 1024,
-                                          io_input="t.inp", io_output="t.out")
-            still_there = leftover.exists()
-        finally:
-            run_matrix.close_isolate_box(isolate)
-
-        self.assertTrue(second.no_output, second)
-        self.assertFalse(still_there,
-                         f"{leftover} survived the next run's clear — a "
-                         f"foreign directory that CAN be removed must be")
 
     def test_close_isolate_box_warns_about_a_staging_directory_it_cannot_remove(self):
         # `shutil.rmtree(..., ignore_errors=True)` is right — teardown must
@@ -1539,7 +1558,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         # too, which is all `rmtree` needs, and unlike a real subuid-owned
         # one it can be chmod'ed back.
         isolate = run_matrix.open_isolate_box(self.tmp)
-        stage = isolate.stage_dir
+        stage = isolate.stage_root
         blocked = stage / "unremovable"
         blocked.mkdir()
         (blocked / "x").write_text("x", encoding="utf-8")
@@ -1600,8 +1619,9 @@ class TestRunMatrixFixture(unittest.TestCase):
         # solution's stray files between runs, which Task 6's dogfood proved
         # is a defect, not a feature: the leftover is owned by one box's
         # subuid and no later box can reopen it, so it turned NO_OUTPUT into
-        # RE. `_clear_stage_dir` now wipes the directory before every run,
-        # and this test must not be the reason to reintroduce the leak.
+        # RE. Every `_run_once` call now gets its own fresh directory
+        # (Task 3), so that leak is unreachable rather than merely cleared,
+        # and this test must not be the reason to reintroduce it.
         silent = _compile("int main(){ return 0; }\n",
                           self.tmp / "silent_first", self.tmp)
         writer = _compile(
@@ -1868,14 +1888,16 @@ class TestRunMatrixFixture(unittest.TestCase):
     def test_stage_dir_is_not_on_a_memory_backed_filesystem(self):
         isolate = run_matrix.open_isolate_box(self.problem_dir)
         try:
-            fstype = run_matrix._filesystem_type(isolate.stage_dir)
+            fstype = run_matrix._filesystem_type(isolate.stage_root)
             self.assertNotIn(fstype, run_matrix.MEMORY_BACKED_FSTYPES,
-                             f"staging landed on {fstype} at {isolate.stage_dir}")
-            self.assertTrue(isolate.stage_dir.is_dir())
+                             f"staging landed on {fstype} at {isolate.stage_root}")
+            self.assertTrue(isolate.stage_root.is_dir())
         finally:
             run_matrix.close_isolate_box(isolate)
-        self.assertFalse(isolate.stage_dir.exists(),
+        self.assertFalse(isolate.stage_root.exists(),
                          "the staging directory outlived close_isolate_box")
+        self.assertFalse(isolate.meta_dir.exists(),
+                         "the meta directory outlived close_isolate_box")
 
     def test_matrix_error_exits_2_so_it_is_not_read_as_a_hole(self):
         # `validating-solutions` tells the agent that exit 1 means holes or
@@ -1895,6 +1917,27 @@ class TestRunMatrixFixture(unittest.TestCase):
                                 str(self.testlib_dir)])
         self.assertEqual(code, 2)
 
+    def test_a_malformed_box_pool_env_exits_2_not_1(self):
+        # `box_pool.BoxPoolError` is a bare RuntimeError with no dependency
+        # on this module's error type, so it does not automatically become
+        # a MatrixError the way every other externally-authored failure in
+        # this file does (R1). Left unconverted it would escape main()'s
+        # `except MatrixError` entirely, crash with a traceback, and exit
+        # 1 — the exact code `validating-solutions` reads as "the matrix
+        # ran and found holes", reopening the crash-read-as-a-finding
+        # defect `main()`'s own docstring says it exists to prevent. This
+        # is the interface contract (`main()`'s exit code), so it is
+        # tested at `main()`, not at `run()` or `open_isolate_box()`
+        # directly — a MatrixError raised deep inside proves nothing about
+        # what actually reaches the caller.
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, {"RUN_MATRIX_BOX_POOL": "not-a-number"}):
+            with contextlib.redirect_stderr(captured):
+                code = run_matrix.main(["run_matrix.py", str(self.problem_dir),
+                                        str(self.testlib_dir)])
+        self.assertEqual(code, 2)
+        self.assertIn("RUN_MATRIX_BOX_POOL", captured.getvalue())
+
     def test_invocation_json_pins_the_testlib_revision(self):
         payload = run_matrix.run(self.problem_dir, self.testlib_dir)
         machine = payload["machine"]
@@ -1904,6 +1947,631 @@ class TestRunMatrixFixture(unittest.TestCase):
         # machine; it is a declaration and is now named as one.
         self.assertNotIn("cg", machine)
         self.assertTrue(machine["cg_requested"])
+
+
+class ParallelPassTest(PackageFixture):
+    def tearDown(self):
+        os.environ.pop("RUN_MATRIX_BOX_POOL", None)
+        super().tearDown()
+
+    def test_invocation_json_records_the_worker_count_and_bound(self):
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("workers", payload["machine"])
+        self.assertGreaterEqual(payload["machine"]["workers"], 1)
+        self.assertEqual(payload["machine"]["contention_bound"],
+                         matrix_core.CONTENTION_BOUND)
+
+    def test_every_result_declares_whether_it_was_retimed_serially(self):
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        for record in payload["results"]:
+            self.assertIn("retimed_serially", record)
+            self.assertIsInstance(record["retimed_serially"], bool)
+
+    def test_one_worker_produces_the_same_verdicts_as_many(self):
+        # The property that matters: parallelism must not change a verdict.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "1"
+        serial = run_matrix.run(self.problem_dir, self.testlib_dir)
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        parallel = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        def verdicts(payload):
+            return {(r["solution"], r["group"], r["test"]): r["verdict"]
+                    for r in payload["results"]}
+
+        self.assertEqual(verdicts(serial), verdicts(parallel))
+        self.assertEqual(serial["holes"], parallel["holes"])
+        self.assertEqual(serial["mismatches"], parallel["mismatches"])
+
+    def test_pass_one_is_never_run_concurrently(self):
+        # t_main defines TL. Running it under contention inflates TL and lets
+        # genuinely-TLE solutions through, which manufactures holes. Asserted
+        # behaviourally — by watching how many runs are actually in flight —
+        # rather than by scraping the source for "ThreadPoolExecutor", so a
+        # refactor that keeps the property passes and one that loses it fails.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        lock = threading.Lock()
+        state = {"live": 0, "peak_pass1": 0, "peak_pass2": 0}
+        limits_known = threading.Event()
+
+        def watched(*args, **kwargs):
+            with lock:
+                state["live"] += 1
+                key = "peak_pass2" if limits_known.is_set() else "peak_pass1"
+                state[key] = max(state[key], state["live"])
+            try:
+                return real_run_once(*args, **kwargs)
+            finally:
+                with lock:
+                    state["live"] -= 1
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            # Pass 1 ends exactly here: compute_limits is what consumes it.
+            result = real_compute(*args, **kwargs)
+            limits_known.set()
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", watched), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertEqual(state["peak_pass1"], 1,
+                         "pass 1 must measure the model solution alone")
+        self.assertGreater(state["peak_pass2"], 1,
+                           "pass 2 did not actually run in parallel")
+
+    def test_a_retimed_result_is_flagged_with_the_worker_count(self):
+        # The band is unreachable on the `mini` fixture — two trivial
+        # solutions, TL pinned to the 1000 ms floor, so nothing can land in
+        # (1000, 2000]. Rather than assert inside a loop that never runs
+        # (a test that asserts nothing), the near-TL measurement is
+        # fabricated by stubbing the runner.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+
+        def near_tl(*args, **kwargs):
+            r = real_run_once(*args, **kwargs)
+            if seen["pass2"]:
+                return dataclasses.replace(r, cpu_ms=1200)  # TL < 1200 <= 1.5*TL
+            return r
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", near_tl), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertTrue(any(r["retimed_serially"] for r in payload["results"]))
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(banded, "a near-TL measurement produced no flag")
+        self.assertTrue(any("worker" in f["assumed"] or "worker" in f["what"]
+                            for f in banded))
+
+    def test_a_wall_clock_kill_is_retimed_serially_but_a_cpu_kill_is_not(self):
+        # needs_serial_retime's short-circuit on `killed` is justified by
+        # CPU-time arithmetic (kill_ms/bound > tl_ms): it says nothing about
+        # wall time. A descheduled process accrues wall time without
+        # accruing CPU time, so a wall-clock kill under contention is not
+        # bounded by CONTENTION_BOUND at all. Left unhandled, a solution
+        # that genuinely finishes under TL could be wall-killed under
+        # contention, land on TL, match an `@expect TL` declaration, and
+        # silently mask a real hole. The fix: `_run_pass2` re-times a
+        # wall-clock kill unconditionally, while a CPU-time kill keeps
+        # `needs_serial_retime`'s existing (correct, never-ambiguous)
+        # short-circuit — that contrast is the point, and preserving it is
+        # what keeps the speedup, since ordinary CPU-time TLs are the bulk
+        # of the wall clock.
+        #
+        # Fabricated by stubbing the runner, the same way the near-TL test
+        # above does: the `mini` fixture's two trivial solutions never
+        # actually get killed by either clock, so both kill kinds are
+        # injected on each solution's first pass-2 call only — a later call
+        # for the same binary is the serial re-time itself and must see a
+        # real (non-killed) measurement, or `retimed_serially` could never
+        # be observed to make a difference to the recorded verdict.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+        fabricated_once = set()
+
+        def killed_after_pass1(isolate, binary, *rest, **kwargs):
+            r = real_run_once(isolate, binary, *rest, **kwargs)
+            if not seen["pass2"] or binary.stem in fabricated_once:
+                return r
+            fabricated_once.add(binary.stem)
+            if binary.stem == "sol-main":
+                # A wall-clock kill: cpu_ms stays low (the process was
+                # descheduled, not slow), only wall time blew past the
+                # ceiling.
+                return dataclasses.replace(
+                    r, killed=True, cpu_ms=50,
+                    message="Time limit exceeded (wall clock)")
+            # A CPU-time kill on the other solution: never ambiguous, must
+            # not be re-timed.
+            return dataclasses.replace(r, killed=True,
+                                       message="Time limit exceeded")
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", killed_after_pass1), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        by_solution = {r["solution"]: r for r in payload["results"]}
+        wall = by_solution["sol-main.cpp"]
+        cpu = by_solution["sol-wrong.cpp"]
+
+        self.assertTrue(wall["retimed_serially"],
+                        "a wall-clock kill under contention must be re-timed")
+        self.assertFalse(cpu["retimed_serially"],
+                         "a CPU-time kill is never ambiguous and must not "
+                         "be re-timed")
+        # The re-time used the real (fast, non-killed) measurement, so the
+        # wall-killed solution's TL is corrected — exactly the masked hole
+        # this fix closes. The CPU kill, never re-timed, stays TL.
+        self.assertFalse(wall["killed"])
+        self.assertEqual(cpu["verdict"], "TL")
+
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(
+            any("wall-clock" in f["what"] and "sol-main.cpp" in f["what"]
+                for f in banded),
+            "the wall-clock kill produced no flag naming it")
+
+    def test_a_matrix_error_in_one_worker_surfaces_from_run(self):
+        # A worker's MatrixError must propagate out of the pool, not be
+        # swallowed into a verdict. Forced directly, by stubbing `_run_once`
+        # to raise `MatrixError` after pass 1 has finished with it — this
+        # exercises the propagation path itself (pool.map -> run()) rather
+        # than any specific real-world trigger of a MatrixError inside
+        # `_run_once` (an unreadable staged output, a umask(077)'d solution,
+        # etc. are exercised by their own dedicated tests elsewhere in this
+        # file).
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        calls = []
+
+        def exploding(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 3:
+                raise run_matrix.MatrixError("synthetic worker failure")
+            return real_run_once(*args, **kwargs)
+
+        with mock.patch.object(run_matrix, "_run_once", exploding):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("synthetic worker failure", str(ctx.exception))
+
+
+class MinimalIsolateFixture(unittest.TestCase):
+    """Just enough to test box leasing directly: a scratch `self.tmp` and
+    the same hard-dependency skip guard `TestRunMatrixFixture` uses.
+
+    Deliberately does *not* copy the `mini` fixture or resolve the testlib
+    cache — `BoxLeasingTest`'s tests never touch a problem package.
+    Subclassing the full `TestRunMatrixFixture` for its ~50 unrelated
+    tests, just to get three new ones, doubled this file's runtime (289 ->
+    342 tests, ~108s longer) and doubled that again across the
+    two-concurrent-suites acceptance check, for no coverage this class
+    actually needs — a controller ruling on the Task 2 review. Tasks 3 and
+    5 should use this too rather than repeat the mistake.
+    """
+
+    def setUp(self):
+        if shutil.which("g++") is None:
+            raise _missing_dependency("g++ not found on PATH")
+        if shutil.which("isolate") is None:
+            raise _missing_dependency("isolate not found on PATH")
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="run_matrix_test_", dir=SCRATCH_ROOT))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class ReentrancyTest(MinimalIsolateFixture):
+    def setUp(self):
+        super().setUp()
+        os.chmod(self.tmp, 0o777)
+        self.stdin_path = self.tmp / "in.txt"
+        self.stdin_path.write_text("\n", encoding="utf-8")
+
+    def test_handle_exposes_roots_not_single_files(self):
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            self.assertTrue(isolate.meta_dir.is_dir())
+            self.assertTrue(isolate.stage_root.is_dir())
+            self.assertFalse(hasattr(isolate, "meta_path"))
+            self.assertFalse(hasattr(isolate, "stage_dir"))
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def test_meta_dir_is_never_inside_the_sandbox_writable_root(self):
+        # A solution that could write its own meta file could write its own
+        # verdict. This is the invariant that forbids the obvious tidy-up of
+        # putting the meta file next to the staged output.
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            self.assertNotIn(isolate.stage_root.resolve(),
+                             isolate.meta_dir.resolve().parents)
+            self.assertNotEqual(isolate.stage_root.resolve(),
+                                isolate.meta_dir.resolve())
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    # ------------------------------------------------------------------
+    # Argv-level capture, mirroring `TestRunMatrixFixture`'s identically
+    # named helpers (duplicated rather than inherited: `ReentrancyTest`
+    # deliberately does not subclass the heavy fixture — see the class
+    # docstring on `MinimalIsolateFixture`).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mounted_host_dirs(cmd) -> set[str]:
+        """The host paths in an isolate `--dir=<label>=<host>[:rw]` argv."""
+        found = set()
+        for arg in cmd:
+            if not isinstance(arg, str) or not arg.startswith("--dir="):
+                continue
+            host = arg.split("=", 2)[2]
+            found.add(host[:-3] if host.endswith(":rw") else host)
+        return found
+
+    def _isolate_run_argv(self, call):
+        """Run `call()` with `subprocess.run` spied on; return the `--run`
+        argv. `_run_once` shells out three times per call (`--init`,
+        `--run`, `--cleanup`); only the middle one carries the mounts."""
+        seen = []
+        real = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            seen.append(cmd)
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(run_matrix.subprocess, "run", spy):
+            call()
+        runs = [cmd for cmd in seen
+                if isinstance(cmd, list) and "--run" in cmd]
+        self.assertEqual(len(runs), 1,
+                         f"expected exactly one isolate --run, saw {seen!r}")
+        return runs[0]
+
+    def test_meta_file_is_never_mounted_into_the_sandbox(self):
+        # CRITICAL on review: `test_meta_dir_is_never_inside_the_sandbox_
+        # writable_root` above only compares *handle fields*
+        # (`isolate.meta_dir` vs `isolate.stage_root`), which is a weak
+        # proxy for the invariant `IsolateHandle`'s docstring actually
+        # claims — "never passed to --dir". A future tidy-up computing
+        # `meta_path = run_dir / "meta"` would leave both of that test's
+        # assertions green while putting the driver's only account of the
+        # run inside the solution's own `:rw` mount — the silent
+        # verdict-rewrite the docstring exists to forbid. This checks the
+        # fact that actually matters: the resolved `--meta=` argument
+        # isolate is invoked with never lies under any `--dir=` target in
+        # the same argv. (Demonstrated to actually catch that regression —
+        # and to show the handle-level test above does *not* — in the task
+        # report.)
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial3", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            argv = self._isolate_run_argv(
+                lambda: run_matrix._run_once(
+                    isolate, binary, self.stdin_path, self.tmp / "o3.out",
+                    cpu_limit_s=5.0, wall_limit_s=10.0,
+                    mem_limit_kb=256 * 1024))
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        meta_args = [a for a in argv
+                    if isinstance(a, str) and a.startswith("--meta=")]
+        self.assertEqual(len(meta_args), 1, argv)
+        meta_path = Path(meta_args[0].split("=", 1)[1]).resolve()
+        mounted = {Path(h).resolve() for h in self._mounted_host_dirs(argv)}
+        self.assertTrue(mounted, "no --dir= mounts found in argv, test is vacuous")
+        for host in mounted:
+            self.assertNotEqual(meta_path, host, (meta_path, host))
+            self.assertNotIn(host, meta_path.parents,
+                             f"{meta_path} is inside mounted directory {host}")
+
+    def test_concurrent_runs_report_their_own_times_not_each_others(self):
+        # The shared-meta defect in its purest form: a fast and a slow run at
+        # once. With one meta file the fast run could read the slow run's
+        # numbers, or vice versa.
+        import concurrent.futures
+        fast = _compile("int main(){ return 0; }\n",
+                        self.tmp / "fast", self.tmp)
+        # 3e9 iterations, not the 4e8 a slower reference machine might use:
+        # measured directly on this box (Intel Core Ultra 7 258V, `nproc`
+        # 8), 4e8 volatile increments finished in ~106ms at -O2 — under the
+        # 200ms threshold below by construction, not because of anything
+        # sandboxed. 3e9 measured at ~720ms, comfortably clear of it.
+        slow = _compile("int main(){ volatile long s=0;"
+                        " for(long i=0;i<3000000000L;i++) s+=i; return 0; }\n",
+                        self.tmp / "slow", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                f_fast = pool.submit(run_matrix._run_once, isolate, fast,
+                                     self.stdin_path, self.tmp / "fast.out",
+                                     cpu_limit_s=30.0, wall_limit_s=60.0,
+                                     mem_limit_kb=256 * 1024)
+                f_slow = pool.submit(run_matrix._run_once, isolate, slow,
+                                     self.stdin_path, self.tmp / "slow.out",
+                                     cpu_limit_s=30.0, wall_limit_s=60.0,
+                                     mem_limit_kb=256 * 1024)
+                r_fast, r_slow = f_fast.result(), f_slow.result()
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertLess(r_fast.cpu_ms, 200, r_fast)
+        self.assertGreater(r_slow.cpu_ms, 200, r_slow)
+
+    def test_concurrent_runs_do_not_read_each_others_output(self):
+        import concurrent.futures
+        a = _compile('#include <cstdio>\nint main(){ puts("AAA"); }\n',
+                     self.tmp / "aaa", self.tmp)
+        b = _compile('#include <cstdio>\nint main(){ puts("BBB"); }\n',
+                     self.tmp / "bbb", self.tmp)
+        out_a, out_b = self.tmp / "a.out", self.tmp / "b.out"
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                fs = [pool.submit(run_matrix._run_once, isolate, binary,
+                                  self.stdin_path, dest, cpu_limit_s=30.0,
+                                  wall_limit_s=60.0, mem_limit_kb=256 * 1024)
+                      for binary, dest in ((a, out_a), (b, out_b))]
+                [f.result() for f in fs]
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        self.assertEqual(out_a.read_text().strip(), "AAA")
+        self.assertEqual(out_b.read_text().strip(), "BBB")
+
+    def test_two_concurrent_run_once_calls_never_share_a_box(self):
+        # The end-to-end Cause-A regression test: run the same binary from two
+        # threads and assert both produced a real verdict. Before the lease
+        # pool this raced on box ids and one side raised MatrixError.
+        import concurrent.futures
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                futures = [pool.submit(run_matrix._run_once, isolate, binary,
+                                       stdin_path, self.tmp / f"out{i}",
+                                       cpu_limit_s=5.0, wall_limit_s=10.0,
+                                       mem_limit_kb=256 * 1024)
+                           for i in range(2)]
+                results = [f.result() for f in futures]
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        for r in results:
+            self.assertFalse(r.crashed, r)
+            self.assertFalse(r.killed, r)
+
+    def test_run_directory_is_removed_after_a_successful_run(self):
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            run_matrix._run_once(isolate, binary, self.stdin_path,
+                                 self.tmp / "o.out", cpu_limit_s=5.0,
+                                 wall_limit_s=10.0, mem_limit_kb=256 * 1024)
+            self.assertEqual(list(isolate.stage_root.iterdir()), [])
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def test_meta_file_is_removed_after_a_successful_run(self):
+        # Minor #3 on review: the `meta_path.unlink` in `_run_once`'s
+        # `finally` had no coverage of its own — undetected, meta files
+        # would accumulate under `meta_dir` across every run of a matrix
+        # (1792 runs on a full package is the review's own reference
+        # figure), silent because nothing reads `meta_dir` back except this
+        # one unlink.
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial2", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            run_matrix._run_once(isolate, binary, self.stdin_path,
+                                 self.tmp / "o2.out", cpu_limit_s=5.0,
+                                 wall_limit_s=10.0, mem_limit_kb=256 * 1024)
+            self.assertEqual(list(isolate.meta_dir.iterdir()), [])
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+    def test_a_solutions_stray_file_cannot_reach_the_next_run(self):
+        # The Task 6 dogfood defect: a solution writing an unexpected
+        # filename used to leave it behind, owned by that box's subuid, and
+        # the next run got EACCES and was reported RE. A fresh directory per
+        # run makes that unreachable rather than merely cleaned up.
+        litterer = _compile('#include <cstdio>\n'
+                            'int main(){ FILE*f=fopen("stray.txt","w");'
+                            ' fputs("x",f); fclose(f); return 0; }\n',
+                            self.tmp / "litterer", self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            first = run_matrix._run_once(
+                isolate, litterer, self.stdin_path, self.tmp / "1.out",
+                cpu_limit_s=5.0, wall_limit_s=10.0, mem_limit_kb=256 * 1024,
+                io_input="t.inp", io_output="t.out")
+            second = run_matrix._run_once(
+                isolate, litterer, self.stdin_path, self.tmp / "2.out",
+                cpu_limit_s=5.0, wall_limit_s=10.0, mem_limit_kb=256 * 1024,
+                io_input="t.inp", io_output="t.out")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        # Both runs wrote the wrong filename, so both must report the same
+        # thing. Before per-run directories the first was NO_OUTPUT and the
+        # second RE, because the leftover file was owned by a subuid the
+        # second box could not write through.
+        self.assertTrue(first.no_output, first)
+        self.assertTrue(second.no_output, second)
+        self.assertFalse(second.crashed, second)
+
+    def test_an_unremovable_run_directory_warns_and_keeps_the_verdict(self):
+        # `_remove_run_dir`'s error branch, exercised end to end: a solution
+        # leaves an unremovable (0700, foreign-owned) subdirectory behind.
+        # Human ruling on review, reversing this task's original design: the
+        # identical fact — a foreign-owned subdirectory this uid cannot
+        # remove — is only a one-line stderr warning when `close_isolate_box`
+        # meets it at teardown, so `_run_once`'s own `finally` meeting the
+        # *same* fact minutes earlier must not abort the whole matrix over
+        # it. `validating-solutions` runs hostile code on purpose;
+        # `mkdir("d", 0700)` is an expected input class from that, not an
+        # infrastructure fault, and this run's own `RunResult` is not in
+        # doubt — its meta file was private, already read and parsed, and
+        # its output already copied back before the `finally` ever runs.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
+            'int main(){ umask(0); if (mkdir("d", 0700) != 0) return 6;\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
+            self.tmp / "dirlitter", self.tmp)
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        # Bound before the `try` so the `finally` below can never hit
+        # `UnboundLocalError` if something fails before either is assigned
+        # (e.g. the survivor-count assertion) — an `UnboundLocalError` there
+        # isn't an `OSError`, so `contextlib.suppress(OSError)` wouldn't
+        # catch it, and `close_isolate_box` would never run: for this
+        # fixture `stage_root` lives under `self.tmp`'s *parent* (see
+        # `_stage_base`), outside what `tearDown`'s `rmtree(self.tmp)`
+        # sweeps, so a failing run of this test would leak the very kind of
+        # undeletable litter this test exists to exercise.
+        run_dir = litter = None
+        try:
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                result = run_matrix._run_once(
+                    isolate, binary, self.stdin_path, self.tmp / "c1.produced",
+                    cpu_limit_s=5.0, wall_limit_s=10.0, mem_limit_kb=256 * 1024,
+                    io_input="t.inp", io_output="t.out")
+
+            # The verdict is not swallowed by the cleanup failure — this is
+            # the property the human ruling exists to protect.
+            self.assertFalse(result.no_output, result)
+            self.assertFalse(result.crashed, result)
+
+            # The run's own directory survives the failed removal (rmtree
+            # aborts partway rather than silently discarding the litter) —
+            # find it so the test can clean it up without leaving anything
+            # behind for the reviewer to explain, and so the warning's path
+            # claim below can be checked against a real path.
+            survivors = list(isolate.stage_root.iterdir())
+            self.assertEqual(len(survivors), 1,
+                             f"expected exactly one surviving run_dir, "
+                             f"got {survivors}")
+            run_dir = survivors[0]
+            litter = run_dir / "d"
+            self.assertTrue(litter.is_dir(), f"{litter} was not created")
+
+            # Minor #2 on review: the deleted `_clear_stage_dir`-era test
+            # asserted the message names the offending path, so the
+            # "remove it as root" instruction stays actionable; that
+            # property moves to the warning text here.
+            warning = captured.getvalue()
+            self.assertIn("WARNING", warning)
+            self.assertIn(str(run_dir), warning,
+                          "the warning does not name the leftover directory")
+            self.assertIn(str(binary), warning,
+                          "the warning does not name the binary responsible")
+            self.assertIn(str(self.stdin_path), warning,
+                          "the warning does not name the test that produced it")
+            self.assertIn("root", warning.lower(),
+                          "the warning drops the 'remove it as root' instruction")
+        finally:
+            # Removable despite not being ours to read: rmdir only needs
+            # write+execute on the *parent*, which we own, and the target
+            # must be empty — both true here.
+            if litter is not None:
+                with contextlib.suppress(OSError):
+                    litter.rmdir()
+            if run_dir is not None:
+                with contextlib.suppress(OSError):
+                    run_dir.rmdir()
+            run_matrix.close_isolate_box(isolate)
+
+    def test_a_removable_foreign_subdirectory_does_not_block_cleanup(self):
+        # The non-error branch of `_remove_run_dir`: a subdirectory owned by
+        # the sandboxed subuid but left world-writable (0777) is not the
+        # undeletable case above, and must not be treated as one.
+        binary = _compile(
+            "#include <sys/types.h>\n#include <sys/stat.h>\n#include <cstdio>\n"
+            'int main(){ umask(0); if (mkdir("e", 0777) != 0) return 6;\n'
+            '  FILE *f = fopen("t.out", "w"); if (!f) return 5;\n'
+            '  fprintf(f, "ok\\n"); fclose(f); return 0; }\n',
+            self.tmp / "dirmaker2", self.tmp)
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            result = run_matrix._run_once(isolate, binary, self.stdin_path,
+                                          self.tmp / "e1.produced",
+                                          cpu_limit_s=5.0, wall_limit_s=10.0,
+                                          mem_limit_kb=256 * 1024,
+                                          io_input="t.inp", io_output="t.out")
+            self.assertFalse(result.no_output, result)
+            self.assertEqual(list(isolate.stage_root.iterdir()), [],
+                             "a removable foreign subdirectory left the run "
+                             "directory behind")
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+
+class BoxLeasingTest(MinimalIsolateFixture):
+    def test_isolate_handle_has_no_pid_derived_counter(self):
+        # The pid-derived counter is the Cause-A defect itself. Its absence
+        # is the invariant, so it is asserted rather than assumed.
+        self.assertFalse(hasattr(run_matrix, "_select_box_id"))
+        self.assertNotIn("box_id_counter",
+                         run_matrix.IsolateHandle.__dataclass_fields__)
+
+    def test_init_box_names_the_collision_instead_of_the_install(self):
+        # isolate answers "This box is currently in use by another process"
+        # (rc=2) when the id is live. The old message blamed cgroup
+        # delegation, subuid ranges and isolate-cg-keeper — a confident wrong
+        # diagnosis that has already cost three agents an afternoon.
+        fake = self._fake_isolate(
+            rc=2, message="This box is currently in use by another process")
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix._init_box(fake, 7)
+        message = str(ctx.exception)
+        self.assertIn("in use", message)
+        self.assertIn("box 7", message)
+        self.assertNotIn("subuid", message)
+        self.assertNotIn("cg-keeper", message)
+
+    def test_init_box_still_names_the_install_for_a_real_config_failure(self):
+        fake = self._fake_isolate(rc=1, message="Cannot initialize control group")
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix._init_box(fake, 7)
+        self.assertIn("subuid", str(ctx.exception))
+
+    def _fake_isolate(self, *, rc: int, message: str) -> str:
+        script = self.tmp / f"fake_isolate_{rc}_{abs(hash(message)) % 9999}"
+        script.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit {rc}\n",
+                          encoding="utf-8")
+        script.chmod(0o755)
+        return str(script)
 
 
 class TestStageBase(unittest.TestCase):

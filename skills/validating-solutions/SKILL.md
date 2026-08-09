@@ -301,6 +301,41 @@ checks each result, and writes `invocation.json`. `main`'s own pass-2 run
 appears in `results` alongside the rest, which is how you see its own `OK`
 recorded rather than only inferred.
 
+The matrix runs several sandboxes at once (half this machine's CPUs by
+default; `RUN_MATRIX_BOX_POOL=N` to change it, `RUN_MATRIX_BOX_POOL=1` for a
+fully quiesced run *provided this is the only `run_matrix` invocation on the
+machine* — a sibling invocation at a higher pool size will still sweep the
+other lease ids while yours holds the one it was given, so `POOL=1` only
+quiesces the machine when nothing else is drawing from the same pool — do
+not raise it past the machine's core count, since
+nothing bounds wall-time inflation the way `CONTENTION_BOUND` bounds CPU
+time, so oversubscription is where wall-clock kills start showing up).
+Running it in parallel with
+another package's matrix is safe — box ids are leased through a per-user,
+cross-process pool. Pass 1, the timing pass `TL`/`kill` are derived from,
+always runs serially regardless of the pool size.
+
+Timing stays trustworthy because contention can only make a run look
+*slower*, never faster. A result measured close enough to TL that
+contention could have decided it is re-timed serially, with every worker
+*this invocation* spawned sitting idle, and marked `"retimed_serially": true`
+in `invocation.json`; `machine.workers` and `machine.contention_bound` record
+how many sandboxes were live and what inflation factor the driver treated as
+ambiguous. That idle guarantee only covers this process's own thread pool —
+the box-id lease is shared across every `run_matrix` invocation this user has
+running, so a sibling invocation can still be holding boxes and driving CPU
+contention while this process re-times. A run whose re-time is genuinely
+authoritative — measured with the machine actually quiet, not just this
+invocation's own workers — needs this to be the *only* `run_matrix`
+invocation running on the machine. Whenever more than one
+sandbox is live, a wall-clock kill is re-timed this way too, even when it
+lands well outside the ambiguity band, because a descheduled process racks
+up wall time without racking up CPU time — the one-sided argument only
+covers CPU time. A CPU-time kill is not re-timed; it already means the
+solution is genuinely too slow. (At `RUN_MATRIX_BOX_POOL=1` nothing is
+re-timed and `retimed_serially` is always `false` — there is no contention
+to correct for.)
+
 **This skill never re-implements timing** — no shell `time`, no wall-clock
 stopwatch in a bash loop, no second opinion on what counts as too slow. The
 tool owns the clock; reading its output is this skill's whole job.
