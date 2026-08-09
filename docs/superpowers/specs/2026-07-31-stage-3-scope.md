@@ -113,10 +113,11 @@ wired to the phases that actually follow (samples → statement → the
 
 - **`running-contests` is an orphan** — no skill references it, not even
   `solving-problems`. Pre-existing, unexamined. Decide: wire it or retire it.
-- **The test suite is not parallel-safe with itself.** `run_matrix` derives
-  isolate box ids from `pid`; a concurrent run collides. Fails loudly, cannot
-  produce a wrong verdict, but has cost three agents a false diagnosis.
-  Documented in the README; a real fix is a box-id allocation strategy.
+- ~~**The test suite is not parallel-safe with itself.**~~ **Resolved**
+  2026-08-09 by `docs/superpowers/plans/2026-08-09-parallel-invocation-matrix.md`:
+  box ids are leased from a per-user, cross-process `flock` pool instead of
+  derived from `pid`, `_run_once` owns its meta file and staging directory, and pass 2 runs
+  on the lease pool.
 - **`review_checks.run()` triggers `scan()` three times**, each spawning one
   `git log` per solution — 24 subprocesses per audit on `flight`. Cosmetic
   until a package has 100 solutions.

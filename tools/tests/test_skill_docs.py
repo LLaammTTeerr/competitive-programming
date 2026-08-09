@@ -469,5 +469,24 @@ class TestWritingStatementsRoutingTable(unittest.TestCase):
                     f"fix the disagreement, do not relax this test.")
 
 
+class TestParallelSafetyDocs(unittest.TestCase):
+    """`run_matrix` stopped deriving box ids from `pid` (Tasks 1-5): it now
+    leases them from a per-user pool and runs pass 2 concurrently. The old
+    "run it alone" warning trained readers to serialise work that no longer
+    needs it, and a stale safety warning is worse than none — these guard
+    against it creeping back in.
+    """
+
+    def test_readme_no_longer_claims_the_tools_are_serial_only(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("not parallel-safe", readme)
+        self.assertIn("RUN_MATRIX_BOX_POOL", readme)
+
+    def test_validating_solutions_documents_the_worker_knob(self):
+        skill = skill_text("validating-solutions")
+        self.assertIn("RUN_MATRIX_BOX_POOL", skill)
+        self.assertIn("retimed_serially", skill)
+
+
 if __name__ == "__main__":
     unittest.main()

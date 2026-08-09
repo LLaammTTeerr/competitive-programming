@@ -301,6 +301,26 @@ checks each result, and writes `invocation.json`. `main`'s own pass-2 run
 appears in `results` alongside the rest, which is how you see its own `OK`
 recorded rather than only inferred.
 
+The matrix runs several sandboxes at once (half this machine's CPUs by
+default; `RUN_MATRIX_BOX_POOL=N` to change it, `RUN_MATRIX_BOX_POOL=1` for a
+fully quiesced run — do not raise it past the machine's core count, since
+that is what makes wall-clock kills reachable). Running it in parallel with
+another package's matrix is safe — box ids are leased through a per-user,
+cross-process pool. Pass 1, the timing pass `TL`/`kill` are derived from,
+always runs serially regardless of the pool size.
+
+Timing stays trustworthy because contention can only make a run look
+*slower*, never faster. A result measured close enough to TL that
+contention could have decided it is re-timed serially, with every other
+sandbox idle, and marked `"retimed_serially": true` in `invocation.json`; `machine.workers`
+and `machine.contention_bound` record how many sandboxes were live and what
+inflation factor the driver treated as ambiguous. A
+wall-clock kill is always re-timed this way too, even when it lands well
+outside the ambiguity band, because a descheduled process racks up wall
+time without racking up CPU time — the one-sided argument only covers CPU
+time. A CPU-time kill is not re-timed; it already means the solution is
+genuinely too slow.
+
 **This skill never re-implements timing** — no shell `time`, no wall-clock
 stopwatch in a bash loop, no second opinion on what counts as too slow. The
 tool owns the clock; reading its output is this skill's whole job.
