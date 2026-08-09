@@ -653,8 +653,12 @@ class TestRunMatrixFixture(unittest.TestCase):
         # every id this invocation actually leased so all of them are
         # checked, not just the first — and, unlike snapshotting the whole
         # of `/var/local/lib/isolate/`, does not misreport a leak when a
-        # concurrently running second copy of this suite is legitimately
-        # using other, non-colliding box ids at the same time.
+        # concurrently running second copy of this suite is using the same
+        # small pool of ids (`pool_size()` is 4 here, so "other" ids are
+        # not guaranteed): each `(box_id, exists)` is recorded while this
+        # invocation still holds that id's flock, so no sibling can have
+        # taken it yet at the moment of observation. See
+        # `_track_leased_box_ids`'s own docstring for the full reasoning.
         with _track_leased_box_ids() as leased:
             run_matrix.run(self.problem_dir, self.testlib_dir)
         self._assert_boxes_gone(leased)
