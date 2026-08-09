@@ -1560,6 +1560,14 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
             needs_serial_retime(r.cpu_ms, r.killed, limits) or wall_killed)
         if retimed:
             first_run_ms = r.cpu_ms
+            # For a CPU-time kill the number that explains it is `cpu_ms`
+            # (captured above as `first_run_ms`); for a wall-clock kill the
+            # number that explains it is the *wall* reading, which
+            # `first_run_ms` never carries. Captured here, before
+            # `_time_median` reassigns `r` below, so the wall-kill flag can
+            # embed its original reading the same way the near-TL flag
+            # below embeds `first_run_ms`.
+            first_wall_ms = r.wall_ms
             r = _time_median(isolate, binaries[name], test, out,
                              cpu_limit_s, wall_limit_s, mem_limit_kb, runs,
                              io_input=problem.input, io_output=problem.output)
@@ -1568,13 +1576,13 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
                     problem_dir, phase="validate-solutions", severity="low",
                     kind="timing-band",
                     what=f"{name} on {group}/{test.stem} was killed by "
-                         f"isolate's wall-clock ceiling with {workers} "
-                         "sandboxes running — a wall-clock kill is not "
-                         "bounded by the contention model (CONTENTION_BOUND "
-                         "covers CPU-time inflation only; a descheduled "
-                         "process accrues wall time without accruing CPU "
-                         "time), so it cannot be trusted as a genuine TL "
-                         "under contention",
+                         f"isolate's wall-clock ceiling at {first_wall_ms} ms "
+                         f"wall time with {workers} sandboxes running — a "
+                         "wall-clock kill is not bounded by the contention "
+                         "model (CONTENTION_BOUND covers CPU-time inflation "
+                         "only; a descheduled process accrues wall time "
+                         "without accruing CPU time), so it cannot be "
+                         "trusted as a genuine TL under contention",
                     assumed=f"re-timed {runs}x serially with every one of "
                             f"this process's own workers idle (a sibling "
                             f"run_matrix invocation could still have been "

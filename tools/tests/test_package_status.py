@@ -1,9 +1,9 @@
 import contextlib
-import json, shutil, tempfile, unittest
+import json, os, shutil, tempfile, unittest
 from io import StringIO
 from pathlib import Path
 
-from tools.package_status import PHASE_ORDER, main, next_phase, status
+from tools.package_status import PHASE_ORDER, _matrix, main, next_phase, status
 
 # Anchored to this file, not to the process's working directory: the suite is
 # documented to run from the repository root, but a fixture path that only
@@ -189,6 +189,80 @@ class TestStatus(unittest.TestCase):
         phases = self.phases()
         self.assertFalse(phases["problem_json"].done)
         self.assertIn("checker.name", phases["problem_json"].detail)
+
+
+class MatrixFreshnessTest(unittest.TestCase):
+    """`invocation.json` is evidence about a package state. When the package
+    has moved on, the evidence does not become wrong — it becomes about
+    something else, and the gate must not accept it.
+
+    This is not only a crash concern. `run_matrix` writes the artifact at
+    the very end of a successful run, so a crash leaves an older one in
+    place; but a *clean* run followed by editing a solution leaves exactly
+    the same stale-green state, and that is the commoner case.
+    """
+
+    def _package(self, *, holes=(), mismatches=()):
+        d = Path(tempfile.mkdtemp()) / "p"
+        shutil.copytree(FIXTURE, d,
+                        ignore=shutil.ignore_patterns(
+                            ".build", "invocation.json", "solutions.json",
+                            "flags.json", "*.a"))
+        (d / "invocation.json").write_text(
+            json.dumps({"schema": 1, "holes": list(holes),
+                        "mismatches": list(mismatches)}),
+            encoding="utf-8")
+        return d
+
+    def test_a_fresh_clean_matrix_passes(self):
+        d = self._package()
+        self.assertTrue(_matrix(d).done)
+
+    def test_an_invocation_older_than_a_solution_is_stale(self):
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        os.utime(d / "solutions" / "sol-main.cpp", (later, later))
+        phase = _matrix(d)
+        self.assertFalse(phase.done)
+        self.assertIn("stale", phase.detail.lower())
+
+    def test_an_invocation_older_than_a_test_is_stale(self):
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        test_file = next((d / "tests").rglob("*.in"))
+        os.utime(test_file, (later, later))
+        self.assertFalse(_matrix(d).done)
+
+    def test_an_invocation_older_than_problem_json_is_stale(self):
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        os.utime(d / "problem.json", (later, later))
+        self.assertFalse(_matrix(d).done)
+
+    def test_staleness_is_reported_before_holes(self):
+        # A stale artifact reporting zero holes must not read as "clean".
+        # Order matters: the detail a reader sees has to name the reason
+        # they cannot trust the number, not the number.
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        os.utime(d / "problem.json", (later, later))
+        self.assertIn("stale", _matrix(d).detail.lower())
+
+    def test_a_stale_artifact_with_holes_still_fails(self):
+        d = self._package(holes=[{"solution": "x", "group": "g1",
+                                  "expected": "WA", "actual": "OK"}])
+        later = (d / "invocation.json").stat().st_mtime + 10
+        os.utime(d / "problem.json", (later, later))
+        self.assertFalse(_matrix(d).done)
+
+    def test_an_equal_mtime_is_not_stale(self):
+        # Boundary: a file written in the same second as the artifact is
+        # not evidence of a later edit. Strictly-newer is the test, or a
+        # fast clean run flags itself stale.
+        d = self._package()
+        stamp = (d / "invocation.json").stat().st_mtime
+        os.utime(d / "problem.json", (stamp, stamp))
+        self.assertTrue(_matrix(d).done)
 
 
 class TestMain(unittest.TestCase):

@@ -1,5 +1,6 @@
 import errno
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -237,3 +238,58 @@ class BoxPoolTest(unittest.TestCase):
         with self.assertRaises(box_pool.BoxPoolError) as ctx:
             box_pool.lock_dir()
         self.assertIn("cannot create the box-lease directory", str(ctx.exception))
+
+    def test_lock_dir_creates_a_fresh_directory_mode_0700(self):
+        # mode=0o700 is safe under any umask (umask only strips bits, and
+        # 0700 has none to strip) -- but only for the directory *this call*
+        # creates. A path that already existed before we got here is left
+        # untouched by the mkdir call, which is exactly why the ownership
+        # check below has to exist too.
+        target = self.tmp / "fresh-boxes"
+        self._set("RUN_MATRIX_BOX_LOCK_DIR", str(target))
+        result = box_pool.lock_dir()
+        self.assertEqual(result, target)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+
+    def test_lock_dir_raises_when_the_directory_is_owned_by_another_uid(self):
+        # `exist_ok=True` on the mkdir means a directory squatted by
+        # another user before our first `mkdir` would otherwise be reused
+        # silently. Driven by monkeypatching `os.lstat` to report a foreign
+        # uid for exactly this path, real `lstat` results for every other
+        # path -- the standing verification rule requires the raise
+        # actually fire, not merely exist in the source.
+        target = self.tmp / "foreign-boxes"
+        target.mkdir(mode=0o700)
+        self._set("RUN_MATRIX_BOX_LOCK_DIR", str(target))
+        real_lstat = os.lstat
+        foreign_uid = os.getuid() + 1
+
+        class _ForeignStat:
+            def __init__(self, real):
+                self.st_mode = real.st_mode
+                self.st_uid = foreign_uid
+
+        def fake_lstat(path, *args, **kwargs):
+            if Path(path) == target:
+                return _ForeignStat(real_lstat(path, *args, **kwargs))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch("tools.box_pool.os.lstat", side_effect=fake_lstat):
+            with self.assertRaises(box_pool.BoxPoolError) as ctx:
+                box_pool.lock_dir()
+        self.assertIn("not a directory owned by this user", str(ctx.exception))
+        self.assertIn(str(foreign_uid), str(ctx.exception))
+
+    def test_lock_dir_raises_when_the_path_is_a_symlink(self):
+        # `lstat`, not `stat`: a symlink to a directory we own must still
+        # be refused, because what it points at is exactly the part an
+        # attacker planting the symlink controls, and it can change after
+        # this check runs.
+        real_dir = self.tmp / "real-boxes"
+        real_dir.mkdir(mode=0o700)
+        link = self.tmp / "linked-boxes"
+        link.symlink_to(real_dir)
+        self._set("RUN_MATRIX_BOX_LOCK_DIR", str(link))
+        with self.assertRaises(box_pool.BoxPoolError) as ctx:
+            box_pool.lock_dir()
+        self.assertIn("not a directory owned by this user", str(ctx.exception))

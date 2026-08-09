@@ -2138,6 +2138,52 @@ class ParallelPassTest(PackageFixture):
                 for f in banded),
             "the wall-clock kill produced no flag naming it")
 
+    def test_the_wall_kill_flag_records_the_original_wall_reading(self):
+        # `first_run_ms` (the CPU-time reading) was already recorded before
+        # this fix. But for a *wall-clock* kill, `cpu_ms` does not explain
+        # the kill -- the process was descheduled, not slow -- so the
+        # number a reader of flags.json actually needs is the original
+        # *wall* reading, and nothing carried it. Same stub harness as the
+        # wall-vs-CPU-kill test above, narrowed to just the wall-kill case,
+        # with a distinctive fabricated `wall_ms` so this assertion can
+        # only pass if that specific original reading survived into the
+        # flag's `what` text (not just the re-timed one, which is a
+        # different, real measurement of the same run).
+        FABRICATED_WALL_MS = 918273
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+        fabricated_once = set()
+
+        def killed_after_pass1(isolate, binary, *rest, **kwargs):
+            r = real_run_once(isolate, binary, *rest, **kwargs)
+            if not seen["pass2"] or binary.stem in fabricated_once:
+                return r
+            fabricated_once.add(binary.stem)
+            if binary.stem == "sol-main":
+                return dataclasses.replace(
+                    r, killed=True, cpu_ms=50, wall_ms=FABRICATED_WALL_MS,
+                    message="Time limit exceeded (wall clock)")
+            return r
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", killed_after_pass1), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(
+            any(str(FABRICATED_WALL_MS) in f["what"] for f in banded),
+            "the wall-kill flag does not record the original wall reading")
+
     def test_a_matrix_error_in_one_worker_surfaces_from_run(self):
         # A worker's MatrixError must propagate out of the pool, not be
         # swallowed into a verdict. Forced directly, by stubbing `_run_once`
@@ -2715,6 +2761,26 @@ class ExitCodeContractTest(PackageFixture):
         # also self-updates if someone later imports `drift_check` (or
         # anything else) into `run_matrix` — exactly the case this test
         # exists to catch.
+        #
+        # Known limits of this approach, not fixed here (a review confirmed
+        # each in principle and confirmed none is live today — an AST sweep
+        # would close all three, but that is a rewrite this task's ruling
+        # was not to make):
+        #   1. A module imported *lazily inside a function* never appears
+        #      in `vars(run_matrix)` — only module-level imports are
+        #      one-hop-reachable this way. `run_matrix` currently has zero
+        #      local imports of `tools` modules.
+        #   2. A type reachable only *transitively* — imported by a module
+        #      that `run_matrix` imports, but not itself re-exported into
+        #      `run_matrix`'s own namespace — is missed, since this only
+        #      walks one hop from `run_matrix`. Reproduced directly: a
+        #      type whose `__module__` sits outside the one-hop module set
+        #      built here comes back absent from `uncovered` regardless of
+        #      whether `main()` could actually reach it.
+        #   3. An exception class *defined inside a function body* never
+        #      appears in its module's `vars()` at all — `vars(m)` only
+        #      sees module-level names. `run_matrix` currently defines zero
+        #      exception classes inside a function.
         mods = {run_matrix}
         for obj in vars(run_matrix).values():
             if isinstance(obj, types.ModuleType):

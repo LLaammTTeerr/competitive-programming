@@ -59,6 +59,45 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
     return Phase("tests", True, f"{len(problem.subtasks)} group(s) populated")
 
 
+# What `invocation.json` is evidence *about*. A matrix result describes a
+# specific package state; when any of these is newer than the artifact, the
+# artifact has not become wrong, it has become a statement about something
+# else — and the gate must not accept it as current.
+#
+# mtime is the signal, and its weakness is known and deliberate: a
+# `git checkout` rewrites mtimes without changing content, so this can
+# report stale when nothing meaningful moved. That direction is the safe
+# one — a false "stale" costs a re-run, a false "fresh" greens a package on
+# evidence describing a different tree. `generated_at` inside the payload
+# was considered and rejected as the source of truth: it records when the
+# matrix ran, not what it ran against, so it cannot detect an edit made
+# afterwards.
+#
+# Checked against `run_matrix.run()` and confirmed not self-defeating:
+# `run()` does write into `tests/` (pass 1 regenerates each `.a` answer
+# file from the model solution), but that write happens early, and
+# `invocation.json` itself is written exactly once, as the very last
+# statement in `run()`. So immediately after any run — clean or not — every
+# file this check walks is already on disk with an equal-or-older mtime
+# than the artifact; a same-second write compares equal, not stale (see
+# the strict `>` below), and nothing this module writes can trigger its
+# own staleness check.
+_MATRIX_SOURCES = ("problem.json", "solutions", "tests")
+
+
+def _newest_source_mtime(problem_dir: Path) -> float:
+    newest = 0.0
+    for name in _MATRIX_SOURCES:
+        path = problem_dir / name
+        if path.is_file():
+            newest = max(newest, path.stat().st_mtime)
+        elif path.is_dir():
+            for child in path.rglob("*"):
+                if child.is_file():
+                    newest = max(newest, child.stat().st_mtime)
+    return newest
+
+
 def _matrix(problem_dir: Path) -> Phase:
     path = problem_dir / "invocation.json"
     if not path.exists():
@@ -69,6 +108,19 @@ def _matrix(problem_dir: Path) -> Phase:
         return Phase("matrix", False, f"invocation.json unreadable: {exc}")
     if not isinstance(data, dict):
         return Phase("matrix", False, "invocation.json top level is not an object")
+    try:
+        artifact_mtime = path.stat().st_mtime
+    except OSError as exc:
+        return Phase("matrix", False, f"invocation.json unreadable: {exc}")
+    # Before the holes/mismatches verdict, deliberately: a stale artifact
+    # reporting zero holes must not read as "clean" — the detail a reader
+    # sees has to name the reason they cannot trust the number, not the
+    # number itself.
+    if _newest_source_mtime(problem_dir) > artifact_mtime:
+        return Phase("matrix", False,
+                     "invocation.json is stale: a solution, test or "
+                     "problem.json changed after it was written — re-run "
+                     "the matrix")
     try:
         holes = data.get("holes", [])
         mismatches = data.get("mismatches", [])
