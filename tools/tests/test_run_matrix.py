@@ -38,6 +38,7 @@ a message about staging rather than about the thing under test.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -46,6 +47,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1930,6 +1932,135 @@ class TestRunMatrixFixture(unittest.TestCase):
         # machine; it is a declaration and is now named as one.
         self.assertNotIn("cg", machine)
         self.assertTrue(machine["cg_requested"])
+
+
+class ParallelPassTest(TestRunMatrixFixture):
+    def tearDown(self):
+        os.environ.pop("RUN_MATRIX_BOX_POOL", None)
+        super().tearDown()
+
+    def test_invocation_json_records_the_worker_count_and_bound(self):
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("workers", payload["machine"])
+        self.assertGreaterEqual(payload["machine"]["workers"], 1)
+        self.assertEqual(payload["machine"]["contention_bound"],
+                         matrix_core.CONTENTION_BOUND)
+
+    def test_every_result_declares_whether_it_was_retimed_serially(self):
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        for record in payload["results"]:
+            self.assertIn("retimed_serially", record)
+            self.assertIsInstance(record["retimed_serially"], bool)
+
+    def test_one_worker_produces_the_same_verdicts_as_many(self):
+        # The property that matters: parallelism must not change a verdict.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "1"
+        serial = run_matrix.run(self.problem_dir, self.testlib_dir)
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        parallel = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        def verdicts(payload):
+            return {(r["solution"], r["group"], r["test"]): r["verdict"]
+                    for r in payload["results"]}
+
+        self.assertEqual(verdicts(serial), verdicts(parallel))
+        self.assertEqual(serial["holes"], parallel["holes"])
+        self.assertEqual(serial["mismatches"], parallel["mismatches"])
+
+    def test_pass_one_is_never_run_concurrently(self):
+        # t_main defines TL. Running it under contention inflates TL and lets
+        # genuinely-TLE solutions through, which manufactures holes. Asserted
+        # behaviourally — by watching how many runs are actually in flight —
+        # rather than by scraping the source for "ThreadPoolExecutor", so a
+        # refactor that keeps the property passes and one that loses it fails.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        lock = threading.Lock()
+        state = {"live": 0, "peak_pass1": 0, "peak_pass2": 0}
+        limits_known = threading.Event()
+
+        def watched(*args, **kwargs):
+            with lock:
+                state["live"] += 1
+                key = "peak_pass2" if limits_known.is_set() else "peak_pass1"
+                state[key] = max(state[key], state["live"])
+            try:
+                return real_run_once(*args, **kwargs)
+            finally:
+                with lock:
+                    state["live"] -= 1
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            # Pass 1 ends exactly here: compute_limits is what consumes it.
+            result = real_compute(*args, **kwargs)
+            limits_known.set()
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", watched), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertEqual(state["peak_pass1"], 1,
+                         "pass 1 must measure the model solution alone")
+        self.assertGreater(state["peak_pass2"], 1,
+                           "pass 2 did not actually run in parallel")
+
+    def test_a_retimed_result_is_flagged_with_the_worker_count(self):
+        # The band is unreachable on the `mini` fixture — two trivial
+        # solutions, TL pinned to the 1000 ms floor, so nothing can land in
+        # (1000, 2000]. Rather than assert inside a loop that never runs
+        # (a test that asserts nothing), the near-TL measurement is
+        # fabricated by stubbing the runner.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+
+        def near_tl(*args, **kwargs):
+            r = real_run_once(*args, **kwargs)
+            if seen["pass2"]:
+                return dataclasses.replace(r, cpu_ms=1200)  # TL < 1200 <= 1.5*TL
+            return r
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", near_tl), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        self.assertTrue(any(r["retimed_serially"] for r in payload["results"]))
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(banded, "a near-TL measurement produced no flag")
+        self.assertTrue(any("worker" in f["assumed"] or "worker" in f["what"]
+                            for f in banded))
+
+    def test_a_matrix_error_in_one_worker_surfaces_from_run(self):
+        # A worker's MatrixError must propagate out of the pool, not be
+        # swallowed into a verdict. Forced by making the *staged output* of
+        # every run unreadable, which is the real MatrixError path in
+        # `_run_once` (a solution that umask(077)s its own output file).
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        calls = []
+
+        def exploding(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 3:
+                raise run_matrix.MatrixError("synthetic worker failure")
+            return real_run_once(*args, **kwargs)
+
+        with mock.patch.object(run_matrix, "_run_once", exploding):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("synthetic worker failure", str(ctx.exception))
 
 
 class MinimalIsolateFixture(unittest.TestCase):

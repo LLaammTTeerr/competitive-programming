@@ -6,7 +6,11 @@ three runs per test and the limit follows from its slowest test. Adversary
 solutions get one run, and only a result landing in the (TL, kill] band —
 strictly over TL, since a run exactly at TL is accepted, up through kill — is
 re-run three times before being reported — three runs of everything triples
-the cost of the pipeline for no gain outside the band.
+the cost of the pipeline for no gain outside the band. Pass 2 also runs on
+several sandboxes at once (see `_run_pass2`), which can inflate a single
+run's CPU time; a measurement close enough to TL that contention could have
+decided it gets one extra serial re-time, before classification, on top of
+the band re-run above — see `matrix_core.needs_serial_retime`.
 
 Runner: every solution runs inside the ioi/isolate sandbox (isolate 2.x).
 This module previously spawned children itself (`os.posix_spawn` + a
@@ -186,6 +190,7 @@ two halves and both are load-bearing:
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import dataclasses
 import json
@@ -202,7 +207,16 @@ from pathlib import Path
 
 from tools import box_pool
 from tools import flags
-from tools.matrix_core import Limits, Outcome, classify, compare, compute_limits, group_verdict
+from tools.matrix_core import (
+    CONTENTION_BOUND,
+    Limits,
+    Outcome,
+    classify,
+    compare,
+    compute_limits,
+    group_verdict,
+    needs_serial_retime,
+)
 from tools.problem_meta import Problem, load
 from tools.scan_solutions import scan
 
@@ -1426,6 +1440,110 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
     return classify(r.cpu_ms, r.killed, verdict_src, limits)
 
 
+def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
+               manifest: dict, binaries: dict[str, Path], checker: Path,
+               tests: dict[str, list[Path]], limits: Limits,
+               mem_limit_kb: int, runs: int, workers: int
+               ) -> tuple[list[dict], dict[str, dict[str, str]]]:
+    """Run every solution on every test, on `workers` sandboxes at once.
+
+    Only pass 2 is parallel. Pass 1 stays serial in `run()` because it
+    measures `t_main`, from which `compute_limits` derives TL: timing the
+    model solution under contention inflates TL, and an inflated TL lets
+    genuinely-too-slow solutions pass, which manufactures holes — the one
+    claim this pipeline makes that has to be true. Pass 1 is also 1-6% of
+    the wall clock on every real package measured, so serialising it costs
+    almost nothing.
+
+    Two phases. The first fans out; the second re-times, **serially and with
+    every worker idle**, only those results `needs_serial_retime` calls
+    undecidable. That set is tiny in practice — 18 of 5508 results across
+    the eight packages this was measured on — because contention is
+    one-sided and a kernel kill therefore still implies a genuine TL (see
+    `matrix_core.needs_serial_retime`).
+
+    Threads, not processes: every unit of work is a `subprocess.run` on
+    isolate, which releases the GIL, and the workers share one
+    `IsolateHandle`. Each `_run_once` leases its own box id and creates its
+    own staging directory, so no state is shared between them; the shared
+    handle carries only the two roots those live under.
+
+    A `MatrixError` raised in any worker propagates out of `.result()` (via
+    `pool.map`, which re-raises it here) and aborts the matrix. That is
+    deliberate: every `MatrixError` in this driver means "this run cannot be
+    judged", and turning one into a verdict is precisely the
+    confidently-wrong outcome the whole module refuses.
+    """
+    cpu_limit_s = limits.kill_ms / 1000.0
+    wall_limit_s = max(3 * limits.tl_ms, limits.kill_ms) / 1000.0
+    build = problem_dir / ".build"
+    work = [(entry["file"], group, test)
+            for entry in manifest["solutions"]
+            for group, paths in tests.items()
+            for test in paths]
+
+    def one(item):
+        name, group, test = item
+        out = build / f"{Path(name).stem}.{group}.{test.stem}.out"
+        r = _run_once(isolate, binaries[name], test, out,
+                      cpu_limit_s, wall_limit_s, mem_limit_kb,
+                      io_input=problem.input, io_output=problem.output)
+        return item, out, r
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        measured = list(pool.map(one, work))
+
+    results, actual = [], {}
+    for (name, group, test), out, r in measured:
+        answer = test.with_suffix(".a")
+        retimed = needs_serial_retime(r.cpu_ms, r.killed, limits) if workers > 1 else False
+        if retimed:
+            first_run_ms = r.cpu_ms
+            r = _time_median(isolate, binaries[name], test, out,
+                             cpu_limit_s, wall_limit_s, mem_limit_kb, runs,
+                             io_input=problem.input, io_output=problem.output)
+            flags.append(
+                problem_dir, phase="validate-solutions", severity="low",
+                kind="timing-band",
+                what=f"{name} on {group}/{test.stem} measured {first_run_ms} ms "
+                     f"CPU time with {workers} sandboxes running, close enough "
+                     f"to TL {limits.tl_ms} that contention could have decided it",
+                assumed=f"re-timed {runs}x serially with every worker idle; the "
+                        f"median came out {r.cpu_ms} ms",
+                changes_if_wrong=f"the expected tag of {name}")
+        outcome = _classify(r, checker, test, out, answer, limits)
+        if outcome.banded:
+            first_run_ms = r.cpu_ms
+            r = _time_median(isolate, binaries[name], test, out,
+                             cpu_limit_s, wall_limit_s, mem_limit_kb, runs,
+                             io_input=problem.input, io_output=problem.output)
+            outcome = _classify(r, checker, test, out, answer, limits)
+            flags.append(
+                problem_dir, phase="validate-solutions", severity="medium",
+                kind="timing-band",
+                what=f"{name} on {group}/{test.stem} ran {first_run_ms} ms CPU "
+                     f"time, between TL {limits.tl_ms} and kill {limits.kill_ms} "
+                     f"({workers} worker(s))",
+                assumed=f"re-timed {runs}x for stability; the median came out "
+                        f"{r.cpu_ms} ms, and the recorded verdict is "
+                        f"{outcome.verdict} — there is no separate 'banded' "
+                        "verdict, only ever a real one (TL if still over the "
+                        "limit, otherwise whatever the checker returned)",
+                changes_if_wrong=f"the expected tag of {name}")
+        actual.setdefault(name, {}).setdefault(group, []).append(outcome.verdict)
+        results.append({
+            "solution": name, "group": group, "test": test.stem,
+            "verdict": outcome.verdict,
+            "time_ms": r.cpu_ms, "wall_ms": r.wall_ms,
+            "ratio": round(r.cpu_ms / max(limits.t_main_ms, 1), 2),
+            "peak_kb": r.peak_kb, "killed": r.killed, "oom": r.oom,
+            "banded": outcome.banded, "retimed_serially": retimed,
+        })
+    collapsed = {name: {group: group_verdict(v) for group, v in groups.items()}
+                 for name, groups in actual.items()}
+    return results, collapsed
+
+
 def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict:
     problem_dir, testlib_dir = Path(problem_dir), Path(testlib_dir)
     problem = load(problem_dir / "problem.json")
@@ -1586,67 +1704,23 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
 
         limits = compute_limits(t_main)
 
-        # Pass 2 — everything else, one run, band results re-timed.
-        # `--time` is set to `kill_ms` (not `tl_ms`): that is the value the
-        # old driver's own wait loop enforced as its hard kill deadline,
-        # and preserving it here is what keeps the (TL, kill] band
-        # reachable at all — a solution genuinely running between TL and
-        # kill must be allowed to actually finish in that window so
-        # `classify()` can band it, not be cut off by isolate at TL first.
-        # `--wall-time` is `max(3 * tl_ms, kill_ms)`: the instructed "3x TL"
-        # backstop, floored at `kill_ms` so it is never smaller than the
-        # CPU cap it backstops (which would happen if a caller ever forces
-        # a degenerate tl_ms, e.g. this module's own timing-band test).
-        cpu_limit_s = limits.kill_ms / 1000.0
-        wall_limit_s = max(3 * limits.tl_ms, limits.kill_ms) / 1000.0
-
-        results, actual = [], {}
-        for entry in manifest["solutions"]:
-            name = entry["file"]
-            actual[name] = {}
-            for group, paths in tests.items():
-                per_test = []
-                for test in paths:
-                    out = build / f"{Path(name).stem}.{group}.{test.stem}.out"
-                    answer = test.with_suffix(".a")
-                    r = _run_once(isolate, binaries[name], test, out,
-                                 cpu_limit_s, wall_limit_s, mem_limit_kb,
-                                 io_input=problem.input,
-                                 io_output=problem.output)
-                    outcome = _classify(r, checker, test, out, answer, limits)
-
-                    if outcome.banded:
-                        first_run_ms = r.cpu_ms
-                        r = _time_median(isolate, binaries[name], test, out,
-                                         cpu_limit_s, wall_limit_s,
-                                         mem_limit_kb, runs,
-                                         io_input=problem.input,
-                                         io_output=problem.output)
-                        outcome = _classify(r, checker, test, out, answer, limits)
-                        flags.append(
-                            problem_dir, phase="validate-solutions", severity="medium",
-                            kind="timing-band",
-                            what=f"{name} on {group}/{test.stem} ran {first_run_ms} ms "
-                                 f"CPU time on its first (single) run, between TL "
-                                 f"{limits.tl_ms} and kill {limits.kill_ms}",
-                            assumed=f"re-timed {runs}x for stability; the median came "
-                                    f"out {r.cpu_ms} ms, and the recorded verdict is "
-                                    f"{outcome.verdict} — there is no separate "
-                                    "'banded' verdict, only ever a real one "
-                                    "(TL if still over the limit, otherwise "
-                                    "whatever the checker returned)",
-                            changes_if_wrong=f"the expected tag of {name}")
-
-                    per_test.append(outcome.verdict)
-                    results.append({
-                        "solution": name, "group": group, "test": test.stem,
-                        "verdict": outcome.verdict,
-                        "time_ms": r.cpu_ms, "wall_ms": r.wall_ms,
-                        "ratio": round(r.cpu_ms / max(limits.t_main_ms, 1), 2),
-                        "peak_kb": r.peak_kb, "killed": r.killed, "oom": r.oom,
-                        "banded": outcome.banded,
-                    })
-                actual[name][group] = group_verdict(per_test)
+        # Pass 2 — everything else, fanned out across `workers` sandboxes at
+        # once (see `_run_pass2`), band results re-timed. `--time` is set to
+        # `kill_ms` (not `tl_ms`): that is the value the old driver's own
+        # wait loop enforced as its hard kill deadline, and preserving it
+        # here is what keeps the (TL, kill] band reachable at all — a
+        # solution genuinely running between TL and kill must be allowed to
+        # actually finish in that window so `classify()` can band it, not be
+        # cut off by isolate at TL first. `--wall-time` is
+        # `max(3 * tl_ms, kill_ms)`: the instructed "3x TL" backstop, floored
+        # at `kill_ms` so it is never smaller than the CPU cap it backstops
+        # (which would happen if a caller ever forces a degenerate tl_ms,
+        # e.g. this module's own timing-band test). Both limits are computed
+        # inside `_run_pass2` itself; nothing here duplicates them.
+        workers = box_pool.pool_size()
+        results, actual = _run_pass2(isolate, problem, problem_dir, manifest,
+                                     binaries, checker, tests, limits,
+                                     mem_limit_kb, runs, workers)
     finally:
         close_isolate_box(isolate)
 
@@ -1679,6 +1753,13 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
             # "no solution survives" could not be reproduced against the
             # header that produced it.
             "testlib": _git_rev(testlib_dir),
+            # How many sandboxes were running at once, and the inflation
+            # bound the ambiguity rule assumed. Both are provenance, not
+            # settings: a reader asking whether a recorded 1040 ms is
+            # trustworthy needs to know it was measured with three other
+            # boxes live.
+            "workers": workers,
+            "contention_bound": CONTENTION_BOUND,
         },
         "t_main_ms": {"per_test": t_main, "max": limits.t_main_ms,
                       "runs": runs, "method": "median", "metric": "cpu"},
