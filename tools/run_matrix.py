@@ -217,8 +217,8 @@ from tools.matrix_core import (
     group_verdict,
     needs_serial_retime,
 )
-from tools.problem_meta import Problem, load
-from tools.scan_solutions import scan
+from tools.problem_meta import Problem, ProblemMetaError, load
+from tools.scan_solutions import ScanError, scan
 
 SCHEMA = 1
 CXXFLAGS = ["-std=c++17", "-O2"]
@@ -532,14 +532,15 @@ def _leased_box(**kwargs):
     """`box_pool.lease()`, translating `BoxPoolError` into `MatrixError`.
 
     `box_pool.BoxPoolError` is a bare `RuntimeError` — deliberately:
-    `box_pool` has no dependency on this module's error type. But
-    `main()` only catches `MatrixError` (see its own docstring: exit 2 is
-    the contract for "the matrix could not be run at all"). Left
-    unconverted, a pool-exhaustion timeout, an unwritable lock directory,
-    or a malformed `$RUN_MATRIX_BOX_POOL` would surface as an uncaught
-    traceback and exit 1 — the code reserved for "the matrix ran and found
-    holes" — reopening, one layer down, exactly the crash-read-as-a-finding
-    defect `main()` was written to prevent.
+    `box_pool` has no dependency on this module's error type. `main()`'s
+    `PACKAGE_ERRORS` boundary catch already includes `box_pool.BoxPoolError`
+    itself, so an unconverted one would still exit 2, not 1 — this
+    conversion is no longer what stands between a pool-exhaustion timeout,
+    an unwritable lock directory, or a malformed `$RUN_MATRIX_BOX_POOL` and
+    an uncaught traceback. What it still buys is the message: `MatrixError`
+    naming the problem the way this driver's other refusals do, rather than
+    a bare `box_pool` exception surfacing `box_pool`'s own wording to a
+    reader who has never heard of that module.
     """
     try:
         with box_pool.lease(**kwargs) as box_id:
@@ -577,11 +578,11 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
        written. `box_pool.lease()` raises its own `BoxPoolError` for this
        (a bare `RuntimeError`, since `box_pool` has no dependency on this
        module's error type); `_leased_box()` converts it to `MatrixError`
-       here so it still reaches `main()`'s `except MatrixError` rather
-       than escaping as an uncaught traceback that exits 1 — the code
-       `main()` reserves for "the matrix ran and found holes" — instead of
-       2, "the matrix could not be run at all". See `main()`'s own
-       docstring.
+       here for the message — naming the problem the way this driver's
+       other refusals do — not to keep it from escaping `main()`: that is
+       `main()`'s `PACKAGE_ERRORS` boundary catch's job, and it already
+       covers a bare `box_pool.BoxPoolError` too. See `main()`'s own
+       docstring and the comment on `PACKAGE_ERRORS`.
 
     This still does one `--init`/`--cleanup` probe cycle up front — so a
     missing/unconfigured sandbox is diagnosed here, before any compilation
@@ -1795,7 +1796,21 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
         # (which would happen if a caller ever forces a degenerate tl_ms,
         # e.g. this module's own timing-band test). Both limits are computed
         # inside `_run_pass2` itself; nothing here duplicates them.
-        workers = box_pool.pool_size()
+        # The one `box_pool` call in this module not routed through
+        # `_leased_box`. It is currently unreachable-with-a-raise —
+        # `open_isolate_box` above already called `pool_size()`
+        # successfully under the same environment, inside `lease()` — but
+        # "currently unreachable" is not "handled", and `PACKAGE_ERRORS`
+        # would already turn a bare `BoxPoolError` here into exit 2 with no
+        # help from this `try`. This exists for the message: naming the
+        # worker pool rather than surfacing whatever `box_pool.pool_size`
+        # happened to say.
+        try:
+            workers = box_pool.pool_size()
+        except box_pool.BoxPoolError as exc:
+            raise MatrixError(
+                f"cannot size the worker pool: {exc}"
+            ) from exc
         results, actual = _run_pass2(isolate, problem, problem_dir, manifest,
                                      binaries, checker, tests, limits,
                                      mem_limit_kb, runs, workers)
@@ -1851,6 +1866,39 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
     return payload
 
 
+# Every exception type this pipeline raises for a package it cannot use.
+# `main()` catches the family rather than a list of call sites, because the
+# property that has to hold is a *boundary* one: nothing reaches a caller as
+# an unhandled exception, whatever future module raises it. A per-site
+# conversion list — the shape `_leased_box` uses for `BoxPoolError`, which is
+# right there because it has exactly two adjacent call sites — cannot state
+# that invariant, and is defeated by the next call site someone adds.
+#
+# Measured, not assumed. Driving `main()` against a real package surfaced
+# three escapees, each as a traceback exiting 1 — the code
+# `validating-solutions` reads as "the matrix ran and found holes":
+#   - a malformed `problem.json`            -> `problem_meta.ProblemMetaError`
+#   - a malformed `@expect` header on a solution -> `scan_solutions.ScanError`
+#   - a corrupted `flags.json` while a result lands in the (TL, kill] band
+#     or is retimed, which is when `_run_pass2` calls `flags.append` and
+#     `flags.append` reads the existing register before writing to it
+#     -> `flags.FlagError`. A probe with a corrupted `flags.json` but no
+#     banded/retimed result in the run does *not* escape — `flags.append`
+#     is simply never called on that path — which is why "exit 0 on a
+#     corrupted flags.json" is not proof of nothing to fix here, only proof
+#     that particular probe didn't reach the call site.
+# `box_pool.BoxPoolError` is included for the boundary invariant itself: it
+# is already converted to `MatrixError` at both of its call sites
+# (`_leased_box`, and the bare `pool_size()` call in `run()`), so nothing
+# here should ever actually raise a bare one, but "should never" is exactly
+# the claim a boundary catch exists to not have to trust.
+# `drift_check.DriftCheckError` is deliberately absent: `drift_check` is
+# never imported by this module, so nothing on any path `run()` takes can
+# raise it — traced by grepping this file for the name, not assumed.
+PACKAGE_ERRORS = (MatrixError, box_pool.BoxPoolError, ProblemMetaError,
+                  ScanError, flags.FlagError)
+
+
 def main(argv: list[str]) -> int:
     """Exit codes are a contract `validating-solutions` reads directly:
 
@@ -1858,22 +1906,30 @@ def main(argv: list[str]) -> int:
         1 — the matrix ran and found holes and/or mismatches. This is a
             *result*, printed to stdout: the signal to keep reading.
         2 — the matrix could not be run at all (usage error, or any
-            `MatrixError`: a compile failure, a missing tests directory, a
-            model solution that produced no output file, an unusable
-            sandbox or staging location).
+            `PACKAGE_ERRORS` member: a compile failure, a missing tests
+            directory, a model solution that produced no output file, an
+            unusable sandbox or staging location, a malformed
+            `problem.json` or solution `@expect` header, or a corrupted
+            `flags.json`).
             A message on stderr, nothing on stdout.
 
-    Before this, an uncaught `MatrixError` surfaced as a traceback and
-    exited 1 as well, so an agent told "exit 1 means holes or mismatches"
-    would read a crash as a finding — a compile failure reported as
-    "the suite has a hole".
+    The guarantee that nothing else escapes is a property of the *boundary*
+    catching a family of types (`PACKAGE_ERRORS`, defined above this
+    function), not of an enumerated list of call sites — see that constant's
+    own comment for why the distinction matters.
+
+    Before this, `main()` caught only `MatrixError`. `ProblemMetaError` and
+    `ScanError` surfaced as tracebacks and exited 1 as well, so an agent
+    told "exit 1 means holes or mismatches" would read a crash as a finding
+    — a typo in a solution's metadata header reported as "the suite has a
+    hole".
     """
     if len(argv) != 3:
         print("usage: run_matrix.py <problem-dir> <testlib-dir>", file=sys.stderr)
         return 2
     try:
         payload = run(argv[1], argv[2])
-    except MatrixError as exc:
+    except PACKAGE_ERRORS as exc:
         print(f"run_matrix: {exc}", file=sys.stderr)
         return 2
     print(f"TL {payload['limits']['tl_ms']} ms  "

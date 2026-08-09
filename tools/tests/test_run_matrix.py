@@ -46,6 +46,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,7 +54,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools import flags, matrix_core, run_matrix
+from tools import box_pool, flags, matrix_core, run_matrix
 from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
@@ -2606,6 +2607,116 @@ class TestStageBase(unittest.TestCase):
 
     def setUp(self):
         SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+class ExitCodeContractTest(PackageFixture):
+    """`main()`'s exit codes are a contract `validating-solutions` reads.
+
+    Exit 1 means "the matrix ran and found holes and/or mismatches" — a
+    statement about the *package*. Anything that prevents the matrix from
+    running is exit 2. A crash reported as exit 1 is a crash read as a
+    finding, which is the misread `main()`'s own docstring says it exists
+    to prevent.
+    """
+
+    def _main(self):
+        return run_matrix.main(["run_matrix.py", str(self.problem_dir),
+                                str(self.testlib_dir)])
+
+    def test_a_malformed_problem_json_exits_2_not_1(self):
+        (self.problem_dir / "problem.json").write_text("{not json",
+                                                       encoding="utf-8")
+        self.assertEqual(self._main(), 2)
+
+    def test_a_malformed_expect_header_exits_2_not_1(self):
+        # Likelier in practice than a bad problem.json: a setter edits
+        # solution headers constantly.
+        path = self.problem_dir / "solutions" / "sol-main.cpp"
+        path.write_text(path.read_text(encoding="utf-8")
+                        .replace("g1=OK", "g1=NOPE"), encoding="utf-8")
+        self.assertEqual(self._main(), 2)
+
+    def test_a_corrupted_flags_json_during_a_banded_result_exits_2_not_1(self):
+        # A third escapee beyond the two the plan for this task named:
+        # `flags.append` (called from `_run_pass2` whenever a result is
+        # retimed or lands in the (TL, kill] band) reads the existing
+        # register before writing to it, so a corrupted flags.json raises
+        # `flags.FlagError` from inside `run()` — but only on a run that
+        # actually reaches that call site. `compute_limits` is patched
+        # (same technique as
+        # `TestRunMatrixFixture.test_band_result_is_reached_and_flagged_with_accurate_wording`)
+        # to force every result into the band deterministically, so this
+        # is not a probe that could pass by accident of timing.
+        (self.problem_dir / "flags.json").write_text("{not json",
+                                                       encoding="utf-8")
+        forced = matrix_core.Limits(t_main_ms=2, tl_ms=-1, kill_ms=5000)
+        with mock.patch.object(run_matrix, "compute_limits", return_value=forced):
+            code = self._main()
+        self.assertEqual(code, 2)
+
+    def test_a_package_error_prints_to_stderr_and_nothing_to_stdout(self):
+        # stdout is the results channel. A caller that parses stdout must
+        # not receive a half-line of nothing and read it as "no holes".
+        (self.problem_dir / "problem.json").write_text("{not json",
+                                                       encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self._main()
+        self.assertEqual(code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("problem.json", err.getvalue())
+
+    def test_no_tools_exception_type_escapes_main(self):
+        # The boundary property itself, asserted rather than assumed: if a
+        # future module raises a new error type through run(), this fails.
+        (self.problem_dir / "problem.json").write_text("{not json",
+                                                       encoding="utf-8")
+        try:
+            self._main()
+        except BaseException as exc:  # noqa: BLE001 - that is the point
+            self.fail(f"{type(exc).__module__}.{type(exc).__name__} escaped main()")
+
+    def test_a_real_hole_still_exits_1(self):
+        # The contract's other half: exit 2 must not swallow genuine
+        # findings. Declare the wrong solution as correct so the suite has
+        # a hole to report.
+        path = self.problem_dir / "solutions" / "sol-wrong.cpp"
+        path.write_text(path.read_text(encoding="utf-8")
+                        .replace("g1=WA", "g1=TL"), encoding="utf-8")
+        self.assertEqual(self._main(), 1)
+
+
+class PoolSizeAtPassTwoTest(PackageFixture):
+    def test_a_bad_pool_size_at_pass_two_is_a_matrix_error(self):
+        # The plan for this task assumed `pool_size()` is called exactly
+        # twice in a run — once inside `open_isolate_box` (via
+        # `box_pool.lease`), once at the bare call site before pass 2 — and
+        # a `len(calls) > 1` counter would isolate the second. That is
+        # wrong: `_leased_box()` is also entered once per sandboxed run
+        # inside `_run_once` (pass 1 times the model solution three times
+        # per test, each a `_leased_box()`/`pool_size()` call of its own),
+        # so a bare call-count trips on pass 1, long before pass 2, and
+        # raises through `_leased_box`'s own conversion instead of the
+        # target site — confirmed empirically: the counter version failed
+        # with `str(ctx.exception) == "synthetic pool failure"`, not
+        # wrapped with "cannot size the worker pool" at all.
+        #
+        # Distinguish by the immediate caller instead: `lease()` (inside
+        # `box_pool.py`) calls `pool_size()` for every leased box; the bare
+        # call this task added calls it directly from `run()`. Only the
+        # latter should fail.
+        real = box_pool.pool_size
+
+        def flaky():
+            caller = sys._getframe(1).f_code.co_name
+            if caller == "run":
+                raise box_pool.BoxPoolError("synthetic pool failure")
+            return real()
+
+        with mock.patch.object(box_pool, "pool_size", flaky):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("worker pool", str(ctx.exception))
 
 
 if __name__ == "__main__":
