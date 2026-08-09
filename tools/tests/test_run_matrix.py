@@ -51,7 +51,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools import flags, run_matrix
+from tools import flags, matrix_core, run_matrix
 from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
@@ -146,6 +146,54 @@ def _compile(src_text: str, out_path: Path, tmp_dir: Path) -> Path:
     subprocess.run(["g++", "-std=c++17", "-O2", str(src), "-o", str(out_path)],
                     check=True, capture_output=True)
     return out_path
+
+
+def _fixed_lease(box_id: int):
+    """Stand in for `box_pool.lease`, always handing out the same id.
+
+    Box ids now come from `box_pool`'s per-user lease pool rather than a
+    value this module derives itself, so tests that need a *specific* box
+    id (an out-of-range one to force a real `--init` failure, or a known
+    one to check its box directory is gone afterward) patch
+    `run_matrix.box_pool.lease` with this rather than a function this
+    module no longer has. Only safe for an id no real lease would ever
+    hand out (`box_pool`'s pool never exceeds 65536 ids) — anything within
+    the real range must go through `_track_leased_box_ids` instead, or two
+    copies of this suite running at once will genuinely collide on it,
+    since this bypasses the real `flock` entirely.
+    """
+    return contextlib.nullcontext(box_id)
+
+
+@contextlib.contextmanager
+def _track_leased_box_ids():
+    """Record every box id `box_pool.lease` hands out during the block,
+    while still leasing for real.
+
+    `test_boxes_are_cleaned_up_after_*` need to know which isolate box
+    directories a `run()` call touched so they can confirm those specific
+    directories are gone afterward. Snapshotting the whole of
+    `/var/local/lib/isolate/` before and after — the previous approach —
+    assumed this process was the only thing using isolate for the whole
+    window, which a second copy of this suite running at the same time
+    (Task 2's own acceptance criterion) violates: a sibling process
+    legitimately opening and closing *other*, correctly non-colliding
+    boxes changes the global directory listing without either side
+    leaking anything. Scoping to only the ids this call actually leased
+    avoids that false positive, and still goes through the real
+    `box_pool.lease` (real `flock`), so it stays safe to run concurrently.
+    """
+    ids: set[int] = set()
+    real_lease = run_matrix.box_pool.lease
+
+    @contextlib.contextmanager
+    def _spy(**kwargs):
+        with real_lease(**kwargs) as box_id:
+            ids.add(box_id)
+            yield box_id
+
+    with mock.patch.object(run_matrix.box_pool, "lease", _spy):
+        yield ids
 
 
 def _testlib_dir() -> Path:
@@ -369,7 +417,8 @@ class TestRunMatrixFixture(unittest.TestCase):
         # unconfigured" case this driver must diagnose separately, since a
         # genuinely unconfigured sandbox cannot be produced on this
         # already-configured machine without root to break it.
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=999_999):
+        with mock.patch.object(run_matrix.box_pool, "lease",
+                               lambda **kw: _fixed_lease(999_999)):
             with self.assertRaises(run_matrix.MatrixError) as ctx:
                 run_matrix.open_isolate_box(self.tmp)
         message = str(ctx.exception)
@@ -444,8 +493,7 @@ class TestRunMatrixFixture(unittest.TestCase):
         # wrong one. This test must FAIL against the single-persistent-box
         # code this task replaces (confirmed: see the task report for the
         # actual failing-before transcript) and PASS now that every
-        # `_run_once` call draws its own fresh box from the same
-        # `IsolateHandle` via `box_id_counter`.
+        # `_run_once` call leases its own fresh box from `box_pool`.
         hog = _compile(
             "#include <cstring>\n#include <cstdlib>\n"
             "int main(){ for(;;){ char*p=(char*)malloc(8*1024*1024); "
@@ -528,28 +576,31 @@ class TestRunMatrixFixture(unittest.TestCase):
         stdin_path.write_text("\n", encoding="utf-8")
         out_path = self.tmp / "ok.out"
 
-        box_dir = Path("/var/local/lib/isolate/54323")
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=54323):
-            isolate = run_matrix.open_isolate_box(self.tmp)
+        isolate = run_matrix.open_isolate_box(self.tmp)
         try:
-            # itertools.count(54323)'s first next() yields 54323 itself, so
-            # this first _run_once call is guaranteed to use box 54323.
-            with mock.patch.object(run_matrix, "_parse_meta",
-                                   side_effect=RuntimeError("boom")):
-                with self.assertRaises(RuntimeError):
-                    run_matrix._run_once(isolate, binary, stdin_path, out_path,
-                                         cpu_limit_s=1.0, wall_limit_s=3.0,
-                                         mem_limit_kb=256 * 1024)
-            self.assertFalse(box_dir.exists(),
-                             f"{box_dir} still present after _run_once raised")
+            # `_run_once` leases its own box id now (no more
+            # `box_id_counter` to seed) — record whichever id the real
+            # `box_pool.lease` hands out (still under its real flock, so
+            # this test does not collide with a concurrently running
+            # second copy of this same suite the way a hardcoded id with
+            # no locking would) and check that one's directory afterward.
+            with _track_leased_box_ids() as leased:
+                with mock.patch.object(run_matrix, "_parse_meta",
+                                       side_effect=RuntimeError("boom")):
+                    with self.assertRaises(RuntimeError):
+                        run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                             cpu_limit_s=1.0, wall_limit_s=3.0,
+                                             mem_limit_kb=256 * 1024)
+            self._assert_boxes_gone(leased)
         finally:
             run_matrix.close_isolate_box(isolate)
 
-    def _isolate_boxes(self) -> set[str]:
-        base = Path("/var/local/lib/isolate")
-        if not base.is_dir():
-            return set()
-        return {p.name for p in base.iterdir()}
+    def _assert_boxes_gone(self, box_ids) -> None:
+        self.assertTrue(box_ids, "no box id was leased at all — sanity check")
+        for box_id in box_ids:
+            box_dir = Path(f"/var/local/lib/isolate/{box_id}")
+            self.assertFalse(box_dir.exists(),
+                             f"{box_dir} still present after run()")
 
     def test_boxes_are_cleaned_up_after_a_real_run(self):
         # A box leaked under /var/local/lib/isolate/<id> is exactly the
@@ -563,23 +614,24 @@ class TestRunMatrixFixture(unittest.TestCase):
         # claimed to cover but did not.
         #
         # Task 9c: `run()` now opens and closes a *different* box for every
-        # single sandboxed execution (see IsolateHandle.box_id_counter), so
-        # checking only the mocked base id would only ever pin the first
-        # of several boxes a real run opens. Snapshotting the whole
-        # directory before and after is the check that actually covers
-        # every box this invocation touched, not just the first.
-        before = self._isolate_boxes()
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=54321):
+        # single sandboxed execution, each leased from `box_pool`, so
+        # checking only one fixed id would only ever pin the first of
+        # several boxes a real run opens. `_track_leased_box_ids` records
+        # every id this invocation actually leased so all of them are
+        # checked, not just the first — and, unlike snapshotting the whole
+        # of `/var/local/lib/isolate/`, does not misreport a leak when a
+        # concurrently running second copy of this suite is legitimately
+        # using other, non-colliding box ids at the same time.
+        with _track_leased_box_ids() as leased:
             run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertEqual(self._isolate_boxes(), before,
-                             "a box was left behind after a clean run")
+        self._assert_boxes_gone(leased)
 
-            (self.problem_dir / "tests" / "g1" / "01.in").write_text(
-                "0 0\n", encoding="utf-8")
+        (self.problem_dir / "tests" / "g1" / "01.in").write_text(
+            "0 0\n", encoding="utf-8")
+        with _track_leased_box_ids() as leased:
             payload = run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
-            self.assertEqual(self._isolate_boxes(), before,
-                             "a box was left behind after a hole-firing run")
+        self.assertEqual(len(payload["holes"]), 1)  # sanity: still ran
+        self._assert_boxes_gone(leased)
 
     def test_boxes_are_cleaned_up_after_run_raises(self):
         # Task 9b review finding D: the test above never actually drives
@@ -591,12 +643,10 @@ class TestRunMatrixFixture(unittest.TestCase):
         (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
             _MAIN_HEADER + "int main(){ int *p = nullptr; *p = 1; return 0; }\n",
             encoding="utf-8")
-        before = self._isolate_boxes()
-        with mock.patch.object(run_matrix, "_select_box_id", return_value=54322):
+        with _track_leased_box_ids() as leased:
             with self.assertRaises(run_matrix.MatrixError):
                 run_matrix.run(self.problem_dir, self.testlib_dir)
-            self.assertEqual(self._isolate_boxes(), before,
-                             "a box was left behind after run() raised")
+        self._assert_boxes_gone(leased)
 
     def test_crashing_model_solution_is_diagnosed_as_crashed_not_exited_0(self):
         # Task 9b review finding A: a signal death (status SG) carries no
@@ -1904,6 +1954,43 @@ class TestRunMatrixFixture(unittest.TestCase):
         # machine; it is a declaration and is now named as one.
         self.assertNotIn("cg", machine)
         self.assertTrue(machine["cg_requested"])
+
+
+class BoxLeasingTest(TestRunMatrixFixture):
+    def test_isolate_handle_has_no_pid_derived_counter(self):
+        # The pid-derived counter is the Cause-A defect itself. Its absence
+        # is the invariant, so it is asserted rather than assumed.
+        self.assertFalse(hasattr(run_matrix, "_select_box_id"))
+        self.assertNotIn("box_id_counter",
+                         run_matrix.IsolateHandle.__dataclass_fields__)
+
+    def test_init_box_names_the_collision_instead_of_the_install(self):
+        # isolate answers "This box is currently in use by another process"
+        # (rc=2) when the id is live. The old message blamed cgroup
+        # delegation, subuid ranges and isolate-cg-keeper — a confident wrong
+        # diagnosis that has already cost three agents an afternoon.
+        fake = self._fake_isolate(
+            rc=2, message="This box is currently in use by another process")
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix._init_box(fake, 7)
+        message = str(ctx.exception)
+        self.assertIn("in use", message)
+        self.assertIn("box 7", message)
+        self.assertNotIn("subuid", message)
+        self.assertNotIn("cg-keeper", message)
+
+    def test_init_box_still_names_the_install_for_a_real_config_failure(self):
+        fake = self._fake_isolate(rc=1, message="Cannot initialize control group")
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix._init_box(fake, 7)
+        self.assertIn("subuid", str(ctx.exception))
+
+    def _fake_isolate(self, *, rc: int, message: str) -> str:
+        script = self.tmp / f"fake_isolate_{rc}_{abs(hash(message)) % 9999}"
+        script.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit {rc}\n",
+                          encoding="utf-8")
+        script.chmod(0o755)
+        return str(script)
 
 
 class TestStageBase(unittest.TestCase):

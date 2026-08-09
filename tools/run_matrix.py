@@ -136,8 +136,10 @@ box id, so no run can ever observe another run's counters — on any field,
 whether or not this driver currently reads it. `open_isolate_box()` still
 does one probe `--init`/`--cleanup` at startup (to fail fast, before any
 compilation, if isolate is missing or unconfigured) but no longer holds a
-box open across the whole invocation — see `IsolateHandle.box_id_counter`
-for how each call gets its own id.
+box open across the whole invocation — see `box_pool` for how each call
+leases its own id, and why a lease rather than a pid-derived id: two
+concurrently-running `run_matrix` invocations no longer collide on the
+same box.
 
 Where the staging directory lives, and why it is not `/tmp`: the third
 relocation of one defect class. The staging directory 9b introduced was a
@@ -181,7 +183,6 @@ two halves and both are load-bearing:
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import json
 import os
 import platform
@@ -194,6 +195,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from tools import box_pool
 from tools import flags
 from tools.matrix_core import Limits, Outcome, classify, compare, compute_limits, group_verdict
 from tools.problem_meta import Problem, load
@@ -309,18 +311,13 @@ class IsolateHandle:
     before it and `--cleanup`ed immediately after (see `_run_once`), and
     this handle carries only what is shared safely across that churn:
 
-    `box_id_counter` hands out a fresh id for each call. It starts from
-    this process's own pid-derived base (`_select_box_id()` — unique among
-    *concurrently running* `run_matrix` invocations, isolate's own
-    contract for box ids) and increments by one per call, wrapping at
-    isolate's box-id range (0-65535). Advancing rather than reusing the
-    same id every time isn't needed for correctness — a fully torn-down
-    box (`--cleanup` completed) has no state left to leak into the next
-    `--init` at the same id — but it costs nothing and further shrinks an
-    already-tiny collision window: a box now exists only for the duration
-    of one `--run`, not this whole invocation, so two processes would have
-    to land the exact same id at the exact same instant, not merely during
-    overlapping lifetimes.
+    The box id for each call is no longer carried on this handle: every
+    `--init`/`--run`/`--cleanup` cycle leases its own id from `box_pool`
+    (see `_run_once` and `open_isolate_box`'s startup probe), held
+    exclusively for that cycle and released immediately after. That
+    replaced a pid-derived counter that only looked unique — see
+    `box_pool`'s module docstring for the two collision windows that
+    produced, neither fixable by a retry.
 
     `stage_dir` is a private `mkdtemp()` directory that is the *only* `:rw`
     mount any `--run` ever uses (unrelated to box identity — a plain host
@@ -338,7 +335,6 @@ class IsolateHandle:
     version: str
     meta_path: Path
     stage_dir: Path
-    box_id_counter: itertools.count
 
 
 def _filesystem_type(path: Path) -> str | None:
@@ -446,49 +442,48 @@ def _isolate_binary_name() -> str:
     return os.environ.get("ISOLATE_BIN", "isolate")
 
 
-def _select_box_id() -> int:
-    """Pick an isolate box id for this `run()` invocation.
-
-    isolate box ids only need to be unique among *concurrently open* boxes
-    on the machine (`isolate --box-id`'s own contract) — there is no shared
-    allocator to coordinate through, and this tool is not itself run with
-    high parallelism. This process's own pid is already unique among
-    processes alive at the same instant, so `pid % 65536` (isolate's box-id
-    range is 0-65535) gives a box id that only collides with another
-    concurrently-running run_matrix invocation whose pid happens to differ
-    by an exact multiple of 65536 — vanishingly unlikely at the scale this
-    pipeline runs at, and far simpler than a lockfile/allocator.
-
-    And even that unlikely collision cannot produce a *wrong verdict*, only
-    a loud one: `--init` on a box id that is already open is idempotent (it
-    returns 0, reusing/reinitializing the same box) rather than failing, so
-    two colliding invocations don't fail here — they fail later, when their
-    concurrent `--run`s and `--cleanup`s race on the same box directory.
-    The worst case observed for that kind of collision is isolate itself
-    reporting an internal error for one side (e.g. "Box not found" /
-    `status:XX`), which `_run_once` already turns into a `MatrixError`
-    naming isolate's own failure (see its docstring) — never a misreported
-    verdict on a solution.
-    """
-    return os.getpid() % 65536
+# isolate's own words when an id is already claimed. Matched as a substring
+# because it is the only signal that separates "another invocation is using
+# this box" from "this install is broken", and the two need opposite advice.
+_ISOLATE_BOX_BUSY = "currently in use by another process"
 
 
 def _init_box(binary: str, box_id: int) -> None:
-    """`isolate --init` for one box id, raising `MatrixError` on failure."""
+    """`isolate --init` for one box id, raising `MatrixError` on failure.
+
+    Two failures with opposite fixes, so they get two messages. A busy box
+    means a *lease* was violated — either something else on this machine
+    uses isolate directly, or `$RUN_MATRIX_BOX_POOL` was raised past what
+    the lock directory coordinates. The old code folded this into the
+    install-is-broken message and sent three agents chasing a cgroup
+    misconfiguration that was never there.
+    """
     init = subprocess.run([binary, "--cg", f"--box-id={box_id}", "--init"],
                           capture_output=True, text=True)
-    if init.returncode != 0:
+    if init.returncode == 0:
+        return
+    detail = (init.stderr or init.stdout).strip()
+    if _ISOLATE_BOX_BUSY in detail:
         raise MatrixError(
-            f"isolate is installed at {binary} but `--init` failed for box "
-            f"{box_id} (exit {init.returncode}): "
-            f"{(init.stderr or init.stdout).strip()}\n"
-            "A missing binary would have failed with a different message "
-            "(see open_isolate_box); this looks instead like an "
-            "installed-but-unconfigured sandbox — isolate needs cgroup v2 "
-            "delegation, the isolate-cg-keeper service (isolate.service) "
-            "enabled and running, and the 'isolate' system user's range "
-            f"registered in /etc/subuid and /etc/subgid. See {_ISOLATE_HOME}."
+            f"isolate box {box_id} is already in use by another process "
+            f"({detail}). This driver leases every box id through "
+            f"{box_pool.lock_dir()} before touching it, and that lease pool "
+            "is per-user — so the cause is something the pool cannot see: "
+            "another user running run_matrix on this machine, another tool "
+            "using isolate directly, or a stale run started before the "
+            "lease pool existed. This is not an installation problem — see "
+            "open_isolate_box's own diagnosis for that case instead."
         )
+    raise MatrixError(
+        f"isolate is installed at {binary} but `--init` failed for box "
+        f"{box_id} (exit {init.returncode}): {detail}\n"
+        "A missing binary would have failed with a different message "
+        "(see open_isolate_box); this looks instead like an "
+        "installed-but-unconfigured sandbox — isolate needs cgroup v2 "
+        "delegation, the isolate-cg-keeper service (isolate.service) "
+        "enabled and running, and the 'isolate' system user's range "
+        f"registered in /etc/subuid and /etc/subgid. See {_ISOLATE_HOME}."
+    )
 
 
 def _cleanup_box(binary: str, box_id: int) -> None:
@@ -531,7 +526,7 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     touches the tree — but does not hold that box open: Task 9c found
     isolate's cgroup counters persist across `--run`s in the same box, so
     every actual sandboxed execution (`_run_once`) now opens and tears down
-    its own box instead (see `IsolateHandle.box_id_counter`).
+    its own box instead, each leased from `box_pool` like this probe is.
     """
     # Resolved (and validated) before isolate is even probed: a staging
     # location that cannot be used is a refuse-to-run, and refusing early
@@ -552,11 +547,13 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     version_done = subprocess.run([binary, "--version"], capture_output=True, text=True)
     version = version_done.stdout.splitlines()[0] if version_done.stdout else "unknown"
 
-    probe_box_id = _select_box_id()
-    _init_box(binary, probe_box_id)
-    # Immediately torn down: this was only a usability probe. Every real
-    # sandboxed execution opens and closes its own box (see _run_once).
-    _cleanup_box(binary, probe_box_id)
+    # A usability probe, so a missing or unconfigured sandbox is diagnosed
+    # before any compilation touches the tree. It leases an id like every
+    # other box: probing an id another invocation is using is the exact
+    # collision this pool exists to prevent.
+    with box_pool.lease() as probe_box_id:
+        _init_box(binary, probe_box_id)
+        _cleanup_box(binary, probe_box_id)
 
     meta_fd, meta_name = tempfile.mkstemp(prefix="run_matrix_isolate_meta_")
     os.close(meta_fd)
@@ -573,8 +570,7 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     os.chmod(stage_dir, 0o777)
 
     return IsolateHandle(binary=binary, version=version,
-                         meta_path=Path(meta_name), stage_dir=stage_dir,
-                         box_id_counter=itertools.count(probe_box_id))
+                         meta_path=Path(meta_name), stage_dir=stage_dir)
 
 
 def close_isolate_box(handle: IsolateHandle) -> None:
@@ -919,9 +915,11 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     run's). It is reported, not classified, here.
 
     Task 9c: every call gets its **own, freshly-`--init`ed box** — one is
-    claimed from `isolate.box_id_counter`, `--init`ed before the sandboxed
-    execution, and `--cleanup`ed in a `finally` regardless of how this
-    function returns or raises. isolate's cgroup counters (`cg-mem`,
+    leased from `box_pool`, `--init`ed before the sandboxed execution, and
+    `--cleanup`ed in a `finally` regardless of how this function returns or
+    raises; the lease wraps the whole cycle so no other invocation's
+    `--init`/`--cleanup` can land on this box id while it's ours. isolate's
+    cgroup counters (`cg-mem`,
     `cg-oom-killed`) persist across `--run`s in the same box — verified
     with bare isolate, no involvement from this module (see module
     docstring for the precise before/after values). Of the two, only
@@ -937,189 +935,189 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     box that lives only from just before this one `--run` to just after it
     can never observe another call's counters, on any field.
     """
-    box_id = next(isolate.box_id_counter) % 65536
-    _init_box(isolate.binary, box_id)
-    try:
-        mounts: dict[Path, str] = {}
-
-        def _label(path: Path) -> str:
-            resolved = path.resolve()
-            if resolved not in mounts:
-                mounts[resolved] = f"/host{len(mounts)}"
-            return mounts[resolved]
-
-        file_io = io_input != "stdin" or io_output != "stdout"
-
-        bin_label = _label(binary.parent)
-        # The test directory is mounted ONLY in stdin mode, where `--stdin`
-        # has to name a path inside the box. In file-IO mode `--stdin` points
-        # at the staged copy (`{stage_label}/{staged_in.name}`) and this
-        # mount is referenced nowhere — dead weight that also handed the
-        # solution a readable `01.a` next to every `01.in`, i.e. the jury's
-        # answers. That exposure is not new (stdin mode has always mounted
-        # this directory, and still must), but in file-IO mode nothing is
-        # bought by it, so it goes.
-        stdin_label = _label(stdin_path.parent) if not file_io else None
-        stage_label = _label(isolate.stage_dir)
-        stage_dir_resolved = isolate.stage_dir.resolve()
-
-        if file_io and io_input == io_output:
-            # `problem_meta` refuses this at load time; this is the same
-            # check at the point of use, because `_run_once` is also called
-            # directly (tests, and anything that builds its own arguments)
-            # and the consequence is silent: the solution's output file is
-            # the staged *input* file, so a solution that writes nothing
-            # hands the test data back as its answer and the checker
-            # accepts it.
-            raise MatrixError(
-                f"io.input and io.output are both {io_input!r}: the "
-                "solution's output file would be the file it read the test "
-                "from, so a solution that wrote nothing would have the test "
-                "input itself checked as its answer. Give them different "
-                "names."
-            )
-        if file_io and (io_input == STAGED_STDOUT_NAME
-                        or io_output == STAGED_STDOUT_NAME):
-            raise MatrixError(
-                f"io.input/io.output may not be named {STAGED_STDOUT_NAME!r}: "
-                "that is the fixed name this driver stages the sandboxed "
-                "process's stdout under, so isolate and the solution would "
-                "write the same file (io.input="
-                f"{io_input!r}, io.output={io_output!r}) — rename the "
-                "problem's IO files."
-            )
-
-        # Everything the previous run left behind goes first — not just the
-        # names this driver knows. See `_clear_stage_dir` and the docstring
-        # above for the measured verdict corruption that motivates it.
-        _clear_stage_dir(isolate.stage_dir)
-        staged_out = isolate.stage_dir / STAGED_STDOUT_NAME
-
-        # In file-IO mode the solution reads and writes real files in its
-        # cwd, which must be the ONE `:rw` mount.
-        staged_in = staged_result = None
-        if file_io:
-            staged_in = isolate.stage_dir / io_input
-            staged_result = isolate.stage_dir / io_output
-            shutil.copyfile(stdin_path, staged_in)
-            # `run()` already granted the original test file the "other"
-            # read bit the mapped subuid needs (`_ensure_sandbox_readable`);
-            # the copy is created fresh at `0666 & ~umask` and would throw
-            # that away. Under a strict umask (077) the sandbox then cannot
-            # open its own input, and it surfaces as isolate's status:XX —
-            # i.e. as this driver blaming isolate for a permission bit it
-            # set itself. Re-grant it on the copy.
-            _ensure_sandbox_readable(staged_in)
-
-        cmd = [
-            isolate.binary, "--cg", f"--box-id={box_id}", "--run",
-            f"--meta={isolate.meta_path}", f"--processes={ISOLATE_PROCESSES}",
-            f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
-            f"--cg-mem={mem_limit_kb}", f"--fsize={OUTPUT_LIMIT_KB}",
-        ]
-        for resolved, label in mounts.items():
-            opt = ":rw" if resolved == stage_dir_resolved else ""
-            cmd.append(f"--dir={label}={resolved}{opt}")
-        cmd += [
-            f"--chdir={stage_label if file_io else bin_label}",
-            (f"--stdin={stage_label}/{staged_in.name}" if file_io
-             else f"--stdin={stdin_label}/{stdin_path.name}"),
-            f"--stdout={stage_label}/{staged_out.name}",
-            "--", f"{bin_label}/{binary.name}",
-        ]
-
-        subprocess.run(cmd, capture_output=True, text=True)
-        # isolate's own process exit code is not the contract here — 0 means
-        # OK but 1 covers TO/SG/RE alike, so it cannot distinguish them. The
-        # meta file is the actual contract (verified against this exact
-        # isolate build; see the module docstring and the task report for
-        # pasted output from all four cases).
+    with box_pool.lease() as box_id:
+        _init_box(isolate.binary, box_id)
         try:
-            meta_text = isolate.meta_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise MatrixError(
-                f"isolate produced no readable meta file for {binary} on "
-                f"{stdin_path}: {exc}"
-            ) from exc
-        if not meta_text.strip():
-            raise MatrixError(
-                f"isolate produced an empty meta file for {binary} on "
-                f"{stdin_path} — the sandboxed run did not report any outcome"
-            )
-        meta = _parse_meta(meta_text)
+            mounts: dict[Path, str] = {}
 
-        status = meta.get("status", "")  # absent -> OK; see module docstring trap 1
-        if status == "XX":
-            raise MatrixError(
-                f"isolate reported an internal error (status XX) running "
-                f"{binary} on {stdin_path}: {meta.get('message', '(no message)')} "
-                "— this is isolate's own failure, not a verdict on the solution."
-            )
+            def _label(path: Path) -> str:
+                resolved = path.resolve()
+                if resolved not in mounts:
+                    mounts[resolved] = f"/host{len(mounts)}"
+                return mounts[resolved]
 
-        oom = meta.get("cg-oom-killed") == "1"  # must be tested before treating
-        killed = status == "TO"                 # SG as a plain crash (trap 2)
-        crashed = (not oom) and status in ("RE", "SG")
-        message = meta.get("message", "")
+            file_io = io_input != "stdin" or io_output != "stdout"
 
-        try:
-            cpu_ms = int(round(float(meta.get("time", "0")) * 1000))
-            wall_ms = int(round(float(meta.get("time-wall", "0")) * 1000))
-            peak_kb = int(meta.get("max-rss", "0"))
-            exit_code = int(meta.get("exitcode", "0"))
-        except ValueError as exc:
-            raise MatrixError(
-                f"isolate meta file malformed for {binary} on {stdin_path}: "
-                f"{meta!r} ({exc})"
-            ) from exc
+            bin_label = _label(binary.parent)
+            # The test directory is mounted ONLY in stdin mode, where `--stdin`
+            # has to name a path inside the box. In file-IO mode `--stdin` points
+            # at the staged copy (`{stage_label}/{staged_in.name}`) and this
+            # mount is referenced nowhere — dead weight that also handed the
+            # solution a readable `01.a` next to every `01.in`, i.e. the jury's
+            # answers. That exposure is not new (stdin mode has always mounted
+            # this directory, and still must), but in file-IO mode nothing is
+            # bought by it, so it goes.
+            stdin_label = _label(stdin_path.parent) if not file_io else None
+            stage_label = _label(isolate.stage_dir)
+            stage_dir_resolved = isolate.stage_dir.resolve()
 
-        # Copy the sandboxed output back into the repository as *this*
-        # process — never write it through a bind mount again (see
-        # docstring above).
-        source = staged_result if file_io else staged_out
-        try:
-            # `lstat`, never `stat`: this asks what the *solution* left at
-            # that name, and following a symlink is precisely the thing being
-            # refused two branches down.
-            source_st = os.lstat(source)
-        except FileNotFoundError:
-            # In file-IO mode this is the reportable outcome `no_output`; in
-            # stdin mode isolate always created the file, so an absent one
-            # is not a fact about the solution and stays unreported.
-            data, no_output = b"", file_io
-        else:
-            _refuse_irregular_output(source_st, source, binary, stdin_path)
-            try:
-                data, no_output = source.read_bytes(), False
-            except OSError as exc:
-                # The file exists but this process cannot read it — reachable
-                # in file-IO mode because the *solution* owns that file: a
-                # `umask(077)` in the solution leaves it `-rw-------` under
-                # the sandbox's subuid, which is neither our uid nor our
-                # group, and we own only the directory, so we cannot even
-                # chmod it. Left bare this escaped `_run_once` as
-                # `PermissionError` and took the whole matrix down mid-run on
-                # one careless solution. Deliberately NOT folded into
-                # `no_output`: "we could not read it" and "it was never
-                # written" are different facts about the solution, and
-                # conflating them is how this project has produced wrong
-                # verdicts before.
+            if file_io and io_input == io_output:
+                # `problem_meta` refuses this at load time; this is the same
+                # check at the point of use, because `_run_once` is also called
+                # directly (tests, and anything that builds its own arguments)
+                # and the consequence is silent: the solution's output file is
+                # the staged *input* file, so a solution that writes nothing
+                # hands the test data back as its answer and the checker
+                # accepts it.
                 raise MatrixError(
-                    f"could not read the output file {source} that {binary} "
-                    f"produced on {stdin_path}: {exc} — the file exists but is "
-                    "not readable by this process (a solution that restricts "
-                    "its own output's permissions, e.g. umask(077), does this). "
-                    "That is not the same as producing no output at all, so it "
-                    "is reported rather than judged."
-                ) from exc
-        stdout_dest.unlink(missing_ok=True)
-        stdout_dest.write_bytes(data)
-        staged_out.unlink(missing_ok=True)
+                    f"io.input and io.output are both {io_input!r}: the "
+                    "solution's output file would be the file it read the test "
+                    "from, so a solution that wrote nothing would have the test "
+                    "input itself checked as its answer. Give them different "
+                    "names."
+                )
+            if file_io and (io_input == STAGED_STDOUT_NAME
+                            or io_output == STAGED_STDOUT_NAME):
+                raise MatrixError(
+                    f"io.input/io.output may not be named {STAGED_STDOUT_NAME!r}: "
+                    "that is the fixed name this driver stages the sandboxed "
+                    "process's stdout under, so isolate and the solution would "
+                    "write the same file (io.input="
+                    f"{io_input!r}, io.output={io_output!r}) — rename the "
+                    "problem's IO files."
+                )
 
-        return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
-                          crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
-                          status=status, message=message, no_output=no_output)
-    finally:
-        _cleanup_box(isolate.binary, box_id)
+            # Everything the previous run left behind goes first — not just the
+            # names this driver knows. See `_clear_stage_dir` and the docstring
+            # above for the measured verdict corruption that motivates it.
+            _clear_stage_dir(isolate.stage_dir)
+            staged_out = isolate.stage_dir / STAGED_STDOUT_NAME
+
+            # In file-IO mode the solution reads and writes real files in its
+            # cwd, which must be the ONE `:rw` mount.
+            staged_in = staged_result = None
+            if file_io:
+                staged_in = isolate.stage_dir / io_input
+                staged_result = isolate.stage_dir / io_output
+                shutil.copyfile(stdin_path, staged_in)
+                # `run()` already granted the original test file the "other"
+                # read bit the mapped subuid needs (`_ensure_sandbox_readable`);
+                # the copy is created fresh at `0666 & ~umask` and would throw
+                # that away. Under a strict umask (077) the sandbox then cannot
+                # open its own input, and it surfaces as isolate's status:XX —
+                # i.e. as this driver blaming isolate for a permission bit it
+                # set itself. Re-grant it on the copy.
+                _ensure_sandbox_readable(staged_in)
+
+            cmd = [
+                isolate.binary, "--cg", f"--box-id={box_id}", "--run",
+                f"--meta={isolate.meta_path}", f"--processes={ISOLATE_PROCESSES}",
+                f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
+                f"--cg-mem={mem_limit_kb}", f"--fsize={OUTPUT_LIMIT_KB}",
+            ]
+            for resolved, label in mounts.items():
+                opt = ":rw" if resolved == stage_dir_resolved else ""
+                cmd.append(f"--dir={label}={resolved}{opt}")
+            cmd += [
+                f"--chdir={stage_label if file_io else bin_label}",
+                (f"--stdin={stage_label}/{staged_in.name}" if file_io
+                 else f"--stdin={stdin_label}/{stdin_path.name}"),
+                f"--stdout={stage_label}/{staged_out.name}",
+                "--", f"{bin_label}/{binary.name}",
+            ]
+
+            subprocess.run(cmd, capture_output=True, text=True)
+            # isolate's own process exit code is not the contract here — 0 means
+            # OK but 1 covers TO/SG/RE alike, so it cannot distinguish them. The
+            # meta file is the actual contract (verified against this exact
+            # isolate build; see the module docstring and the task report for
+            # pasted output from all four cases).
+            try:
+                meta_text = isolate.meta_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise MatrixError(
+                    f"isolate produced no readable meta file for {binary} on "
+                    f"{stdin_path}: {exc}"
+                ) from exc
+            if not meta_text.strip():
+                raise MatrixError(
+                    f"isolate produced an empty meta file for {binary} on "
+                    f"{stdin_path} — the sandboxed run did not report any outcome"
+                )
+            meta = _parse_meta(meta_text)
+
+            status = meta.get("status", "")  # absent -> OK; see module docstring trap 1
+            if status == "XX":
+                raise MatrixError(
+                    f"isolate reported an internal error (status XX) running "
+                    f"{binary} on {stdin_path}: {meta.get('message', '(no message)')} "
+                    "— this is isolate's own failure, not a verdict on the solution."
+                )
+
+            oom = meta.get("cg-oom-killed") == "1"  # must be tested before treating
+            killed = status == "TO"                 # SG as a plain crash (trap 2)
+            crashed = (not oom) and status in ("RE", "SG")
+            message = meta.get("message", "")
+
+            try:
+                cpu_ms = int(round(float(meta.get("time", "0")) * 1000))
+                wall_ms = int(round(float(meta.get("time-wall", "0")) * 1000))
+                peak_kb = int(meta.get("max-rss", "0"))
+                exit_code = int(meta.get("exitcode", "0"))
+            except ValueError as exc:
+                raise MatrixError(
+                    f"isolate meta file malformed for {binary} on {stdin_path}: "
+                    f"{meta!r} ({exc})"
+                ) from exc
+
+            # Copy the sandboxed output back into the repository as *this*
+            # process — never write it through a bind mount again (see
+            # docstring above).
+            source = staged_result if file_io else staged_out
+            try:
+                # `lstat`, never `stat`: this asks what the *solution* left at
+                # that name, and following a symlink is precisely the thing being
+                # refused two branches down.
+                source_st = os.lstat(source)
+            except FileNotFoundError:
+                # In file-IO mode this is the reportable outcome `no_output`; in
+                # stdin mode isolate always created the file, so an absent one
+                # is not a fact about the solution and stays unreported.
+                data, no_output = b"", file_io
+            else:
+                _refuse_irregular_output(source_st, source, binary, stdin_path)
+                try:
+                    data, no_output = source.read_bytes(), False
+                except OSError as exc:
+                    # The file exists but this process cannot read it — reachable
+                    # in file-IO mode because the *solution* owns that file: a
+                    # `umask(077)` in the solution leaves it `-rw-------` under
+                    # the sandbox's subuid, which is neither our uid nor our
+                    # group, and we own only the directory, so we cannot even
+                    # chmod it. Left bare this escaped `_run_once` as
+                    # `PermissionError` and took the whole matrix down mid-run on
+                    # one careless solution. Deliberately NOT folded into
+                    # `no_output`: "we could not read it" and "it was never
+                    # written" are different facts about the solution, and
+                    # conflating them is how this project has produced wrong
+                    # verdicts before.
+                    raise MatrixError(
+                        f"could not read the output file {source} that {binary} "
+                        f"produced on {stdin_path}: {exc} — the file exists but is "
+                        "not readable by this process (a solution that restricts "
+                        "its own output's permissions, e.g. umask(077), does this). "
+                        "That is not the same as producing no output at all, so it "
+                        "is reported rather than judged."
+                    ) from exc
+            stdout_dest.unlink(missing_ok=True)
+            stdout_dest.write_bytes(data)
+            staged_out.unlink(missing_ok=True)
+
+            return RunResult(cpu_ms=cpu_ms, wall_ms=wall_ms, killed=killed, oom=oom,
+                              crashed=crashed, exit_code=exit_code, peak_kb=peak_kb,
+                              status=status, message=message, no_output=no_output)
+        finally:
+            _cleanup_box(isolate.binary, box_id)
 
 
 def _time_median(isolate: IsolateHandle, binary: Path, stdin_path: Path,
