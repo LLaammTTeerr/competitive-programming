@@ -1525,6 +1525,13 @@ The warning in `README.md` and the constraint repeated in the plan documents are
 **Interfaces:**
 - Consumes: the env var names from Task 1 (`RUN_MATRIX_BOX_POOL`, `RUN_MATRIX_BOX_LOCK_DIR`) and the provenance fields from Task 5
 
+> **What actually shipped, which this task must describe rather than the plan's original prose.** Four things changed after this section was written; document what exists, not what was specified.
+>
+> 1. **The pool is per-user**, not machine-wide: `/run/user/<uid>/run_matrix-boxes`, falling back to `/tmp/run_matrix-boxes-<uid>`. Two *different users* running `run_matrix` on one machine can still collide on an isolate box id — caught loudly by isolate's own lock, never silently, but not prevented. Say so.
+> 2. **A wall-clock kill is re-timed serially; a CPU-time kill is not.** The one-sided contention argument is about CPU time. Wall-time inflation is not bounded by `CONTENTION_BOUND`, because a descheduled process accrues wall time while accruing no CPU time, so a wall-killed run could otherwise mask a hole. Keeping the CPU-kill short-circuit is what preserves the speedup, since ordinary TL solutions dominate the wall clock.
+> 3. **Oversubscription is the one way to invalidate the contention model**, and `pool_size()` currently accepts values far above the core count with no guard. `RUN_MATRIX_BOX_POOL` above `nproc` is what makes wall-clock kills reachable in the first place. Document this as an operator hazard, in the same breath as the knob itself — a reader who learns the knob exists must learn its bound at the same time.
+> 4. **The measured result, not the projection.** `goldenseed` (13 solutions, 45 tests, 546 results): 182.4s serial → 65.4s at 4 workers, **2.79x**, with verdicts, holes, mismatches and TL/kill limits identical and 1 of 546 results re-timed serially. Quote measurements; the plan's earlier 2.3x was a projection and should not be presented as a result.
+
 - [ ] **Step 1: Write the failing test**
 
 Add to `tools/tests/test_skill_docs.py`:
