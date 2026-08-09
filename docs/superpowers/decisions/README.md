@@ -1,6 +1,6 @@
 # Decision records
 
-The five SDD run ledgers, moved here from `.superpowers/sdd/*/progress.md` so
+The six SDD run ledgers, moved here from `.superpowers/sdd/*/progress.md` so
 they survive. That directory is git-ignored scratch: `git clean -fdx` would
 have destroyed every ruling below, and the rulings are the part that outlives
 the run.
@@ -17,6 +17,7 @@ current code, the code wins and the ledger tells you what someone believed.
 | [`2026-07-30-problem-setting-stage-2`](2026-07-30-problem-setting-stage-2.md) | `shaping-`/`reviewing-`/`creating-problems` | PR #4, 214 tests |
 | [`2026-07-31-file-io-support`](2026-07-31-file-io-support.md) | file-based IO, `NO_OUTPUT`, routing table | PR #5, 270 tests |
 | [`2026-08-09-parallel-invocation-matrix`](2026-08-09-parallel-invocation-matrix.md) | per-user box-id lease pool, reentrant `_run_once`, parallel pass 2 | 321 tests, 2.79x measured |
+| [`2026-08-09-matrix-followups`](2026-08-09-matrix-followups.md) | exit-code contract at `main()`, staleness gate on `invocation.json` | 353 tests |
 
 ---
 
