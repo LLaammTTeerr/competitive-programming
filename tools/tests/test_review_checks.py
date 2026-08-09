@@ -1,4 +1,4 @@
-import json, shutil, tempfile, unittest
+import json, os, shutil, tempfile, unittest
 from pathlib import Path
 
 from tools.review_checks import KINDS, run
@@ -195,6 +195,62 @@ class TestRun(unittest.TestCase):
         findings = self.only("stale-constraints-header")
         self.assertEqual(findings[0].severity, "low")
         self.assertIn("Identifier collision", findings[0].what)
+
+    # --- coordinator review round: `_matrix()` here is the sibling of
+    # `package_status._matrix()` and had the identical staleness hole —
+    # fixed by sharing `package_status.newest_source_mtime` rather than
+    # duplicating it, so the two checks cannot silently drift apart again.
+
+    def test_a_stale_matrix_is_reported(self):
+        (self.dir / "invocation.json").write_text(json.dumps(
+            {"schema": 1, "holes": [], "mismatches": []}), encoding="utf-8")
+        later = (self.dir / "invocation.json").stat().st_mtime + 10
+        os.utime(self.dir / "solutions" / "sol-main.cpp", (later, later))
+        findings = self.only("stale-matrix")
+        self.assertEqual(findings[0].severity, "high")
+
+    def test_a_stale_matrix_suppresses_hole_findings(self):
+        # Staleness is reported instead of holes/mismatches, not alongside
+        # them: a stale invocation.json's holes describe a package state
+        # that no longer exists, and surfacing them here would be citing
+        # evidence about a different tree as though it were current.
+        (self.dir / "invocation.json").write_text(json.dumps(
+            {"schema": 1, "holes": [{"solution": "sol-wrong.cpp", "group": "g1",
+                                     "expected": "WA", "actual": "OK"}],
+             "mismatches": []}), encoding="utf-8")
+        later = (self.dir / "invocation.json").stat().st_mtime + 10
+        os.utime(self.dir / "solutions" / "sol-main.cpp", (later, later))
+        kinds = self.kinds()
+        self.assertIn("stale-matrix", kinds)
+        self.assertNotIn("matrix-hole", kinds)
+
+    def test_a_fresh_matrix_with_holes_is_not_reported_as_stale(self):
+        # Contrast case: a genuinely current invocation.json with real
+        # holes must still surface `matrix-hole`, not `stale-matrix` — the
+        # staleness check must not fire just because holes are present.
+        (self.dir / "invocation.json").write_text(json.dumps(
+            {"schema": 1, "holes": [{"solution": "sol-wrong.cpp", "group": "g1",
+                                     "expected": "WA", "actual": "OK"}],
+             "mismatches": []}), encoding="utf-8")
+        kinds = self.kinds()
+        self.assertIn("matrix-hole", kinds)
+        self.assertNotIn("stale-matrix", kinds)
+
+    def test_a_stale_custom_checker_is_reported(self):
+        # The custom checker decides every cell's verdict and lives under
+        # `files/`, outside `problem.json`/`solutions/`/`tests/` entirely
+        # -- declare one, then edit it after invocation.json is written.
+        problem = json.loads((self.dir / "problem.json").read_text(encoding="utf-8"))
+        problem["checker"] = {"kind": "custom", "name": "checker.cpp"}
+        (self.dir / "problem.json").write_text(json.dumps(problem), encoding="utf-8")
+        checker = self.dir / "files" / "checker.cpp"
+        checker.parent.mkdir(exist_ok=True)
+        checker.write_text("// checker\n", encoding="utf-8")
+        (self.dir / "invocation.json").write_text(json.dumps(
+            {"schema": 1, "holes": [], "mismatches": []}), encoding="utf-8")
+        later = (self.dir / "invocation.json").stat().st_mtime + 10
+        os.utime(checker, (later, later))
+        self.assertIn("stale-matrix", self.kinds())
 
 
 class TestCleanPackageReturnsNoFindings(unittest.TestCase):

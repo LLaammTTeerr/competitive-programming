@@ -2,7 +2,9 @@ import contextlib
 import json, os, shutil, tempfile, unittest
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
+from tools import problem_meta
 from tools.package_status import PHASE_ORDER, _matrix, main, next_phase, status
 
 # Anchored to this file, not to the process's working directory: the suite is
@@ -214,15 +216,24 @@ class MatrixFreshnessTest(unittest.TestCase):
             encoding="utf-8")
         return d
 
+    def _problem(self, d):
+        """`_matrix` takes the already-loaded `Problem` the same way every
+        other multi-arg phase function in this module does (see `_checker`,
+        `_tests`) — it needs `checker_kind`/`checker_name` to know whether a
+        custom checker is in scope. Loaded fresh per call so tests that
+        mutate `problem.json` (none currently do in this class) would still
+        see their own edit."""
+        return problem_meta.load(d / "problem.json")
+
     def test_a_fresh_clean_matrix_passes(self):
         d = self._package()
-        self.assertTrue(_matrix(d).done)
+        self.assertTrue(_matrix(d, self._problem(d)).done)
 
     def test_an_invocation_older_than_a_solution_is_stale(self):
         d = self._package()
         later = (d / "invocation.json").stat().st_mtime + 10
         os.utime(d / "solutions" / "sol-main.cpp", (later, later))
-        phase = _matrix(d)
+        phase = _matrix(d, self._problem(d))
         self.assertFalse(phase.done)
         self.assertIn("stale", phase.detail.lower())
 
@@ -231,13 +242,13 @@ class MatrixFreshnessTest(unittest.TestCase):
         later = (d / "invocation.json").stat().st_mtime + 10
         test_file = next((d / "tests").rglob("*.in"))
         os.utime(test_file, (later, later))
-        self.assertFalse(_matrix(d).done)
+        self.assertFalse(_matrix(d, self._problem(d)).done)
 
     def test_an_invocation_older_than_problem_json_is_stale(self):
         d = self._package()
         later = (d / "invocation.json").stat().st_mtime + 10
         os.utime(d / "problem.json", (later, later))
-        self.assertFalse(_matrix(d).done)
+        self.assertFalse(_matrix(d, self._problem(d)).done)
 
     def test_staleness_is_reported_before_holes(self):
         # A stale artifact reporting zero holes must not read as "clean".
@@ -246,14 +257,14 @@ class MatrixFreshnessTest(unittest.TestCase):
         d = self._package()
         later = (d / "invocation.json").stat().st_mtime + 10
         os.utime(d / "problem.json", (later, later))
-        self.assertIn("stale", _matrix(d).detail.lower())
+        self.assertIn("stale", _matrix(d, self._problem(d)).detail.lower())
 
     def test_a_stale_artifact_with_holes_still_fails(self):
         d = self._package(holes=[{"solution": "x", "group": "g1",
                                   "expected": "WA", "actual": "OK"}])
         later = (d / "invocation.json").stat().st_mtime + 10
         os.utime(d / "problem.json", (later, later))
-        self.assertFalse(_matrix(d).done)
+        self.assertFalse(_matrix(d, self._problem(d)).done)
 
     def test_an_equal_mtime_is_not_stale(self):
         # Boundary: a file written in the same second as the artifact is
@@ -262,7 +273,116 @@ class MatrixFreshnessTest(unittest.TestCase):
         d = self._package()
         stamp = (d / "invocation.json").stat().st_mtime
         os.utime(d / "problem.json", (stamp, stamp))
-        self.assertTrue(_matrix(d).done)
+        self.assertTrue(_matrix(d, self._problem(d)).done)
+
+    # --- coordinator review round: deletions, the custom checker, and the
+    # two unguarded `.stat()` races the review's empirical coverage map
+    # found ------------------------------------------------------------
+
+    def test_a_deleted_test_is_stale(self):
+        # A *removed* test file bumps no remaining file's mtime — only its
+        # parent directory's. Missing that was a false "fresh": the gate
+        # would report "clean" over a suite quietly made weaker than the
+        # invocation.json on disk claims to have exercised.
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        test_file = next((d / "tests").rglob("*.in"))
+        parent = test_file.parent
+        test_file.unlink()
+        os.utime(parent, (later, later))
+        phase = _matrix(d, self._problem(d))
+        self.assertFalse(phase.done)
+        self.assertIn("stale", phase.detail.lower())
+
+    def test_a_deleted_solution_is_stale(self):
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        sol_dir = d / "solutions"
+        (sol_dir / "sol-wrong.cpp").unlink()
+        os.utime(sol_dir, (later, later))
+        self.assertFalse(_matrix(d, self._problem(d)).done)
+
+    def test_an_edited_custom_checker_is_stale(self):
+        # A custom checker decides OK vs WA on every cell of the matrix —
+        # not covered by `problem.json`/`solutions/`/`tests/` at all, since
+        # it lives under `files/`. Declare one, create it, then edit it
+        # after `invocation.json` is written.
+        d = self._package()
+        meta_path = d / "problem.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["checker"] = {"kind": "custom", "name": "checker.cpp"}
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        checker = d / "files" / "checker.cpp"
+        checker.write_text("// custom checker\n", encoding="utf-8")
+        (d / "invocation.json").write_text(
+            json.dumps({"schema": 1, "holes": [], "mismatches": []}),
+            encoding="utf-8")
+        later = (d / "invocation.json").stat().st_mtime + 10
+        os.utime(checker, (later, later))
+        phase = _matrix(d, self._problem(d))
+        self.assertFalse(phase.done)
+        self.assertIn("stale", phase.detail.lower())
+
+    def test_editing_files_other_than_a_custom_checker_is_not_stale(self):
+        # The narrowness ruling, pinned rather than just commented: editing
+        # `files/validator.cpp` does not change any recorded verdict until
+        # the tests it produces are regenerated (already caught by the
+        # `tests/` walk), so widening this check to all of `files/` would
+        # add false-staleness for no gain. A prior version of this test
+        # only confirmed a fresh package was fresh without ever touching
+        # `files/` at all -- it could not have failed even if the walk
+        # were widened to cover the whole directory, which is exactly the
+        # kind of test this project's evidence standard rules out.
+        d = self._package()
+        self.assertEqual(self._problem(d).checker_kind, "stock")
+        later = (d / "invocation.json").stat().st_mtime + 10
+        os.utime(d / "files" / "validator.cpp", (later, later))
+        self.assertTrue(_matrix(d, self._problem(d)).done)
+
+    def test_a_vanishing_invocation_json_between_read_and_stat_does_not_raise(self):
+        # `path.exists()` and `path.read_text()` already succeeded by the
+        # time `_matrix` calls `path.stat()` for the artifact's own mtime —
+        # a race in that microscopic window (something unlinks
+        # invocation.json between the read and the stat) must not turn a
+        # read-only status check into an uncaught OSError. Driven by
+        # monkeypatching `Path.stat` to fail for exactly this path, real
+        # `stat()` for everything else.
+        d = self._package()
+        target = d / "invocation.json"
+        real_stat = Path.stat
+
+        def flaky_stat(self, *args, **kwargs):
+            if self == target:
+                raise OSError("simulated race: invocation.json vanished")
+            return real_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", flaky_stat):
+            phase = _matrix(d, self._problem(d))
+        self.assertFalse(phase.done)
+        self.assertIn("unreadable", phase.detail.lower())
+
+    def test_a_file_that_vanishes_during_the_source_walk_does_not_raise(self):
+        # Same race, one level down: `newest_source_mtime`'s walk lists a
+        # child via `rglob` and then `.stat()`s it — a file legitimately
+        # unlinked in between (this is literally what `run_matrix` itself
+        # does to `.a` files: `unlink(missing_ok=True)` then
+        # `write_bytes`) must not raise either. `_mtime_or_zero` is what's
+        # supposed to guard this; this exercises that guard directly rather
+        # than trusting it was wired in everywhere it needed to be.
+        d = self._package()
+        victim = next((d / "tests").rglob("*.in"))
+        real_stat = Path.stat
+
+        def flaky_stat(self, *args, **kwargs):
+            if self == victim:
+                raise OSError("simulated race: unlinked mid-walk")
+            return real_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", flaky_stat):
+            phase = _matrix(d, self._problem(d))
+        # A vanished file contributes 0.0, not a crash, and cannot itself
+        # manufacture staleness -- the package is otherwise untouched.
+        self.assertTrue(phase.done)
 
 
 class TestMain(unittest.TestCase):
