@@ -120,9 +120,27 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
 #          validator/generator edits, which is the exact failure narrowing
 #          to just the checker file was meant to avoid. See
 #          `extra_matrix_files`'s docstring for the full trade.
-#     (2) through (5) are accepted gaps, not fixed here — flagged for a
+#       6. The artifact's own mtime reading *high*, not a source reading
+#          low: `invocation.json` stamped in the future by a clock stepped
+#          back after the run (an NTP correction, a VM suspended and later
+#          resumed, a dual-boot machine with a local-time RTC), or a
+#          package copied in from a machine whose clock ran fast, compares
+#          as fresh against every edit made afterwards until real time
+#          catches up to the stamp. A different mechanism from (2)
+#          (mtime-preserving copies pin a *source* mtime low); this pins
+#          the *artifact* mtime high, and nothing here clamps either
+#          against a trusted clock, because this module has no trusted
+#          clock to clamp against.
+#     (2) through (6) are accepted gaps, not fixed here — flagged for a
 #     reader deciding how much to trust this gate, not concealed by a
 #     comment that only named the safe direction.
+#
+# Out of scope entirely, not just unwalked: the stock checker, `testlib.h`,
+# and the compiler are externally owned, not package content, so this gate
+# never diffs them against the current checkout — `invocation.json`'s
+# `machine` block pins their identity (the testlib git revision, the g++
+# version) for provenance, but that pin is read by a human comparing runs,
+# never by this check.
 #
 # `generated_at` inside the payload was considered and rejected as the
 # source of truth: it records when the matrix ran, not what it ran against,

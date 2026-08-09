@@ -1927,15 +1927,16 @@ def main(argv: list[str]) -> int:
             is a plain `OSError`, not anything under `tools/`). Nothing
             that happens while sizing up whether the matrix could run
             reaches a caller as exit 1.
-            A message on stderr; for `PACKAGE_ERRORS` a one-line message
-            naming the package problem, for anything else the full
+            A message on stderr; for `PACKAGE_ERRORS` a message naming the
+            package problem, with no traceback, for anything else the full
             traceback (`traceback.print_exc()`) so the failure is not
             hidden, just correctly coded. Nothing on stdout either way.
 
     Two tiers, deliberately not one `except Exception`: `PACKAGE_ERRORS` are
     problems in the *package* — a user can act on "malformed problem.json"
-    without seeing a stack trace, and the one-line message is more useful to
-    them than 40 lines of this driver's internals. Everything else is
+    without seeing a stack trace, and a message naming the problem, with no
+    traceback, is more useful to them than 40 lines of this driver's
+    internals. Everything else is
     unexpected — some driver bug or environment condition this pipeline
     never named — and for those the traceback is the useful artifact; only
     the *exit code* changes from the Python default, to the one that

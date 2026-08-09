@@ -358,8 +358,9 @@ crash being read as a finding:
   malformed `@expect` header on a solution, a corrupted `flags.json`, or
   (a driver bug or an unnamed environment failure, e.g. a full or
   read-only disk) any other exception the driver could not name. For the
-  named package problems the message is one line; for everything else it
-  is the full traceback — either way, nothing on stdout. This is a defect
+  named package problems the message names the problem with no traceback;
+  for everything else it is the full traceback — either way, nothing on
+  stdout. This is a defect
   in the *package or the machine*, not a finding about the test suite —
   fix what the message (or, for the traceback case, the failure it
   describes) names and run it again.
