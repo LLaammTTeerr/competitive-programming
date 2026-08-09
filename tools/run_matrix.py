@@ -1571,9 +1571,11 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
                          "process accrues wall time without accruing CPU "
                          "time), so it cannot be trusted as a genuine TL "
                          "under contention",
-                    assumed=f"re-timed {runs}x serially with every worker "
-                            f"idle; the median came out {r.cpu_ms} ms CPU "
-                            f"time, {r.wall_ms} ms wall time",
+                    assumed=f"re-timed {runs}x serially with every one of "
+                            f"this process's own workers idle (a sibling "
+                            f"run_matrix invocation could still have been "
+                            f"running); the median came out {r.cpu_ms} ms "
+                            f"CPU time, {r.wall_ms} ms wall time",
                     changes_if_wrong=f"the expected tag of {name}")
             else:
                 flags.append(
@@ -1582,8 +1584,10 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
                     what=f"{name} on {group}/{test.stem} measured {first_run_ms} ms "
                          f"CPU time with {workers} sandboxes running, close enough "
                          f"to TL {limits.tl_ms} that contention could have decided it",
-                    assumed=f"re-timed {runs}x serially with every worker idle; the "
-                            f"median came out {r.cpu_ms} ms",
+                    assumed=f"re-timed {runs}x serially with every one of "
+                            f"this process's own workers idle (a sibling "
+                            f"run_matrix invocation could still have been "
+                            f"running); the median came out {r.cpu_ms} ms",
                     changes_if_wrong=f"the expected tag of {name}")
         outcome = _classify(r, checker, test, out, answer, limits)
         if outcome.banded:

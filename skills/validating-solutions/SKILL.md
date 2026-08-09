@@ -303,7 +303,11 @@ recorded rather than only inferred.
 
 The matrix runs several sandboxes at once (half this machine's CPUs by
 default; `RUN_MATRIX_BOX_POOL=N` to change it, `RUN_MATRIX_BOX_POOL=1` for a
-fully quiesced run — do not raise it past the machine's core count, since
+fully quiesced run *provided this is the only `run_matrix` invocation on the
+machine* — a sibling invocation at a higher pool size will still sweep the
+other lease ids while yours holds the one it was given, so `POOL=1` only
+quiesces the machine when nothing else is drawing from the same pool — do
+not raise it past the machine's core count, since
 nothing bounds wall-time inflation the way `CONTENTION_BOUND` bounds CPU
 time, so oversubscription is where wall-clock kills start showing up).
 Running it in parallel with
