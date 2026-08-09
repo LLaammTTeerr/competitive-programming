@@ -1440,6 +1440,20 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
     return classify(r.cpu_ms, r.killed, verdict_src, limits)
 
 
+def _is_wall_clock_kill(message: str) -> bool:
+    """True when a `status:TO` kill was isolate's wall-clock ceiling, not
+    its CPU one.
+
+    isolate's own `status:TO` fires for either kill; only the message text
+    ("Time limit exceeded (wall clock)" vs plain "Time limit exceeded")
+    tells them apart (verified against a real `sleep()`-bound run). Pass 1
+    (`run()`) and pass 2 (`_run_pass2`) both need this distinction, so it
+    lives in exactly one place rather than being reimplemented at each call
+    site.
+    """
+    return "wall clock" in message.lower()
+
+
 def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
                manifest: dict, binaries: dict[str, Path], checker: Path,
                tests: dict[str, list[Path]], limits: Limits,
@@ -1451,16 +1465,31 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
     measures `t_main`, from which `compute_limits` derives TL: timing the
     model solution under contention inflates TL, and an inflated TL lets
     genuinely-too-slow solutions pass, which manufactures holes — the one
-    claim this pipeline makes that has to be true. Pass 1 is also 1-6% of
-    the wall clock on every real package measured, so serialising it costs
-    almost nothing.
+    claim this pipeline makes that has to be true. Pass 1 is also a small
+    share of the wall clock relative to pass 2 (the plan's own analysis put
+    it at 1-6% across the packages it measured — not re-verified by this
+    task; this task's own measurement is `goldenseed`: 182.4s serial to
+    65.4s at 4 workers, 2.79x), so serialising it costs almost nothing.
 
     Two phases. The first fans out; the second re-times, **serially and with
-    every worker idle**, only those results `needs_serial_retime` calls
-    undecidable. That set is tiny in practice — 18 of 5508 results across
-    the eight packages this was measured on — because contention is
-    one-sided and a kernel kill therefore still implies a genuine TL (see
-    `matrix_core.needs_serial_retime`).
+    every worker idle**, only those results that are undecidable under
+    contention: `needs_serial_retime` calls a CPU-time measurement
+    undecidable when it lands close enough to TL that contention could have
+    decided it (that set is tiny in practice — the plan's own analysis put
+    it at 18 of 5508 results across the packages it measured, not
+    re-verified by this task; `goldenseed` alone saw 1 of 546 — because
+    contention is one-sided and a kernel *CPU*-time kill therefore still
+    implies a genuine TL, see `matrix_core.needs_serial_retime`), and this
+    function additionally re-times any **wall-clock** kill unconditionally,
+    because `needs_serial_retime`'s CPU-time bound (`CONTENTION_BOUND`)
+    says nothing about wall time: a descheduled process accrues wall time
+    without accruing CPU time, so a solution that genuinely finishes under
+    TL can still be wall-killed under contention, and left unflagged that
+    is a `TL` verdict matching an `@expect TL` declaration — a real hole,
+    silently masked. A CPU-time kill keeps `needs_serial_retime`'s existing
+    short-circuit (never ambiguous); only the wall-clock case is treated
+    differently, and it is why `_is_wall_clock_kill` mirrors pass 1's own
+    kill-kind check exactly rather than reimplementing it.
 
     Threads, not processes: every unit of work is a `subprocess.run` on
     isolate, which releases the GIL, and the workers share one
@@ -1468,10 +1497,11 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
     own staging directory, so no state is shared between them; the shared
     handle carries only the two roots those live under.
 
-    A `MatrixError` raised in any worker propagates out of `.result()` (via
-    `pool.map`, which re-raises it here) and aborts the matrix. That is
-    deliberate: every `MatrixError` in this driver means "this run cannot be
-    judged", and turning one into a verdict is precisely the
+    A `MatrixError` raised in any worker propagates out of iterating
+    `pool.map`'s results; un-started work is cancelled and in-flight runs
+    complete, so the abort costs at most one round of `workers` runs. That
+    is deliberate: every `MatrixError` in this driver means "this run
+    cannot be judged", and turning one into a verdict is precisely the
     confidently-wrong outcome the whole module refuses.
     """
     cpu_limit_s = limits.kill_ms / 1000.0
@@ -1496,21 +1526,54 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
     results, actual = [], {}
     for (name, group, test), out, r in measured:
         answer = test.with_suffix(".a")
-        retimed = needs_serial_retime(r.cpu_ms, r.killed, limits) if workers > 1 else False
+        # `needs_serial_retime` short-circuits to False whenever `killed` is
+        # true, and its justification (`kill_ms / bound > tl_ms`) is about
+        # CPU time — `CONTENTION_BOUND` bounds CPU-time inflation, not
+        # wall-time inflation. A wall-clock kill is a different failure mode
+        # entirely: a descheduled process accrues wall time without
+        # accruing CPU time, so nothing bounds how far contention can push
+        # a genuinely-fast solution's wall clock past its wall ceiling. Left
+        # unchecked, a solution declared TL that actually finishes under TL
+        # gets wall-killed, `expected == actual`, and a real hole is masked
+        # — the one non-circular claim this pipeline makes. So a wall kill
+        # gets its own re-time here, alongside (not instead of)
+        # `needs_serial_retime`'s CPU-time case; a CPU kill keeps the
+        # existing short-circuit (it is never ambiguous — see
+        # `matrix_core.needs_serial_retime`).
+        wall_killed = r.killed and _is_wall_clock_kill(r.message)
+        retimed = workers > 1 and (
+            needs_serial_retime(r.cpu_ms, r.killed, limits) or wall_killed)
         if retimed:
             first_run_ms = r.cpu_ms
             r = _time_median(isolate, binaries[name], test, out,
                              cpu_limit_s, wall_limit_s, mem_limit_kb, runs,
                              io_input=problem.input, io_output=problem.output)
-            flags.append(
-                problem_dir, phase="validate-solutions", severity="low",
-                kind="timing-band",
-                what=f"{name} on {group}/{test.stem} measured {first_run_ms} ms "
-                     f"CPU time with {workers} sandboxes running, close enough "
-                     f"to TL {limits.tl_ms} that contention could have decided it",
-                assumed=f"re-timed {runs}x serially with every worker idle; the "
-                        f"median came out {r.cpu_ms} ms",
-                changes_if_wrong=f"the expected tag of {name}")
+            if wall_killed:
+                flags.append(
+                    problem_dir, phase="validate-solutions", severity="low",
+                    kind="timing-band",
+                    what=f"{name} on {group}/{test.stem} was killed by "
+                         f"isolate's wall-clock ceiling with {workers} "
+                         "sandboxes running — a wall-clock kill is not "
+                         "bounded by the contention model (CONTENTION_BOUND "
+                         "covers CPU-time inflation only; a descheduled "
+                         "process accrues wall time without accruing CPU "
+                         "time), so it cannot be trusted as a genuine TL "
+                         "under contention",
+                    assumed=f"re-timed {runs}x serially with every worker "
+                            f"idle; the median came out {r.cpu_ms} ms CPU "
+                            f"time, {r.wall_ms} ms wall time",
+                    changes_if_wrong=f"the expected tag of {name}")
+            else:
+                flags.append(
+                    problem_dir, phase="validate-solutions", severity="low",
+                    kind="timing-band",
+                    what=f"{name} on {group}/{test.stem} measured {first_run_ms} ms "
+                         f"CPU time with {workers} sandboxes running, close enough "
+                         f"to TL {limits.tl_ms} that contention could have decided it",
+                    assumed=f"re-timed {runs}x serially with every worker idle; the "
+                            f"median came out {r.cpu_ms} ms",
+                    changes_if_wrong=f"the expected tag of {name}")
         outcome = _classify(r, checker, test, out, answer, limits)
         if outcome.banded:
             first_run_ms = r.cpu_ms
@@ -1652,7 +1715,7 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                     # against a real sleep()-bound run; see the task
                     # report), so it, not a hardcoded guess, picks which
                     # limit to name here.
-                    if "wall clock" in r.message.lower():
+                    if _is_wall_clock_kill(r.message):
                         kind, limit_ms = "wall-clock", int(MODEL_SAFETY_WALL_S * 1000)
                     else:
                         kind, limit_ms = "CPU", int(MODEL_SAFETY_CPU_S * 1000)

@@ -2042,11 +2042,93 @@ class ParallelPassTest(TestRunMatrixFixture):
         self.assertTrue(any("worker" in f["assumed"] or "worker" in f["what"]
                             for f in banded))
 
+    def test_a_wall_clock_kill_is_retimed_serially_but_a_cpu_kill_is_not(self):
+        # needs_serial_retime's short-circuit on `killed` is justified by
+        # CPU-time arithmetic (kill_ms/bound > tl_ms): it says nothing about
+        # wall time. A descheduled process accrues wall time without
+        # accruing CPU time, so a wall-clock kill under contention is not
+        # bounded by CONTENTION_BOUND at all. Left unhandled, a solution
+        # that genuinely finishes under TL could be wall-killed under
+        # contention, land on TL, match an `@expect TL` declaration, and
+        # silently mask a real hole. The fix: `_run_pass2` re-times a
+        # wall-clock kill unconditionally, while a CPU-time kill keeps
+        # `needs_serial_retime`'s existing (correct, never-ambiguous)
+        # short-circuit — that contrast is the point, and preserving it is
+        # what keeps the speedup, since ordinary CPU-time TLs are the bulk
+        # of the wall clock.
+        #
+        # Fabricated by stubbing the runner, the same way the near-TL test
+        # above does: the `mini` fixture's two trivial solutions never
+        # actually get killed by either clock, so both kill kinds are
+        # injected on each solution's first pass-2 call only — a later call
+        # for the same binary is the serial re-time itself and must see a
+        # real (non-killed) measurement, or `retimed_serially` could never
+        # be observed to make a difference to the recorded verdict.
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+        fabricated_once = set()
+
+        def killed_after_pass1(isolate, binary, *rest, **kwargs):
+            r = real_run_once(isolate, binary, *rest, **kwargs)
+            if not seen["pass2"] or binary.stem in fabricated_once:
+                return r
+            fabricated_once.add(binary.stem)
+            if binary.stem == "sol-main":
+                # A wall-clock kill: cpu_ms stays low (the process was
+                # descheduled, not slow), only wall time blew past the
+                # ceiling.
+                return dataclasses.replace(
+                    r, killed=True, cpu_ms=50,
+                    message="Time limit exceeded (wall clock)")
+            # A CPU-time kill on the other solution: never ambiguous, must
+            # not be re-timed.
+            return dataclasses.replace(r, killed=True,
+                                       message="Time limit exceeded")
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", killed_after_pass1), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        by_solution = {r["solution"]: r for r in payload["results"]}
+        wall = by_solution["sol-main.cpp"]
+        cpu = by_solution["sol-wrong.cpp"]
+
+        self.assertTrue(wall["retimed_serially"],
+                        "a wall-clock kill under contention must be re-timed")
+        self.assertFalse(cpu["retimed_serially"],
+                         "a CPU-time kill is never ambiguous and must not "
+                         "be re-timed")
+        # The re-time used the real (fast, non-killed) measurement, so the
+        # wall-killed solution's TL is corrected — exactly the masked hole
+        # this fix closes. The CPU kill, never re-timed, stays TL.
+        self.assertFalse(wall["killed"])
+        self.assertEqual(cpu["verdict"], "TL")
+
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(
+            any("wall-clock" in f["what"] and "sol-main.cpp" in f["what"]
+                for f in banded),
+            "the wall-clock kill produced no flag naming it")
+
     def test_a_matrix_error_in_one_worker_surfaces_from_run(self):
         # A worker's MatrixError must propagate out of the pool, not be
-        # swallowed into a verdict. Forced by making the *staged output* of
-        # every run unreadable, which is the real MatrixError path in
-        # `_run_once` (a solution that umask(077)s its own output file).
+        # swallowed into a verdict. Forced directly, by stubbing `_run_once`
+        # to raise `MatrixError` after pass 1 has finished with it — this
+        # exercises the propagation path itself (pool.map -> run()) rather
+        # than any specific real-world trigger of a MatrixError inside
+        # `_run_once` (an unreadable staged output, a umask(077)'d solution,
+        # etc. are exercised by their own dedicated tests elsewhere in this
+        # file).
         os.environ["RUN_MATRIX_BOX_POOL"] = "4"
         real_run_once = run_matrix._run_once
         calls = []
