@@ -18,11 +18,12 @@ module is that mechanism.
 
 from __future__ import annotations
 
+import inspect
 import re
 import unittest
 from pathlib import Path
 
-from tools import run_matrix
+from tools import box_pool, run_matrix
 from tools.matrix_core import _SEVERITY
 from tools.package_status import PHASE_ORDER
 from tools.scan_solutions import VERDICTS
@@ -475,17 +476,30 @@ class TestParallelSafetyDocs(unittest.TestCase):
     "run it alone" warning trained readers to serialise work that no longer
     needs it, and a stale safety warning is worse than none — these guard
     against it creeping back in.
+
+    Pinned against the code's own names, not string literals copied from
+    prose: renaming `box_pool.POOL_ENV`/`LOCK_DIR_ENV` or the
+    `"retimed_serially"` payload key should fail these tests, the same way
+    `test_prose_names_the_drivers_real_staged_stdout_file` above is pinned
+    to `run_matrix.STAGED_STDOUT_NAME` rather than a copy of the string.
     """
 
     def test_readme_no_longer_claims_the_tools_are_serial_only(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertNotIn("not parallel-safe", readme)
-        self.assertIn("RUN_MATRIX_BOX_POOL", readme)
+        self.assertIn(box_pool.POOL_ENV, readme)
+        self.assertIn(box_pool.LOCK_DIR_ENV, readme)
 
     def test_validating_solutions_documents_the_worker_knob(self):
         skill = skill_text("validating-solutions")
-        self.assertIn("RUN_MATRIX_BOX_POOL", skill)
+        self.assertIn(box_pool.POOL_ENV, skill)
         self.assertIn("retimed_serially", skill)
+        # The payload field the doc's promise actually depends on: a reader
+        # parsing invocation.json needs this exact key to still exist.
+        self.assertIn('"retimed_serially"', inspect.getsource(run_matrix),
+                      "run_matrix.py no longer writes a literal "
+                      "'retimed_serially' payload key; the docs still "
+                      "promise readers can look for one")
 
 
 if __name__ == "__main__":

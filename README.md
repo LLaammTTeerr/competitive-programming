@@ -172,8 +172,8 @@ falling back to `/tmp/run_matrix-boxes-<uid>`, overridable with
 `dispatching-parallel-agents` subagents, or two copies of the test suite —
 can run at once without colliding. Pass 2 also runs on that same pool, so
 the pool size is simultaneously the box allocator and this user's CPU
-admission control. Measured, not projected: `goldenseed` (13 solutions, 45
-tests, 546 results) ran in 182.4s serial vs. 65.4s at 4 workers — 2.79x —
+admission control. Measured, not projected: `goldenseed` (13 solutions, 42
+graded tests, 546 results) ran in 182.4s serial vs. 65.4s at 4 workers — 2.79x —
 with verdicts, holes, mismatches, and TL/kill limits identical between the
 two runs, and 1 of 546 results re-timed serially.
 
@@ -190,9 +190,10 @@ concurrent sandboxes and up to 1.92x at 8), and the driver's ambiguity rule
 is only sound while inflation stays below 2x. `pool_size()` accepts any
 value up to isolate's own box-id ceiling with no check against the core
 count, so raising it past `nproc` is an operator hazard, not a safety net —
-it is what makes wall-clock kills reachable at all. Raise it only on a
-machine with the cores to match, and set it to `1` for a fully quiesced
-authoritative run.
+nothing bounds wall-time inflation the way `CONTENTION_BOUND` bounds CPU
+time, so oversubscription is where wall-clock kills start showing up. Raise
+it only on a machine with the cores to match, and set it to `1` for a fully
+quiesced authoritative run.
 
 Pass 1 — the model solution's timings, from which TL is derived — is
 always serial regardless of the pool size.

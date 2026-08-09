@@ -99,9 +99,10 @@ running.
 
 ## Open items
 
-- The suite is **not parallel-safe with itself** — `run_matrix` derives isolate
-  box ids from `pid`. Fails loudly, cannot produce a wrong verdict, but has cost
-  three agents a false diagnosis. A real fix is box-id allocation.
+- ~~The suite is **not parallel-safe with itself**~~ — **Resolved** 2026-08-09
+  by `docs/superpowers/plans/2026-08-09-parallel-invocation-matrix.md`: box
+  ids are leased from a per-user, cross-process `flock` pool instead of
+  derived from `pid`, and pass 2 now runs on that same pool.
 - **`running-contests` is an orphan** — no skill routes to it, not even
   `solving-problems`. A design question, not a defect.
 - **`flight` promises absolute error ≤ 1e-6 but ships `rcmp6`**, which grants
