@@ -16,10 +16,11 @@ description: >
 
 Mission: an end-to-end audit of a problem package, split into two halves on
 purpose. The mechanical half — constraint drift, incomplete phases, orphan
-solutions, matrix holes, a stale generated header, a declared sample that
-doesn't exist on disk — is a program's job, already written, and this skill
-never redoes it by hand. The judgement half — is any sentence in the
-statement readable two ways, does a term get used as though the reader
+solutions, matrix holes, a stale matrix, a stale generated header, a
+declared sample that doesn't exist on disk — is a program's job, already
+written, and this skill never redoes it by hand. The judgement half — is
+any sentence in the statement readable two ways, does a term get used as
+though the reader
 already knows it, does an `@algorithm` comment claim an invariant with no
 argument behind it, does the checker actually match what the statement
 promises, is every declared bound actually attained by some test — is what
@@ -75,14 +76,15 @@ python3 -m tools.review_checks "$PROBLEM" "$PROBLEM/<name>.tex" "$TESTLIB"
 
 This reports constraint drift (`problem.json` vs the `.tex` vs
 `constraints.h`), an incomplete phase, an orphan solution file the scan
-never picked up, matrix holes and mismatches, a stale generated
-`constraints.h`, and a sample declared in `problem.json` whose `.in`/`.a`
-files are missing on disk. **Exit 1 means findings; read them, fix what they
-name, and re-run until exit 0.** Do not re-derive any of this by reading
-`problem.json` and the `.tex` side by side yourself — the tool exists
-precisely because that comparison is mechanical, and hand-checking it a
-second time spends effort on a question already answered while leaving less
-attention for the half a tool genuinely cannot do.
+never picked up, matrix holes and mismatches, a stale matrix
+(`invocation.json` no longer describes the current package — re-run it), a
+stale generated `constraints.h`, and a sample declared in `problem.json`
+whose `.in`/`.a` files are missing on disk. **Exit 1 means findings; read
+them, fix what they name, and re-run until exit 0.** Do not re-derive any of
+this by reading `problem.json` and the `.tex` side by side yourself — the
+tool exists precisely because that comparison is mechanical, and
+hand-checking it a second time spends effort on a question already answered
+while leaving less attention for the half a tool genuinely cannot do.
 
 ## The judgement half — this is what the skill is for
 

@@ -59,7 +59,204 @@ def _tests(problem_dir: Path, problem: Problem | None) -> Phase:
     return Phase("tests", True, f"{len(problem.subtasks)} group(s) populated")
 
 
-def _matrix(problem_dir: Path) -> Phase:
+# What `invocation.json` is evidence *about*. A matrix result describes a
+# specific package state; when any of these is newer than the artifact, the
+# artifact has not become wrong, it has become a statement about something
+# else — and the gate must not accept it as current. The custom checker (when
+# there is one) is included via `extra_matrix_files`, not listed here,
+# because it needs `problem.checker_name` to locate — see that function
+# below, shared by both `_matrix` here and `review_checks._matrix()`.
+#
+# mtime is the signal, not a perfect one, and both of its failure directions
+# are known:
+#
+#   * False "stale" (safe): a `git checkout` rewrites every file's mtime
+#     without changing content. Costs a re-run; never certifies anything
+#     false.
+#   * False "fresh" (dangerous — this is a false soundness claim, not an
+#     inconvenience): five ways this check can still miss a real edit.
+#       1. A *deletion* — removing a test or a solution — used to be
+#          invisible, since the old version of this walk only stat'd files.
+#          Fixed: directories are stat'd too, both the two top-level ones
+#          and every directory `rglob` yields, because removing an entry
+#          from a directory updates that directory's own mtime even though
+#          no remaining file changed.
+#       2. A tool that restores the original mtime on write — `cp -p`,
+#          `tar x`, `rsync -a` — changes content without advancing mtime at
+#          all. Not detectable by this check; nothing mtime-based can see it.
+#       3. A file inside a subdirectory this process cannot read: `rglob`
+#          silently skips permission-denied entries rather than raising (a
+#          `status()`-never-raises consequence, not a choice made for this
+#          check specifically), so content invisible to us cannot bump
+#          `newest`.
+#       4. A change landing inside the same mtime *tick* as the artifact
+#          write, not just the same wall-clock second. Measured on this
+#          filesystem: ~4 ms granularity, not 1s — an edit and the
+#          `invocation.json` write can round to the identical mtime even
+#          though the edit happened after. `>=` is not the fix: pass 1's
+#          own `.a` rewrites already share a tick with the final
+#          `invocation.json` write on a fast run (see the
+#          "Checked against `run_matrix.run()`" note below), so `>=` would
+#          flag a normal clean run as stale, which is the failure that
+#          makes a gate worthless — see the "equal mtime is not stale"
+#          test for why strict `>` is the one that has to stay. The
+#          granularity itself is filesystem-dependent (ext4 measured here;
+#          other filesystems, or a coarser one under a container overlay,
+#          could be wider or narrower). Not reachable by a human editing
+#          a file — nobody edits a solution 4 ms after a matrix run
+#          finishes — but reachable by a script that runs the matrix and
+#          immediately mutates the package in the same process, which is
+#          exactly how this gap was found.
+#       5. A *multi-file* custom checker: `extra_matrix_files` below only
+#          walks `files/<checker_name>` itself, not anything it
+#          `#include`s from elsewhere under `files/`. Editing an included
+#          helper changes verdicts on the next compile, and — unlike a
+#          validator or generator edit — nothing about that edit
+#          regenerates test data, so there is no downstream `tests/` walk
+#          to catch it the way there is for (2)'s sibling cases. Accepted,
+#          not fixed: single-file testlib checkers are the norm this
+#          pipeline is built around, and walking all of `files/` to close
+#          this one case would reopen false-staleness on ordinary
+#          validator/generator edits, which is the exact failure narrowing
+#          to just the checker file was meant to avoid. See
+#          `extra_matrix_files`'s docstring for the full trade.
+#       6. The artifact's own mtime reading *high*, not a source reading
+#          low: `invocation.json` stamped in the future by a clock stepped
+#          back after the run (an NTP correction, a VM suspended and later
+#          resumed, a dual-boot machine with a local-time RTC), or a
+#          package copied in from a machine whose clock ran fast, compares
+#          as fresh against every edit made afterwards until real time
+#          catches up to the stamp. A different mechanism from (2)
+#          (mtime-preserving copies pin a *source* mtime low); this pins
+#          the *artifact* mtime high, and nothing here clamps either
+#          against a trusted clock, because this module has no trusted
+#          clock to clamp against.
+#     (2) through (6) are accepted gaps, not fixed here — flagged for a
+#     reader deciding how much to trust this gate, not concealed by a
+#     comment that only named the safe direction.
+#
+# Out of scope entirely, not just unwalked: the stock checker, `testlib.h`,
+# and the compiler are externally owned, not package content, so this gate
+# never diffs them against the current checkout — `invocation.json`'s
+# `machine` block pins their identity (the testlib git revision, the g++
+# version) for provenance, but that pin is read by a human comparing runs,
+# never by this check.
+#
+# `generated_at` inside the payload was considered and rejected as the
+# source of truth: it records when the matrix ran, not what it ran against,
+# so it cannot detect an edit made afterwards.
+#
+# Checked against `run_matrix.run()` and confirmed not self-defeating:
+# `run()` does write into `tests/` (pass 1 regenerates each `.a` answer file
+# from the model solution via `unlink(missing_ok=True)` then `write_bytes`,
+# which bumps both the file's own mtime and its parent directory's), but
+# every one of those writes happens during pass 1, and `invocation.json`
+# itself is written exactly once, as the very last statement in `run()`. So
+# immediately after any run — clean or not — every file and directory this
+# check walks is already on disk with an equal-or-older mtime than the
+# artifact; a same-second write compares equal, not stale (see the strict
+# `>` below), and nothing this module writes can trigger its own staleness
+# check. Verified empirically, not just by this argument — see the task
+# report.
+_MATRIX_SOURCES = ("problem.json", "solutions", "tests")
+
+
+def _mtime_or_zero(path: Path) -> float:
+    """`path`'s mtime, or `0.0` if it vanished between being listed and
+    being stat'd. `status()` never raises (module docstring) — a file
+    legitimately unlinked mid-walk (the exact `unlink`/`write_bytes` cycle
+    `run_matrix` itself uses on `.a` files, or simply a concurrent edit)
+    must not turn a read-only status check into a crash. Reporting `0.0`
+    rather than propagating the race also cannot manufacture a false
+    "stale": a vanished entry cannot be newer than anything.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def newest_source_mtime(problem_dir: Path,
+                         extra_files: tuple[Path, ...] = ()) -> float:
+    """The newest mtime among everything `invocation.json` is evidence
+    about: every name in `_MATRIX_SOURCES`, and any `extra_files` (the
+    custom checker, when `_matrix` below determines there is one).
+
+    Public, and shared rather than duplicated: `review_checks._matrix()`
+    is a second, independent reader of the same `invocation.json`, making
+    the identical staleness claim about the identical files — a copy of
+    this function there would be one more place the two checks could
+    silently drift apart, which is exactly the failure this project keeps
+    re-paying for (see the task report).
+
+    Each `_MATRIX_SOURCES` name is handled generically, not just as
+    "a directory": `problem.json` is ordinarily a file, but a hostile
+    package can put anything at that path (see `TestStatus`'s hostile-input
+    tests elsewhere in this module), so this stats whatever is actually
+    there rather than assuming a shape. When it *is* a directory (the
+    normal case for `solutions/`/`tests/`), both the directory itself and
+    every entry `rglob` yields are stat'd — the directory's own mtime is
+    what a deletion updates. Removing a test or a solution touches no
+    remaining file at all, so skipping directories would make a deleted
+    test invisible to this check and the gate would report "clean" over a
+    weakened suite instead of naming the loss.
+    """
+    newest = 0.0
+    for name in _MATRIX_SOURCES:
+        path = problem_dir / name
+        if path.is_file():
+            newest = max(newest, _mtime_or_zero(path))
+        elif path.is_dir():
+            newest = max(newest, _mtime_or_zero(path))
+            for child in path.rglob("*"):
+                newest = max(newest, _mtime_or_zero(child))
+    for extra in extra_files:
+        newest = max(newest, _mtime_or_zero(extra))
+    return newest
+
+
+def extra_matrix_files(problem_dir: Path, problem: Problem | None) -> tuple[Path, ...]:
+    """Source files `newest_source_mtime` must also walk, beyond
+    `_MATRIX_SOURCES`, because `problem.json` alone can't say where they
+    live.
+
+    Currently just the custom checker: it decides OK vs WA on every cell of
+    the matrix — as load-bearing as any solution or test, and edited
+    independently of both. `problem.checker_name` is only meaningful when
+    `checker_kind` is "custom" (a stock checker's `checker_name` names a
+    testlib checker this package does not own and cannot edit, so it is not
+    a source of *this* package's evidence going stale).
+
+    Narrow on purpose: `files/validator.cpp` or `files/gen-*.cpp` are not
+    included, because editing them does not change any recorded verdict
+    until the tests they produce are regenerated — and that regeneration is
+    already caught by the `tests/` walk `newest_source_mtime` does
+    unconditionally. Widening to all of `files/` would add false-staleness
+    for validator/generator edits with no gain.
+
+    That trade has a real, accepted gap of its own: if `files/<checker_name>`
+    `#include`s a local helper also under `files/`, editing *that* helper
+    changes verdicts on the next compile, and — unlike a validator or
+    generator edit — there is no downstream `tests/` regeneration to catch
+    it, since nothing about a checker helper regenerates test data. Not
+    fixed here: single-file testlib checkers are the norm this pipeline is
+    built around, and walking all of `files/` to close this one case would
+    reopen the validator/generator false-staleness this function exists to
+    avoid. A checker split across files is the case this gate cannot see.
+
+    Called identically by `package_status._matrix()` and
+    `review_checks._matrix()` — both need the *same* answer to "what else
+    counts as a matrix source", and duplicating this selection logic at
+    each call site (as an earlier version of this fix did, sharing only
+    `newest_source_mtime` itself) would leave exactly the kind of two
+    copies that can silently drift the shared walk was meant to prevent.
+    """
+    if problem is not None and problem.checker_kind == "custom":
+        return (problem_dir / "files" / problem.checker_name,)
+    return ()
+
+
+def _matrix(problem_dir: Path, problem: Problem | None) -> Phase:
     path = problem_dir / "invocation.json"
     if not path.exists():
         return Phase("matrix", False, "invocation.json not written yet")
@@ -69,6 +266,20 @@ def _matrix(problem_dir: Path) -> Phase:
         return Phase("matrix", False, f"invocation.json unreadable: {exc}")
     if not isinstance(data, dict):
         return Phase("matrix", False, "invocation.json top level is not an object")
+    try:
+        artifact_mtime = path.stat().st_mtime
+    except OSError as exc:
+        return Phase("matrix", False, f"invocation.json unreadable: {exc}")
+    # Before the holes/mismatches verdict, deliberately: a stale artifact
+    # reporting zero holes must not read as "clean" — the detail a reader
+    # sees has to name the reason they cannot trust the number, not the
+    # number itself.
+    extra_files = extra_matrix_files(problem_dir, problem)
+    if newest_source_mtime(problem_dir, extra_files) > artifact_mtime:
+        return Phase("matrix", False,
+                     "invocation.json is stale: a solution, test, "
+                     "problem.json, or the checker changed after it was "
+                     "written — re-run the matrix")
     try:
         holes = data.get("holes", [])
         mismatches = data.get("mismatches", [])
@@ -161,7 +372,7 @@ def status(problem_dir, testlib_dir=None) -> list[Phase]:
               ", ".join(g.name for g in gens) or "no files/gen-*.cpp"),
         _tests(problem_dir, problem),
         _zoo(problem_dir, problem),
-        _matrix(problem_dir),
+        _matrix(problem_dir, problem),
         _samples(problem_dir, problem),
     ]
 

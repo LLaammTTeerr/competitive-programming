@@ -349,15 +349,21 @@ crash being read as a finding:
   command.
 - **2** — **the matrix could not be run at all**: a compile failure, a
   missing `tests/<group>/` directory, an unusable sandbox, a staging
-  location on a memory-backed filesystem, or one of the file-IO refusals —
-  an `io.output` colliding with the driver's own staged stdout (`run.out`),
+  location on a memory-backed filesystem, one of the file-IO refusals — an
+  `io.output` colliding with the driver's own staged stdout (`run.out`),
   `io.input` equal to `io.output`, an output file the driver cannot read
   back, or **the model solution exiting 0 without creating `io.output`**
   (that last one would write an empty `.a` and measure every later verdict
-  against it, so it refuses instead). A message on
-  stderr, nothing on stdout. This is a defect in the *package or the
-  machine*, not a finding about the test suite — fix what the message names
-  and run it again.
+  against it, so it refuses instead) — a malformed `problem.json`, a
+  malformed `@expect` header on a solution, a corrupted `flags.json`, or
+  (a driver bug or an unnamed environment failure, e.g. a full or
+  read-only disk) any other exception the driver could not name. For the
+  named package problems the message names the problem with no traceback;
+  for everything else it is the full traceback — either way, nothing on
+  stdout. This is a defect
+  in the *package or the machine*, not a finding about the test suite —
+  fix what the message (or, for the traceback case, the failure it
+  describes) names and run it again.
 
 ## Reading the result
 

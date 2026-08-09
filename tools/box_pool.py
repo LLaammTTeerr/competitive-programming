@@ -65,6 +65,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -153,13 +154,37 @@ def lock_dir() -> Path:
     raw = os.environ.get(LOCK_DIR_ENV)
     path = Path(raw) if raw else _default_lock_dir()
     try:
-        path.mkdir(parents=True, exist_ok=True)
+        # mode=0o700 is safe under any umask -- umask only ever strips
+        # bits, and 0700 has none to strip. But `exist_ok=True` means this
+        # call silently reuses whatever is already at `path`, mode
+        # untouched, if it was created before we got here -- the ownership
+        # check below, not this mode, is what actually closes that gap.
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         if not path.is_dir():
             raise BoxPoolError(
                 f"cannot create the box-lease directory {path}: {exc}. Set "
                 f"${LOCK_DIR_ENV} to a writable directory."
             ) from exc
+    # `exist_ok=True` above is exactly what lets a directory **squatted** by
+    # another user -- or a symlink planted at `path` -- before our first
+    # `mkdir` get used silently: both the systemd `/run/user/<uid>`
+    # location and the `/tmp` fallback are reachable by other users on a
+    # shared machine. Checked here, after creation, rather than before it:
+    # a pre-check races the `mkdir` above (TOCTOU) and could not close
+    # anything the `mkdir` itself doesn't already close, so this has to
+    # verify what we actually got, not what we asked for. `lstat`, not
+    # `stat`: a symlink to a directory we own must still be refused, since
+    # the interesting attacker-controlled step is what the symlink points
+    # at, which can change after this check runs.
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise BoxPoolError(
+            f"the box-lease directory {path} is not a directory owned by "
+            f"this user (uid {st.st_uid}, mode {stat.filemode(st.st_mode)}). "
+            "Another user may have created it first. Remove it, or set "
+            f"${LOCK_DIR_ENV} to a directory you own."
+        )
     return path
 
 

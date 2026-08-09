@@ -23,14 +23,15 @@ from pathlib import Path
 
 from tools.drift_check import check as drift
 from tools.gen_constraints_header import render
-from tools.package_status import next_phase, status
+from tools.package_status import (extra_matrix_files, newest_source_mtime,
+                                  next_phase, status)
 from tools.problem_meta import Problem, ProblemMetaError, load
 from tools.scan_solutions import ScanError, scan
 
 KINDS = (
     "constraint-drift", "incomplete-package", "orphan-solution",
     "sample-not-reproducible", "matrix-hole", "matrix-mismatch",
-    "stale-constraints-header",
+    "stale-constraints-header", "stale-matrix",
 )
 
 
@@ -81,7 +82,7 @@ def _orphans(problem_dir: Path, problem: Problem | None) -> list[Finding]:
     ]
 
 
-def _matrix(problem_dir: Path) -> list[Finding]:
+def _matrix(problem_dir: Path, problem: Problem | None) -> list[Finding]:
     path = problem_dir / "invocation.json"
     if not path.exists():
         return []
@@ -97,6 +98,31 @@ def _matrix(problem_dir: Path) -> list[Finding]:
         return [Finding("matrix-hole", "low",
                         f"invocation.json top level is not an object (got {type(data).__name__})",
                         str(path))]
+    try:
+        artifact_mtime = path.stat().st_mtime
+    except OSError as exc:
+        return [Finding("matrix-hole", "low",
+                        f"invocation.json unreadable: {exc}", str(path))]
+    # The identical staleness claim `package_status._matrix()` makes about
+    # the same artifact — via the shared `newest_source_mtime` *and* the
+    # shared `extra_matrix_files` (both live in `package_status`, not
+    # copied here), so the two checks cannot silently drift apart on either
+    # the walk or on what counts as a source to walk (see the task report:
+    # leaving this sibling gate without the freshness check `package_status`
+    # just got was the exact "fix the instance, not the class" mistake this
+    # project keeps re-paying for). Reported instead of the holes/mismatches
+    # findings below, not alongside them: those findings describe a package
+    # state `invocation.json` no longer speaks for, so surfacing them here
+    # would be citing evidence about a different tree as though it were
+    # current.
+    extra_files = extra_matrix_files(problem_dir, problem)
+    if newest_source_mtime(problem_dir, extra_files) > artifact_mtime:
+        return [Finding(
+            "stale-matrix", "high",
+            "invocation.json is stale: a solution, test, problem.json, or "
+            "the checker changed after it was written — the holes/"
+            "mismatches it records describe a package state that no "
+            "longer exists; re-run the matrix", str(path))]
     try:
         out = [
             Finding("matrix-hole", "high",
@@ -171,7 +197,7 @@ def run(problem_dir, tex_path=None, testlib_dir=None) -> list[Finding]:
     findings += _drift(problem, tex_path)
     findings += _incomplete(problem_dir, testlib_dir)
     findings += _orphans(problem_dir, problem)
-    findings += _matrix(problem_dir)
+    findings += _matrix(problem_dir, problem)
     findings += _stale_header(problem_dir, problem)
     findings += _samples(problem_dir, problem)
     rank = {"high": 0, "medium": 1, "low": 2}

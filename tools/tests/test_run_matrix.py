@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import io
 import json
 import os
@@ -46,14 +47,16 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools import flags, matrix_core, run_matrix
+from tools import box_pool, flags, matrix_core, run_matrix
 from tools.matrix_core import Limits
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mini"
@@ -2135,6 +2138,52 @@ class ParallelPassTest(PackageFixture):
                 for f in banded),
             "the wall-clock kill produced no flag naming it")
 
+    def test_the_wall_kill_flag_records_the_original_wall_reading(self):
+        # `first_run_ms` (the CPU-time reading) was already recorded before
+        # this fix. But for a *wall-clock* kill, `cpu_ms` does not explain
+        # the kill -- the process was descheduled, not slow -- so the
+        # number a reader of flags.json actually needs is the original
+        # *wall* reading, and nothing carried it. Same stub harness as the
+        # wall-vs-CPU-kill test above, narrowed to just the wall-kill case,
+        # with a distinctive fabricated `wall_ms` so this assertion can
+        # only pass if that specific original reading survived into the
+        # flag's `what` text (not just the re-timed one, which is a
+        # different, real measurement of the same run).
+        FABRICATED_WALL_MS = 918273
+        os.environ["RUN_MATRIX_BOX_POOL"] = "4"
+        real_run_once = run_matrix._run_once
+        seen = {"pass2": False}
+        fabricated_once = set()
+
+        def killed_after_pass1(isolate, binary, *rest, **kwargs):
+            r = real_run_once(isolate, binary, *rest, **kwargs)
+            if not seen["pass2"] or binary.stem in fabricated_once:
+                return r
+            fabricated_once.add(binary.stem)
+            if binary.stem == "sol-main":
+                return dataclasses.replace(
+                    r, killed=True, cpu_ms=50, wall_ms=FABRICATED_WALL_MS,
+                    message="Time limit exceeded (wall clock)")
+            return r
+
+        real_compute = run_matrix.compute_limits
+
+        def marking(*args, **kwargs):
+            result = real_compute(*args, **kwargs)
+            seen["pass2"] = True
+            return result
+
+        with mock.patch.object(run_matrix, "_run_once", killed_after_pass1), \
+             mock.patch.object(run_matrix, "compute_limits", marking):
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+
+        register = json.loads(
+            (self.problem_dir / "flags.json").read_text(encoding="utf-8"))
+        banded = [f for f in register["flags"] if f["kind"] == "timing-band"]
+        self.assertTrue(
+            any(str(FABRICATED_WALL_MS) in f["what"] for f in banded),
+            "the wall-kill flag does not record the original wall reading")
+
     def test_a_matrix_error_in_one_worker_surfaces_from_run(self):
         # A worker's MatrixError must propagate out of the pool, not be
         # swallowed into a verdict. Forced directly, by stubbing `_run_once`
@@ -2606,6 +2655,237 @@ class TestStageBase(unittest.TestCase):
 
     def setUp(self):
         SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+class ExitCodeContractTest(PackageFixture):
+    """`main()`'s exit codes are a contract `validating-solutions` reads.
+
+    Exit 1 means "the matrix ran and found holes and/or mismatches" — a
+    statement about the *package*. Anything that prevents the matrix from
+    running is exit 2. A crash reported as exit 1 is a crash read as a
+    finding, which is the misread `main()`'s own docstring says it exists
+    to prevent.
+    """
+
+    def _main(self):
+        return run_matrix.main(["run_matrix.py", str(self.problem_dir),
+                                str(self.testlib_dir)])
+
+    def test_a_malformed_problem_json_exits_2_not_1(self):
+        (self.problem_dir / "problem.json").write_text("{not json",
+                                                       encoding="utf-8")
+        self.assertEqual(self._main(), 2)
+
+    def test_a_malformed_expect_header_exits_2_not_1(self):
+        # Likelier in practice than a bad problem.json: a setter edits
+        # solution headers constantly.
+        path = self.problem_dir / "solutions" / "sol-main.cpp"
+        path.write_text(path.read_text(encoding="utf-8")
+                        .replace("g1=OK", "g1=NOPE"), encoding="utf-8")
+        self.assertEqual(self._main(), 2)
+
+    def test_a_corrupted_flags_json_during_a_banded_result_exits_2_not_1(self):
+        # A third escapee beyond the two the plan for this task named:
+        # `flags.append` (called from `_run_pass2` whenever a result is
+        # retimed or lands in the (TL, kill] band) reads the existing
+        # register before writing to it, so a corrupted flags.json raises
+        # `flags.FlagError` from inside `run()` — but only on a run that
+        # actually reaches that call site. `compute_limits` is patched
+        # (same technique as
+        # `TestRunMatrixFixture.test_band_result_is_reached_and_flagged_with_accurate_wording`)
+        # to force every result into the band deterministically, so this
+        # is not a probe that could pass by accident of timing.
+        #
+        # `compute_limits` is patched to a degenerate `tl_ms=-1`, so the run
+        # is heavily perturbed; asserting only `code == 2` would pass just
+        # as well for an unrelated `MatrixError` and prove nothing about
+        # `FlagError` specifically. Pin it the way
+        # `test_a_package_error_prints_to_stderr_and_nothing_to_stdout`
+        # already does: capture stderr and require the message actually
+        # names `flags.json`.
+        (self.problem_dir / "flags.json").write_text("{not json",
+                                                       encoding="utf-8")
+        forced = matrix_core.Limits(t_main_ms=2, tl_ms=-1, kill_ms=5000)
+        err = io.StringIO()
+        with mock.patch.object(run_matrix, "compute_limits", return_value=forced):
+            with contextlib.redirect_stderr(err):
+                code = self._main()
+        self.assertEqual(code, 2)
+        self.assertIn("flags.json", err.getvalue())
+
+    def test_a_package_error_prints_to_stderr_and_nothing_to_stdout(self):
+        # stdout is the results channel. A caller that parses stdout must
+        # not receive a half-line of nothing and read it as "no holes".
+        (self.problem_dir / "problem.json").write_text("{not json",
+                                                       encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self._main()
+        self.assertEqual(code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("problem.json", err.getvalue())
+
+    def test_no_tools_exception_type_escapes_main(self):
+        # An end-to-end check for the one type this actually injects
+        # (`ProblemMetaError`, already a `PACKAGE_ERRORS` member) — not a
+        # general guarantee that *any* future error type is caught; nothing
+        # about running this single case would fail if a new `tools` module
+        # raised a brand-new type main() had never heard of.
+        # `test_every_tools_error_type_reachable_from_run_matrix_is_in_package_errors`
+        # below is what actually proves the boundary property this
+        # docstring used to (wrongly) claim this test alone established.
+        (self.problem_dir / "problem.json").write_text("{not json",
+                                                       encoding="utf-8")
+        try:
+            self._main()
+        except BaseException as exc:  # noqa: BLE001 - that is the point
+            self.fail(f"{type(exc).__module__}.{type(exc).__name__} escaped main()")
+
+    def test_every_tools_error_type_reachable_from_run_matrix_is_in_package_errors(self):
+        # The boundary property itself, enforced rather than asserted by a
+        # single injected example: every exception class actually defined
+        # in `run_matrix` or in any `tools` module `run_matrix` imports
+        # something from must be a member of `PACKAGE_ERRORS` (or
+        # `PACKAGE_ERRORS` itself must widen to a blanket `except
+        # Exception`, which `main()` also has — but that tier prints a raw
+        # traceback rather than a clean message, so an exception type this
+        # pipeline *names* belongs in the one-line-message tier, and this
+        # test is what keeps a newly-added named type from silently falling
+        # through to the traceback tier instead).
+        #
+        # Deliberately not a sweep of `sys.modules`: under full `discover`,
+        # `tools.drift_check` is imported by its own test module, and its
+        # deliberately-excluded `DriftCheckError` would then fail this test
+        # for a module `main()` cannot actually reach through `run()`.
+        # Building the module set from `run_matrix`'s own namespace instead
+        # also self-updates if someone later imports `drift_check` (or
+        # anything else) into `run_matrix` — exactly the case this test
+        # exists to catch.
+        #
+        # Known limits of this approach, not fixed here (a review confirmed
+        # each in principle and confirmed none is live today — an AST sweep
+        # would close all three, but that is a rewrite this task's ruling
+        # was not to make):
+        #   1. A module imported *lazily inside a function* never appears
+        #      in `vars(run_matrix)` — only module-level imports are
+        #      one-hop-reachable this way. `run_matrix` currently has zero
+        #      local imports of `tools` modules.
+        #   2. A type reachable only *transitively* — imported by a module
+        #      that `run_matrix` imports, but not itself re-exported into
+        #      `run_matrix`'s own namespace — is missed, since this only
+        #      walks one hop from `run_matrix`. Reproduced directly: a
+        #      type whose `__module__` sits outside the one-hop module set
+        #      built here comes back absent from `uncovered` regardless of
+        #      whether `main()` could actually reach it.
+        #   3. An exception class *defined inside a function body* never
+        #      appears in its module's `vars()` at all — `vars(m)` only
+        #      sees module-level names. `run_matrix` currently defines zero
+        #      exception classes inside a function.
+        mods = {run_matrix}
+        for obj in vars(run_matrix).values():
+            if isinstance(obj, types.ModuleType):
+                name = obj.__name__
+            elif inspect.isclass(obj) or inspect.isfunction(obj):
+                name = getattr(obj, "__module__", "")
+            else:
+                continue
+            if name == "tools" or name.startswith("tools."):
+                mods.add(sys.modules[name])
+        uncovered = [f"{m.__name__}.{n}"
+                     for m in mods for n, o in vars(m).items()
+                     if inspect.isclass(o) and issubclass(o, BaseException)
+                     and o.__module__ == m.__name__
+                     and not issubclass(o, run_matrix.PACKAGE_ERRORS)]
+        self.assertEqual(uncovered, [])
+
+    def test_a_real_hole_still_exits_1(self):
+        # The contract's other half: exit 2 must not swallow genuine
+        # findings. Declare the wrong solution as correct so the suite has
+        # a hole to report.
+        path = self.problem_dir / "solutions" / "sol-wrong.cpp"
+        path.write_text(path.read_text(encoding="utf-8")
+                        .replace("g1=WA", "g1=TL"), encoding="utf-8")
+        self.assertEqual(self._main(), 1)
+
+
+class MainExceptionTierTest(unittest.TestCase):
+    """Review finding: `PACKAGE_ERRORS` alone left a real, reachable gap —
+    a plain `OSError` from `invocation.json`'s own `write_text` (a full or
+    read-only disk) is a stdlib exception, not a `tools/` type, so it
+    escaped as a traceback and exited 1 just like `ProblemMetaError` did
+    before this task. `main()`'s trailing `except Exception` closes that
+    gap. No sandbox needed here — `run_matrix.run` is mocked directly, so
+    this does not need `PackageFixture`'s isolate/g++ dependency at all.
+    """
+
+    def _main(self):
+        return run_matrix.main(["run_matrix.py", "/nonexistent/problem",
+                                "/nonexistent/testlib"])
+
+    def test_a_driver_bug_is_exit_2_with_a_traceback_on_stderr(self):
+        # A concrete stand-in for the reviewer's example: some plain
+        # exception `run()` raises that is not a `tools/` type at all, so
+        # it cannot be a `PACKAGE_ERRORS` member.
+        with mock.patch.object(
+                run_matrix, "run",
+                side_effect=OSError("No space left on device")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = self._main()
+        self.assertEqual(code, 2)
+        # The full traceback, not a one-line message — that tier is for
+        # PACKAGE_ERRORS only; a driver bug is not something a package
+        # author can silently act on the way "malformed problem.json" is.
+        self.assertIn("Traceback (most recent call last)", err.getvalue())
+        self.assertIn("OSError", err.getvalue())
+        self.assertIn("No space left on device", err.getvalue())
+
+    def test_keyboard_interrupt_is_not_swallowed(self):
+        # `except Exception` must not catch `BaseException` subclasses that
+        # are not `Exception` subclasses — confirmed rather than assumed,
+        # per Python's own exception hierarchy (`KeyboardInterrupt` and
+        # `SystemExit` derive from `BaseException` directly).
+        with mock.patch.object(run_matrix, "run", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._main()
+
+    def test_system_exit_is_not_swallowed(self):
+        with mock.patch.object(run_matrix, "run", side_effect=SystemExit(3)):
+            with self.assertRaises(SystemExit):
+                self._main()
+
+
+class PoolSizeAtPassTwoTest(PackageFixture):
+    def test_a_bad_pool_size_at_pass_two_is_a_matrix_error(self):
+        # The plan for this task assumed `pool_size()` is called exactly
+        # twice in a run — once inside `open_isolate_box` (via
+        # `box_pool.lease`), once at the bare call site before pass 2 — and
+        # a `len(calls) > 1` counter would isolate the second. That is
+        # wrong: `_leased_box()` is also entered once per sandboxed run
+        # inside `_run_once` (pass 1 times the model solution three times
+        # per test, each a `_leased_box()`/`pool_size()` call of its own),
+        # so a bare call-count trips on pass 1, long before pass 2, and
+        # raises through `_leased_box`'s own conversion instead of the
+        # target site — confirmed empirically: the counter version failed
+        # with `str(ctx.exception) == "synthetic pool failure"`, not
+        # wrapped with "cannot size the worker pool" at all.
+        #
+        # Distinguish by the immediate caller instead: `lease()` (inside
+        # `box_pool.py`) calls `pool_size()` for every leased box; the bare
+        # call this task added calls it directly from `run()`. Only the
+        # latter should fail.
+        real = box_pool.pool_size
+
+        def flaky():
+            caller = sys._getframe(1).f_code.co_name
+            if caller == "run":
+                raise box_pool.BoxPoolError("synthetic pool failure")
+            return real()
+
+        with mock.patch.object(box_pool, "pool_size", flaky):
+            with self.assertRaises(run_matrix.MatrixError) as ctx:
+                run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("worker pool", str(ctx.exception))
 
 
 if __name__ == "__main__":

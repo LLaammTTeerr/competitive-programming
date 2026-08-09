@@ -273,10 +273,11 @@ python3 -m tools.review_checks "$PROBLEM" "$PROBLEM/<name>.tex" "$TESTLIB"
 exits 0. Both are required — `package_status` says every phase produced its
 artifact, `review_checks` says the mechanical half of the audit found
 nothing wrong across all of them at once (constraint drift, an orphan
-solution, a matrix hole, a stale generated header, a sample declared but
-missing on disk). Neither claim substitutes for the other: a package can
-have every phase present and still drift, and `review_checks` has nothing
-to check if a phase never ran.
+solution, a matrix hole, a stale matrix (`invocation.json` no longer
+describes the current package — re-run the matrix), a stale generated
+header, a sample declared but missing on disk). Neither claim substitutes
+for the other: a package can have every phase present and still drift, and
+`review_checks` has nothing to check if a phase never ran.
 
 **REQUIRED:** `superpowers:verification-before-completion` before reporting
 either claim — run both commands and show their exit codes and output, not
