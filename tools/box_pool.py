@@ -1,4 +1,4 @@
-"""Machine-wide lease allocator for isolate box ids.
+"""Per-user lease allocator for isolate box ids.
 
 Why a lease and not a smarter derivation of the id: `run_matrix` used to
 take `os.getpid() % 65536` and hand out consecutive ids from there, one per
@@ -24,20 +24,36 @@ already uses for its register, deliberately, so the project has one locking
 idiom rather than two.
 
 The pool is also this pipeline's CPU admission control, and that is not a
-side effect — it is the second reason it is machine-wide rather than
-per-process. `run_matrix` sizes its worker pool to `pool_size()`, so three
-concurrent invocations share `pool_size()` leases instead of running three
-times that many boxes. That bound is load-bearing for verdict correctness:
-CPU time inflates under contention (measured on an 8-thread box: 1.15-1.21x
-at 4 concurrent boxes, up to 1.92x at 8), and `run_matrix`'s ambiguity band
-is only valid below a bounded inflation factor.
+side effect — it is the second reason it exists as a shared pool rather
+than a per-process counter. `run_matrix` sizes its worker pool to
+`pool_size()`, so all of one user's concurrent invocations share
+`pool_size()` leases instead of each running that many boxes on top of the
+others. That bound is load-bearing for verdict correctness: CPU time
+inflates under contention (measured on an 8-thread box: 1.15-1.21x at 4
+concurrent boxes, up to 1.92x at 8), and `run_matrix`'s ambiguity band is
+only valid below a bounded inflation factor.
 
 The lock directory holds zero-byte files and is *not* where anything
 sandboxed writes, so the tmpfs-charges-the-cgroup rule that keeps
-`run_matrix`'s staging directory off `/tmp` does not apply here and `/tmp`
-is the right default: it is the one path that is machine-wide, writable by
-every user who could run isolate, and cleared on boot. Do not "fix" this to
-match `_stage_base()`.
+`run_matrix`'s staging directory off `/tmp` does not apply here — these
+locks are allowed to live on tmpfs. What the directory *is* is per-user, not
+machine-wide: it defaults to the caller's systemd-managed per-user runtime
+directory (`/run/user/<uid>/run_matrix-boxes`), falling back to a
+uid-suffixed directory under `/tmp` (`/tmp/run_matrix-boxes-<uid>`) on
+machines without one. Building a pool that several different users could
+share safely would need a lock directory writable, and *trusted*, by all of
+them; this module does not attempt that, and the consequence is real,
+not hidden: two different users running `run_matrix` on the same machine at
+the same time can still pick the same isolate box id, because each has
+their own lock directory and neither can see the other's leases. When that
+happens, isolate's own "This box is currently in use by another process"
+check (rc=2) catches it — loudly, as a named failure, which is strictly
+better than the silent collisions the pid-derived scheme produced, but it
+is a live failure mode, not a guarantee this module closes. Do not "fix"
+this to a single shared directory to close that gap; that is a deliberate,
+documented trade-off, and do not "fix" the lock directory choice to match
+`_stage_base()` either — the tmpfs reasoning above is why it doesn't need
+to.
 """
 
 from __future__ import annotations
@@ -52,7 +68,14 @@ from typing import Iterator
 
 POOL_ENV = "RUN_MATRIX_BOX_POOL"
 LOCK_DIR_ENV = "RUN_MATRIX_BOX_LOCK_DIR"
-DEFAULT_LOCK_DIR = "/tmp/run_matrix-boxes"
+
+# isolate box ids run 0-65535 on this machine's isolate 2.6; a pool bigger
+# than that would eventually hand out an id isolate itself will refuse.
+MAX_POOL_SIZE = 65536
+
+# The basename of the lock directory, whether it lands under /run/user/<uid>
+# or under /tmp.
+_LOCK_DIR_NAME = "run_matrix-boxes"
 
 # How long to sleep between full sweeps of the pool when every id is taken.
 # Short enough that a released lease is picked up promptly, long enough that
@@ -85,20 +108,43 @@ def pool_size() -> int:
         raise BoxPoolError(
             f"${POOL_ENV} must be at least 1, got {value}"
         )
+    if value > MAX_POOL_SIZE:
+        raise BoxPoolError(
+            f"${POOL_ENV} must be at most {MAX_POOL_SIZE} (isolate box ids "
+            f"run 0-{MAX_POOL_SIZE - 1} on this machine), got {value}"
+        )
     return value
+
+
+def _default_lock_dir() -> Path:
+    """Where lock files live when $RUN_MATRIX_BOX_LOCK_DIR is unset.
+
+    Per-user, not machine-wide: prefers the caller's systemd-managed
+    per-user runtime directory (mode 0700, owned by the user, wiped at
+    logout) and falls back to a uid-suffixed directory under `/tmp` when
+    that isn't available (no systemd, or `/run/user/<uid>` doesn't exist).
+    See the module docstring for what "per-user" implies for two different
+    users racing on the same machine.
+    """
+    uid = os.getuid()
+    runtime_dir = Path(f"/run/user/{uid}")
+    if runtime_dir.is_dir() and os.access(runtime_dir, os.W_OK):
+        return runtime_dir / _LOCK_DIR_NAME
+    return Path(f"/tmp/{_LOCK_DIR_NAME}-{uid}")
 
 
 def lock_dir() -> Path:
     """The directory holding one lock file per box id, created if absent.
 
-    Mode 0o1777 (sticky, world-writable) for the same reason `/tmp` has it:
-    the pool must be shared by every user who can run isolate, and the sticky
-    bit stops one user unlinking another's lock file.
+    Per-user (see `_default_lock_dir`): not chmod'd to be shared with other
+    users, because it isn't meant to be — a lock directory one user's
+    `run_matrix` writes into is not a directory another user should be able
+    to write into too.
     """
-    path = Path(os.environ.get(LOCK_DIR_ENV, DEFAULT_LOCK_DIR))
+    raw = os.environ.get(LOCK_DIR_ENV)
+    path = Path(raw) if raw else _default_lock_dir()
     try:
         path.mkdir(parents=True, exist_ok=True)
-        os.chmod(path, 0o1777)
     except OSError as exc:
         if not path.is_dir():
             raise BoxPoolError(
@@ -111,13 +157,16 @@ def lock_dir() -> Path:
 def _try_claim(directory: Path, box_id: int) -> int | None:
     """Open and `flock` one id's lock file, returning the fd or None.
 
+    Mode 0o600: the directory is per-user (see `lock_dir`), so there is no
+    reason for any other user to be able to read or write these files.
+
     Returns None only for "someone else holds it" (EWOULDBLOCK/EACCES); any
     other OSError is a real problem with the lock directory and propagates as
     `BoxPoolError` rather than silently shrinking the pool.
     """
     path = directory / f"box-{box_id}.lock"
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as exc:
         raise BoxPoolError(
             f"cannot open the box-lease file {path}: {exc}"
