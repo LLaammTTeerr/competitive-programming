@@ -202,6 +202,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -1514,7 +1515,9 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
     complete, so the abort costs at most one round of `workers` runs. That
     is deliberate: every `MatrixError` in this driver means "this run
     cannot be judged", and turning one into a verdict is precisely the
-    confidently-wrong outcome the whole module refuses.
+    confidently-wrong outcome the whole module refuses. A `flags.FlagError`
+    from `flags.append` below (a corrupted `flags.json` read back before a
+    retimed/banded result is recorded) takes the identical path.
     """
     cpu_limit_s = limits.kill_ms / 1000.0
     wall_limit_s = max(3 * limits.tl_ms, limits.kill_ms) / 1000.0
@@ -1905,18 +1908,45 @@ def main(argv: list[str]) -> int:
         0 — every solution's @expect was met.
         1 — the matrix ran and found holes and/or mismatches. This is a
             *result*, printed to stdout: the signal to keep reading.
-        2 — the matrix could not be run at all (usage error, or any
-            `PACKAGE_ERRORS` member: a compile failure, a missing tests
+        2 — the matrix could not be run at all: usage error, any
+            `PACKAGE_ERRORS` member (a compile failure, a missing tests
             directory, a model solution that produced no output file, an
             unusable sandbox or staging location, a malformed
-            `problem.json` or solution `@expect` header, or a corrupted
-            `flags.json`).
-            A message on stderr, nothing on stdout.
+            `problem.json` or solution `@expect` header, a corrupted
+            `flags.json`), or any *other* exception `run()` raises — a
+            driver bug, or an environment failure this pipeline has no
+            named type for (`invocation.json` on a full or read-only disk
+            is a plain `OSError`, not anything under `tools/`). Nothing
+            that happens while sizing up whether the matrix could run
+            reaches a caller as exit 1.
+            A message on stderr; for `PACKAGE_ERRORS` a one-line message
+            naming the package problem, for anything else the full
+            traceback (`traceback.print_exc()`) so the failure is not
+            hidden, just correctly coded. Nothing on stdout either way.
 
-    The guarantee that nothing else escapes is a property of the *boundary*
-    catching a family of types (`PACKAGE_ERRORS`, defined above this
-    function), not of an enumerated list of call sites — see that constant's
-    own comment for why the distinction matters.
+    Two tiers, deliberately not one `except Exception`: `PACKAGE_ERRORS` are
+    problems in the *package* — a user can act on "malformed problem.json"
+    without seeing a stack trace, and the one-line message is more useful to
+    them than 40 lines of this driver's internals. Everything else is
+    unexpected — some driver bug or environment condition this pipeline
+    never named — and for those the traceback is the useful artifact; only
+    the *exit code* changes from the Python default, to the one that
+    correctly describes "the matrix could not be run", not to a swallowed
+    silence. `except Exception` does not catch `SystemExit` or
+    `KeyboardInterrupt` — both derive from `BaseException`, not
+    `Exception` — so neither is intercepted here; a `^C` or an explicit
+    `sys.exit()` inside `run()` still propagates as itself.
+
+    `test_no_tools_exception_type_escapes_main` in
+    `tools/tests/test_run_matrix.py` only proves this for the one type it
+    injects (`ProblemMetaError`); the property that *every* `tools/` error
+    type is a member of `PACKAGE_ERRORS` — the thing that decides whether a
+    given failure gets the one-line message or the traceback tier — is
+    proven separately, by
+    `test_every_tools_error_type_reachable_from_run_matrix_is_in_package_errors`,
+    which enumerates the actual types defined in every `tools` module
+    reachable from this module's own namespace rather than trusting one
+    injected example to stand for all of them.
 
     Before this, `main()` caught only `MatrixError`. `ProblemMetaError` and
     `ScanError` surfaced as tracebacks and exited 1 as well, so an agent
@@ -1931,6 +1961,16 @@ def main(argv: list[str]) -> int:
         payload = run(argv[1], argv[2])
     except PACKAGE_ERRORS as exc:
         print(f"run_matrix: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        # Not a package problem this pipeline has a name for — a driver bug
+        # or an unnamed environment failure (e.g. `invocation.json`'s own
+        # `write_text` on a full or read-only disk, a plain `OSError`).
+        # Exit 2 is still the right code ("the matrix could not be run at
+        # all" is exactly what a driver crash is), and the traceback on
+        # stderr means nothing is hidden — only the exit code changes from
+        # what an uncaught exception would otherwise produce.
+        traceback.print_exc()
         return 2
     print(f"TL {payload['limits']['tl_ms']} ms  "
           f"kill {payload['limits']['kill_ms']} ms  "

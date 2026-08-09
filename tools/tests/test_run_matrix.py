@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import io
 import json
 import os
@@ -50,6 +51,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2647,12 +2649,23 @@ class ExitCodeContractTest(PackageFixture):
         # `TestRunMatrixFixture.test_band_result_is_reached_and_flagged_with_accurate_wording`)
         # to force every result into the band deterministically, so this
         # is not a probe that could pass by accident of timing.
+        #
+        # `compute_limits` is patched to a degenerate `tl_ms=-1`, so the run
+        # is heavily perturbed; asserting only `code == 2` would pass just
+        # as well for an unrelated `MatrixError` and prove nothing about
+        # `FlagError` specifically. Pin it the way
+        # `test_a_package_error_prints_to_stderr_and_nothing_to_stdout`
+        # already does: capture stderr and require the message actually
+        # names `flags.json`.
         (self.problem_dir / "flags.json").write_text("{not json",
                                                        encoding="utf-8")
         forced = matrix_core.Limits(t_main_ms=2, tl_ms=-1, kill_ms=5000)
+        err = io.StringIO()
         with mock.patch.object(run_matrix, "compute_limits", return_value=forced):
-            code = self._main()
+            with contextlib.redirect_stderr(err):
+                code = self._main()
         self.assertEqual(code, 2)
+        self.assertIn("flags.json", err.getvalue())
 
     def test_a_package_error_prints_to_stderr_and_nothing_to_stdout(self):
         # stdout is the results channel. A caller that parses stdout must
@@ -2667,14 +2680,57 @@ class ExitCodeContractTest(PackageFixture):
         self.assertIn("problem.json", err.getvalue())
 
     def test_no_tools_exception_type_escapes_main(self):
-        # The boundary property itself, asserted rather than assumed: if a
-        # future module raises a new error type through run(), this fails.
+        # An end-to-end check for the one type this actually injects
+        # (`ProblemMetaError`, already a `PACKAGE_ERRORS` member) — not a
+        # general guarantee that *any* future error type is caught; nothing
+        # about running this single case would fail if a new `tools` module
+        # raised a brand-new type main() had never heard of.
+        # `test_every_tools_error_type_reachable_from_run_matrix_is_in_package_errors`
+        # below is what actually proves the boundary property this
+        # docstring used to (wrongly) claim this test alone established.
         (self.problem_dir / "problem.json").write_text("{not json",
                                                        encoding="utf-8")
         try:
             self._main()
         except BaseException as exc:  # noqa: BLE001 - that is the point
             self.fail(f"{type(exc).__module__}.{type(exc).__name__} escaped main()")
+
+    def test_every_tools_error_type_reachable_from_run_matrix_is_in_package_errors(self):
+        # The boundary property itself, enforced rather than asserted by a
+        # single injected example: every exception class actually defined
+        # in `run_matrix` or in any `tools` module `run_matrix` imports
+        # something from must be a member of `PACKAGE_ERRORS` (or
+        # `PACKAGE_ERRORS` itself must widen to a blanket `except
+        # Exception`, which `main()` also has — but that tier prints a raw
+        # traceback rather than a clean message, so an exception type this
+        # pipeline *names* belongs in the one-line-message tier, and this
+        # test is what keeps a newly-added named type from silently falling
+        # through to the traceback tier instead).
+        #
+        # Deliberately not a sweep of `sys.modules`: under full `discover`,
+        # `tools.drift_check` is imported by its own test module, and its
+        # deliberately-excluded `DriftCheckError` would then fail this test
+        # for a module `main()` cannot actually reach through `run()`.
+        # Building the module set from `run_matrix`'s own namespace instead
+        # also self-updates if someone later imports `drift_check` (or
+        # anything else) into `run_matrix` — exactly the case this test
+        # exists to catch.
+        mods = {run_matrix}
+        for obj in vars(run_matrix).values():
+            if isinstance(obj, types.ModuleType):
+                name = obj.__name__
+            elif inspect.isclass(obj) or inspect.isfunction(obj):
+                name = getattr(obj, "__module__", "")
+            else:
+                continue
+            if name == "tools" or name.startswith("tools."):
+                mods.add(sys.modules[name])
+        uncovered = [f"{m.__name__}.{n}"
+                     for m in mods for n, o in vars(m).items()
+                     if inspect.isclass(o) and issubclass(o, BaseException)
+                     and o.__module__ == m.__name__
+                     and not issubclass(o, run_matrix.PACKAGE_ERRORS)]
+        self.assertEqual(uncovered, [])
 
     def test_a_real_hole_still_exits_1(self):
         # The contract's other half: exit 2 must not swallow genuine
@@ -2684,6 +2740,53 @@ class ExitCodeContractTest(PackageFixture):
         path.write_text(path.read_text(encoding="utf-8")
                         .replace("g1=WA", "g1=TL"), encoding="utf-8")
         self.assertEqual(self._main(), 1)
+
+
+class MainExceptionTierTest(unittest.TestCase):
+    """Review finding: `PACKAGE_ERRORS` alone left a real, reachable gap —
+    a plain `OSError` from `invocation.json`'s own `write_text` (a full or
+    read-only disk) is a stdlib exception, not a `tools/` type, so it
+    escaped as a traceback and exited 1 just like `ProblemMetaError` did
+    before this task. `main()`'s trailing `except Exception` closes that
+    gap. No sandbox needed here — `run_matrix.run` is mocked directly, so
+    this does not need `PackageFixture`'s isolate/g++ dependency at all.
+    """
+
+    def _main(self):
+        return run_matrix.main(["run_matrix.py", "/nonexistent/problem",
+                                "/nonexistent/testlib"])
+
+    def test_a_driver_bug_is_exit_2_with_a_traceback_on_stderr(self):
+        # A concrete stand-in for the reviewer's example: some plain
+        # exception `run()` raises that is not a `tools/` type at all, so
+        # it cannot be a `PACKAGE_ERRORS` member.
+        with mock.patch.object(
+                run_matrix, "run",
+                side_effect=OSError("No space left on device")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = self._main()
+        self.assertEqual(code, 2)
+        # The full traceback, not a one-line message — that tier is for
+        # PACKAGE_ERRORS only; a driver bug is not something a package
+        # author can silently act on the way "malformed problem.json" is.
+        self.assertIn("Traceback (most recent call last)", err.getvalue())
+        self.assertIn("OSError", err.getvalue())
+        self.assertIn("No space left on device", err.getvalue())
+
+    def test_keyboard_interrupt_is_not_swallowed(self):
+        # `except Exception` must not catch `BaseException` subclasses that
+        # are not `Exception` subclasses — confirmed rather than assumed,
+        # per Python's own exception hierarchy (`KeyboardInterrupt` and
+        # `SystemExit` derive from `BaseException` directly).
+        with mock.patch.object(run_matrix, "run", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._main()
+
+    def test_system_exit_is_not_swallowed(self):
+        with mock.patch.object(run_matrix, "run", side_effect=SystemExit(3)):
+            with self.assertRaises(SystemExit):
+                self._main()
 
 
 class PoolSizeAtPassTwoTest(PackageFixture):
