@@ -105,6 +105,15 @@ running.
   by `docs/superpowers/plans/2026-08-09-parallel-invocation-matrix.md`: box
   ids are leased from a per-user, cross-process `flock` pool instead of
   derived from `pid`, and pass 2 now runs on that same pool.
+- **The serial re-time is not machine-quiet.** `_run_pass2` drains its own
+  thread pool before re-timing an ambiguous measurement, but `box_pool`'s
+  leases are shared across invocations, so a sibling `run_matrix` can be
+  holding boxes at that moment — and the re-timed value is never re-checked.
+  A wall-kill re-time can wall-kill again and mask a hole. Bounded (total
+  live boxes never exceed `pool_size`; a single invocation is unaffected) and
+  documented in code, so it ships. The obvious fix deadlocks; see
+  `docs/superpowers/specs/2026-08-09-retime-quiescence.md` for the analysis,
+  four candidate approaches, and the acceptance criteria any fix must meet.
 - **`running-contests` is an orphan** — no skill routes to it, not even
   `solving-problems`. A design question, not a defect.
 - **`flight` promises absolute error ≤ 1e-6 but ships `rcmp6`**, which grants

@@ -1483,7 +1483,12 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
     pool, so a sibling `run_matrix` invocation can still be holding boxes
     and driving CPU contention elsewhere on the machine while this re-time
     runs; "every worker idle" is a fact about this invocation, not a
-    guarantee about the machine), only those results that are undecidable
+    guarantee about the machine, and the re-timed value is never fed back
+    through `needs_serial_retime` to check whether it is still ambiguous —
+    an open design question, deliberately deferred rather than patched:
+    see `docs/superpowers/specs/2026-08-09-retime-quiescence.md` for why
+    the obvious fix deadlocks and what any real one must preserve), only
+    those results that are undecidable
     under contention: `needs_serial_retime` calls a CPU-time measurement
     undecidable when it lands close enough to TL that contention could have
     decided it (that set is tiny in practice — the plan's own analysis put
