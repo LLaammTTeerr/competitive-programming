@@ -4,7 +4,7 @@
 
 **Goal:** Make `run_matrix` safe to run concurrently with itself and internally parallel, turning the pipeline's longest serial stage (24s–253s per package, ~1160s across the eight real packages) into a ~2.3x faster stage that still cannot produce a wrong timing verdict.
 
-**Architecture:** Three separate defects are fixed in order, and only the third is about speed. (1) Box ids are leased from a machine-wide `flock` pool instead of derived from `pid`, which is what makes two concurrent invocations collide today. (2) `_run_once` stops sharing one meta file and one staging directory across the whole invocation and owns per-run copies, which is what makes it reentrant. (3) Pass 2 runs on a bounded thread pool sized to the same lease pool, so the lease pool doubles as machine-wide CPU admission control; pass 1 stays serial because it defines TL and costs only 1–6% of the wall clock. Timing stays trustworthy because CPU-time contention is **one-sided** — it can only inflate a measurement — so only results measured in the narrow band `(TL, 1.5·TL]` are ambiguous and get re-timed serially. Measured on the eight real packages: 18 results out of 5508 land in that band.
+**Architecture:** Three separate defects are fixed in order, and only the third is about speed. (1) Box ids are leased from a per-user, cross-process `flock` pool instead of derived from `pid`, which is what makes two concurrent invocations collide today. (2) `_run_once` stops sharing one meta file and one staging directory across the whole invocation and owns per-run copies, which is what makes it reentrant. (3) Pass 2 runs on a bounded thread pool sized to the same lease pool, so the lease pool doubles as this user's CPU admission control; pass 1 stays serial because it defines TL and costs only 1–6% of the wall clock. Timing stays trustworthy because CPU-time contention is **one-sided** — it can only inflate a measurement — so only results measured in the narrow band `(TL, 1.5·TL]` are ambiguous and get re-timed serially. Measured on the eight real packages: 18 results out of 5508 land in that band.
 
 **Tech Stack:** Python 3.10+ stdlib only (no venv, no third-party imports — hard project constraint). `ioi/isolate` 2.6 as the sandbox. `concurrent.futures.ThreadPoolExecutor` (threads, not processes: every unit of work is a `subprocess.run`, which releases the GIL, and the workers must share one `IsolateHandle`).
 
@@ -151,7 +151,7 @@ The band is narrow, so the serial tail is cheap. Simulated against the recorded 
 
 | File | Responsibility | Change |
 |---|---|---|
-| `tools/box_pool.py` | machine-wide isolate box-id leases | **new** |
+| `tools/box_pool.py` | per-user, cross-process isolate box-id leases | **new** |
 | `tools/tests/test_box_pool.py` | lease semantics, including cross-process | **new** |
 | `tools/matrix_core.py` | pure timing/verdict model | add `needs_serial_retime()`; no signature changes to `classify`/`compute_limits` |
 | `tools/run_matrix.py` | the sandboxed driver | lease box ids; per-run meta + staging; parallel pass 2; provenance |
@@ -169,17 +169,32 @@ The band is narrow, so the serial tail is cheap. Simulated against the recorded 
 
 `_select_box_id()` must be replaced by a real allocator before anything else can be parallel. This task builds it standalone, with no `run_matrix` changes, so it can be tested on its own.
 
-The pool is deliberately **machine-wide, not per-process**: it is simultaneously the box-id allocator (fixing Cause A) and the CPU admission-control token pool (bounding `F` when several invocations run at once). Sizing it to `nproc // 2` means three concurrent invocations share four leases rather than running twelve boxes and blowing past the contention bound.
+The pool is deliberately **cross-process, not per-invocation** (and, per the ruling above, per-user): it is simultaneously the box-id allocator (fixing Cause A) and the CPU admission-control token pool (bounding `F` when several invocations run at once). Sizing it to `nproc // 2` means three concurrent invocations share four leases rather than running twelve boxes and blowing past the contention bound.
 
 **Files:**
 - Create: `tools/box_pool.py`
 - Test: `tools/tests/test_box_pool.py`
 
+> **SUPERSEDED IN PART — read this before the code blocks below.** Task 1
+> shipped (`55c0358`, fixes `3a16a27`) under a human ruling that overrides
+> this section: **the pool is per-user, not machine-wide-multi-user.** The
+> lock directory defaults to `/run/user/<uid>/run_matrix-boxes`, falling
+> back to `/tmp/run_matrix-boxes-<uid>`; there is no `0o1777` chmod and no
+> world-writable anything; lock files are `0o600`; and `pool_size()`
+> rejects a value above 65536. The docstrings say per-user and state the
+> consequence: two *different users* running `run_matrix` on one machine
+> can still collide on isolate box ids, and isolate's own lock catches that
+> loudly. The "`/tmp` is the right default, do not fix this" note in the
+> code block below applied to the multi-user design and no longer governs —
+> the tmpfs *reasoning* in it is still correct and still shipped. Read
+> `tools/box_pool.py` for what actually exists; later tasks depend on that,
+> not on this section.
+
 **Interfaces:**
 - Produces:
   - `class BoxPoolError(RuntimeError)`
-  - `pool_size() -> int` — lease count, from `$RUN_MATRIX_BOX_POOL` else `max(1, (os.cpu_count() or 2) // 2)`
-  - `lock_dir() -> Path` — from `$RUN_MATRIX_BOX_LOCK_DIR` else `/tmp/run_matrix-boxes`
+  - `pool_size() -> int` — lease count, from `$RUN_MATRIX_BOX_POOL` else `max(1, (os.cpu_count() or 2) // 2)`, rejecting anything above 65536
+  - `lock_dir() -> Path` — from `$RUN_MATRIX_BOX_LOCK_DIR` else the per-user default
   - `lease(*, timeout_s: float = 3600.0) -> ContextManager[int]` — yields an isolate box id held exclusively for the `with` body
 - Consumed by: Task 2 (`run_matrix._run_once`, `run_matrix.open_isolate_box`)
 
@@ -579,31 +594,6 @@ class BoxLeasingTest(TestRunMatrixFixture):
         script.chmod(0o755)
         return str(script)
 
-    def test_two_concurrent_run_once_calls_never_share_a_box(self):
-        # The end-to-end Cause-A regression test: run the same binary from two
-        # threads and assert both produced a real verdict. Before the lease
-        # pool this raced on box ids and one side raised MatrixError.
-        import concurrent.futures
-        binary = _compile("int main(){ return 0; }\n",
-                          self.tmp / "trivial", self.tmp)
-        os.chmod(self.tmp, 0o777)
-        stdin_path = self.tmp / "in.txt"
-        stdin_path.write_text("\n", encoding="utf-8")
-
-        isolate = run_matrix.open_isolate_box(self.tmp)
-        try:
-            with concurrent.futures.ThreadPoolExecutor(2) as pool:
-                futures = [pool.submit(run_matrix._run_once, isolate, binary,
-                                       stdin_path, self.tmp / f"out{i}",
-                                       cpu_limit_s=5.0, wall_limit_s=10.0,
-                                       mem_limit_kb=256 * 1024)
-                           for i in range(2)]
-                results = [f.result() for f in futures]
-        finally:
-            run_matrix.close_isolate_box(isolate)
-        for r in results:
-            self.assertFalse(r.crashed, r)
-            self.assertFalse(r.killed, r)
 ```
 
 The two `_init_box` tests call the helper as
@@ -612,7 +602,7 @@ The two `_init_box` tests call the helper as
 `run_matrix._init_box(self._fake_isolate(rc=1, message="Cannot initialize "
 "control group"), 7)` respectively.
 
-> **Note for the implementer:** `test_two_concurrent_run_once_calls_never_share_a_box` will still fail after this task if Cause B is unfixed — the shared meta file and shared staging directory are Task 3. Mark it `@unittest.expectedFailure` here with a comment naming Task 3, and remove that decorator in Task 3 Step 4. Do not weaken the assertions to make it pass early.
+> **Note for the implementer:** `test_two_concurrent_run_once_calls_never_share_a_box` belongs to **Task 3**, not this task — do not add it here. Two threads sharing one `IsolateHandle` still share a meta file and a staging directory until Task 3, so its outcome at this point is a race: it fails when the clobbering happens to be observable and passes when it doesn't (two ~6 ms trivial runs frequently serialize, and a clobbered stdout in stdin mode lands in the harmless `FileNotFoundError → data=b""` branch). An `@unittest.expectedFailure` on a test that passes by luck reports **unexpected success**, which fails the suite — a flaky gate on the very task whose acceptance criterion is "two concurrent suites both pass". Task 2's acceptance is Step 5's two-concurrent-suites run, which is the property Task 2 actually fixes: separate processes already have separate handles, so only the box ids were colliding.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -649,9 +639,10 @@ def _init_box(binary: str, box_id: int) -> None:
         raise MatrixError(
             f"isolate box {box_id} is already in use by another process "
             f"({detail}). This driver leases every box id through "
-            f"{box_pool.lock_dir()} before touching it, so this means "
-            "something outside the lease pool is using isolate on this "
-            "machine — another tool, or a stale run started before the "
+            f"{box_pool.lock_dir()} before touching it, and that lease pool "
+            "is per-user — so the cause is something the pool cannot see: "
+            "another user running run_matrix on this machine, another tool "
+            "using isolate directly, or a stale run started before the "
             "lease pool existed. It is not an install problem: nothing "
             "about cgroups, subuid ranges or isolate-cg-keeper needs "
             "changing."
@@ -696,7 +687,7 @@ In `_run_once`, replace `box_id = next(isolate.box_id_counter) % 65536` / `_init
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m unittest tools.tests.test_run_matrix -v`
-Expected: PASS, with `test_two_concurrent_run_once_calls_never_share_a_box` reported as an expected failure.
+Expected: PASS, no expected failures and no skips.
 
 - [ ] **Step 5: Verify the acceptance property directly**
 
@@ -816,6 +807,32 @@ class ReentrancyTest(TestRunMatrixFixture):
         self.assertEqual(out_a.read_text().strip(), "AAA")
         self.assertEqual(out_b.read_text().strip(), "BBB")
 
+    def test_two_concurrent_run_once_calls_never_share_a_box(self):
+        # The end-to-end Cause-A regression test: run the same binary from two
+        # threads and assert both produced a real verdict. Before the lease
+        # pool this raced on box ids and one side raised MatrixError.
+        import concurrent.futures
+        binary = _compile("int main(){ return 0; }\n",
+                          self.tmp / "trivial", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                futures = [pool.submit(run_matrix._run_once, isolate, binary,
+                                       stdin_path, self.tmp / f"out{i}",
+                                       cpu_limit_s=5.0, wall_limit_s=10.0,
+                                       mem_limit_kb=256 * 1024)
+                           for i in range(2)]
+                results = [f.result() for f in futures]
+        finally:
+            run_matrix.close_isolate_box(isolate)
+        for r in results:
+            self.assertFalse(r.crashed, r)
+            self.assertFalse(r.killed, r)
+
     def test_run_directory_is_removed_after_a_successful_run(self):
         binary = _compile("int main(){ return 0; }\n",
                           self.tmp / "trivial", self.tmp)
@@ -891,8 +908,9 @@ class IsolateHandle:
     `_stage_base()`.
 
     Box ids are not a field here at all — `_run_once` leases one per run from
-    `tools.box_pool`, which is machine-wide and therefore also excludes
-    *other* invocations, something no per-handle counter could do.
+    `tools.box_pool`, which is cross-process and therefore also excludes
+    *other* invocations by this user, something no per-handle counter
+    could do.
     """
 
     binary: str
@@ -970,9 +988,9 @@ In `_run_once`, inside the lease, create the per-run directories and point every
             _remove_run_dir(run_dir)
 ```
 
-- [ ] **Step 4: Remove the expected-failure marker from Task 2**
+- [ ] **Step 4: Confirm the concurrency test is genuinely load-bearing**
 
-Delete the `@unittest.expectedFailure` decorator (and its Task 3 comment) from `test_two_concurrent_run_once_calls_never_share_a_box`.
+`test_two_concurrent_run_once_calls_never_share_a_box` lives in this task because it only passes deterministically once `_run_once` is reentrant. Prove it is not passing by luck: temporarily revert `_run_once` to the single shared `meta_path`/`stage_dir` (stash the change, or point both runs at one meta file), confirm the test fails, then restore. Record the observed failure in your report — a concurrency test that has never been seen to fail has not been shown to test anything.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -1504,12 +1522,19 @@ Replace `README.md:168-171` with:
 
 ```markdown
 **The tools suite is parallel-safe.** `run_matrix.py` leases every isolate
-box id from a machine-wide `flock` pool (`/tmp/run_matrix-boxes`, overridable
-with `$RUN_MATRIX_BOX_LOCK_DIR`), so several invocations — or several
+box id from a per-user `flock` pool (`/run/user/<uid>/run_matrix-boxes`,
+falling back to `/tmp/run_matrix-boxes-<uid>`, overridable with
+`$RUN_MATRIX_BOX_LOCK_DIR`), so several invocations — or several
 `dispatching-parallel-agents` subagents, or two copies of the test suite —
 can run at once without colliding. It also runs pass 2 on that same pool, so
-the pool size is simultaneously the box allocator and the machine's CPU
+the pool size is simultaneously the box allocator and this user's CPU
 admission control.
+
+The pool is per-user, and that bound is worth knowing: two *different* users
+running `run_matrix` on the same machine can still land on the same isolate
+box id. That collision is caught loudly by isolate's own lock — the driver
+names it and stops, rather than reporting a wrong verdict — but it is not
+prevented.
 
 `$RUN_MATRIX_BOX_POOL` sets the pool size; it defaults to half the CPUs. That
 default is a correctness bound, not a throughput setting: CPU time inflates
@@ -1530,7 +1555,7 @@ After the `python3 -m tools.run_matrix "$PROBLEM" "$TESTLIB"` block in `skills/v
 The matrix runs several sandboxes at once (half this machine's CPUs by
 default; `RUN_MATRIX_BOX_POOL=N` to change it, `RUN_MATRIX_BOX_POOL=1` for a
 fully quiesced run). Running it in parallel with another package's matrix is
-safe — box ids are leased machine-wide.
+safe — box ids are leased through a per-user, cross-process pool.
 
 Timing stays trustworthy because contention can only make a run look
 *slower*, never faster. A result measured close enough to TL that contention
@@ -1547,8 +1572,8 @@ In `docs/superpowers/specs/2026-07-31-stage-3-scope.md`, replace the "The test s
 ```markdown
 - ~~**The test suite is not parallel-safe with itself.**~~ **Resolved**
   2026-08-09 by `docs/superpowers/plans/2026-08-09-parallel-invocation-matrix.md`:
-  box ids are leased from a machine-wide `flock` pool instead of derived from
-  `pid`, `_run_once` owns its meta file and staging directory, and pass 2 runs
+  box ids are leased from a per-user, cross-process `flock` pool instead of
+  derived from `pid`, `_run_once` owns its meta file and staging directory, and pass 2 runs
   on the lease pool.
 ```
 
