@@ -560,8 +560,16 @@ Add to `tools/tests/test_run_matrix.py`:
 > only `self.tmp` and the `g++`/`isolate` skip guard. Task 2 got this wrong
 > and paid for it — `BoxLeasingTest` inherited ~50 unrelated tests to gain
 > 3, taking the suite from 289 to 342 and adding ~108s, doubled again by
-> the two-concurrent-suites acceptance run. Task 2's fix round introduces
-> the mixin; reuse it, do not re-derive it.
+> the two-concurrent-suites acceptance run. The light base already exists
+> as **`MinimalIsolateFixture`** (in `tools/tests/test_run_matrix.py`,
+> added by Task 2's fix round): it gives `self.tmp` and the `g++`/`isolate`
+> skip guard, and deliberately does *not* copy the `mini` package or
+> resolve the testlib cache. Reuse it; do not re-derive it.
+>
+> Task 3's tests are a mixed case and need judgment rather than a blanket
+> rule: those driving `_run_once` directly — concurrency, staging, per-run
+> isolation — want `MinimalIsolateFixture`, while anything calling `run()`
+> over a real package still needs the full `TestRunMatrixFixture`.
 >
 > Binaries are built with the **module-level** `_compile(src_text, out_path,
 > tmp_dir)` helper (`:140`) — there is no `self._compile`.
