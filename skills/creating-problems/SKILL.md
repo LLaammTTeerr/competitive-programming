@@ -92,12 +92,13 @@ Either way, the phase this mode-detection produces is **G1**, below.
 
 ## The gate model
 
-**One blocking gate: G1 — idea, story, subtasks.** It is the only point in
-the whole pipeline where this skill stops and waits for a human decision,
-because it is the input, it is creative, and it produces `problem.json` —
-the file every later phase treats as authoritative. Whether G1 is satisfied
-by preparing a finished idea directly or by a full `shaping-problems` run,
-it does not close until `problem.json` loads and validates.
+**One blocking gate: G1 — idea, story, subtasks, format.** It is the only
+point in the whole pipeline where this skill stops and waits for a human
+decision, because it is the input, it is creative, and it produces
+`problem.json` — the file every later phase treats as authoritative.
+Whether G1 is satisfied by preparing a finished idea directly or by a full
+`shaping-problems` run, it does not close until `problem.json` loads and
+validates.
 
 **Everything after G1 flags and continues.** Algorithm choice, a borderline
 TLE reclassified to `time-limit-exceeded-or-accepted`, stock-vs-custom

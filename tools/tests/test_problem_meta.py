@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.problem_meta import ProblemMetaError, load
+from tools.problem_meta import FORMAT_VALUES, ProblemMetaError, load
 
 # Anchored to this file, not to the process's working directory — see
 # test_run_matrix.py / test_package_status.py, which document why.
@@ -97,6 +97,74 @@ class TestLoad(unittest.TestCase):
         del bad["subtasks"][0]["points"]
         with self.assertRaisesRegex(ProblemMetaError, "points"):
             load(write(bad))
+
+
+class TestFormatField(unittest.TestCase):
+    """`format` ("oi" | "icpc") is optional and, when absent, inferred from
+    the subtask ladder already parsed above it — see the comment in `load`
+    for why inference only goes one way."""
+
+    def _single_subtask(self) -> dict:
+        # VALID's `g2` depends on `g1`; drop it rather than leave a dangling
+        # `depends_on` behind.
+        doc = json.loads(json.dumps(VALID))
+        doc["subtasks"] = [dict(doc["subtasks"][0], points=100)]
+        return doc
+
+    def test_infers_icpc_for_a_single_subtask(self):
+        self.assertEqual(load(write(self._single_subtask())).format, "icpc")
+
+    def test_infers_oi_for_more_than_one_subtask(self):
+        # VALID itself carries two subtasks (g1, g2).
+        self.assertEqual(load(write(VALID)).format, "oi")
+
+    def test_explicit_value_overrides_inference_either_direction(self):
+        # A single 100-point group is legal OI too — a group ladder with one
+        # rung is not the same claim as "this problem is scored ICPC-style"
+        # — so an explicit "oi" here must stick despite the single subtask.
+        one_group_oi = dict(self._single_subtask(), format="oi")
+        self.assertEqual(load(write(one_group_oi)).format, "oi")
+        # And the reverse: several subtasks scored all-or-nothing (a scoring
+        # group per rung, but no partial credit) is legal ICPC.
+        multi_group_icpc = dict(json.loads(json.dumps(VALID)), format="icpc")
+        self.assertEqual(load(write(multi_group_icpc)).format, "icpc")
+
+    def test_accepted_values_are_exactly_oi_and_icpc(self):
+        self.assertEqual(FORMAT_VALUES, ("oi", "icpc"))
+
+    def test_rejects_a_value_outside_the_closed_set(self):
+        for bad_value in ("OI", "ioi", "Icpc", "both"):
+            with self.subTest(value=bad_value):
+                bad = dict(VALID, format=bad_value)
+                with self.assertRaisesRegex(ProblemMetaError, "format"):
+                    load(write(bad))
+
+    def test_rejection_names_both_accepted_values(self):
+        # Semantics: "naming the field and the two accepted values" — not
+        # just "format", or a shortened message with one value dropped
+        # would still pass every other case above.
+        bad = dict(VALID, format="ioi")
+        with self.assertRaises(ProblemMetaError) as ctx:
+            load(write(bad))
+        message = str(ctx.exception)
+        for value in FORMAT_VALUES:
+            self.assertIn(value, message)
+
+    def test_rejects_a_non_string(self):
+        bad = dict(VALID, format=1)
+        with self.assertRaisesRegex(ProblemMetaError, "format"):
+            load(write(bad))
+
+    def test_rejects_explicit_null_rather_than_inferring(self):
+        # `"format": null` is a typo — an emptied key, per R1 — not the same
+        # document as one where the key was never written.
+        bad = dict(VALID, format=None)
+        with self.assertRaisesRegex(ProblemMetaError, "format"):
+            load(write(bad))
+
+    def test_format_survives_on_the_loaded_problem_object(self):
+        problem = load(write(dict(VALID, format="icpc")))
+        self.assertEqual(problem.format, "icpc")
 
 
 class TestLoadWrapsEveryFailure(unittest.TestCase):

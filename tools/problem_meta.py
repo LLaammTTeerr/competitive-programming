@@ -8,6 +8,7 @@ from pathlib import Path
 
 SCHEMA = 1
 CHECKER_KINDS = ("stock", "custom")
+FORMAT_VALUES = ("oi", "icpc")
 
 
 class ProblemMetaError(ValueError):
@@ -52,6 +53,7 @@ class Problem:
     constraints: list[Constraint]
     subtasks: list[Subtask]
     examples: list[dict]
+    format: str = "icpc"
 
     def constraint(self, cid: str) -> Constraint:
         for c in self.constraints:
@@ -351,6 +353,26 @@ def load(path: str | Path) -> Problem:
         for dep in reversed(subtask.depends_on):
             stack.append(("enter", dep, trail + [sid]))
 
+    # `format` decides how the package scores: "icpc" (one 100-point group,
+    # binary) or "oi" (partial credit across the subtask ladder). Absent is
+    # inferred from the ladder already parsed above — more than one subtask
+    # reads as "oi", one (or none) reads as "icpc". Inference cannot go the
+    # other way: a single 100-point group is legal under either format (OI
+    # with no ladder is rare but not wrong), so declaring `"format": "oi"`
+    # explicitly is the only way to keep that reading once there is only one
+    # group. An explicit value always wins over inference, whichever way it
+    # points. `"format" in raw` (not `raw.get`) so an explicit `null` is
+    # rejected rather than silently falling back to inference — `null` is a
+    # typo (an emptied key), not "unset".
+    if "format" in raw:
+        fmt = raw["format"]
+        if fmt not in FORMAT_VALUES:
+            raise ProblemMetaError(
+                f"{path}: 'format' is {fmt!r}, expected one of {FORMAT_VALUES}"
+            )
+    else:
+        fmt = "oi" if len(subtasks) > 1 else "icpc"
+
     try:
         name = raw["name"]
     except KeyError as exc:
@@ -435,5 +457,6 @@ def load(path: str | Path) -> Problem:
         checker_name=checker_name,
         constraints=constraints,
         subtasks=subtasks,
+        format=fmt,
         examples=[_object(e, path, f"examples[{i}]") for i, e in enumerate(_array(raw.get("examples", []), path, "'examples'"))],
     )
