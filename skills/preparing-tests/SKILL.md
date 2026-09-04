@@ -88,8 +88,8 @@ Compile everything the same way — with `$PROBLEM` spelled out on both
 sides, since the working directory is `$PLUGIN_ROOT`, not the problem.
 **`validator.cpp` lives in `$PROBLEM/files/`, not `$PROBLEM/`** — confirmed
 against `tools/package_status.py`'s own `validator` phase check
-(`files / "validator.cpp"`) and against both on-disk packages
-(`flight/files/validator.cpp`, `tools/tests/fixtures/mini/files/validator.cpp`).
+(`files / "validator.cpp"`) and against the in-repo fixture
+(`tools/tests/fixtures/mini/files/validator.cpp`).
 A validator built at `$PROBLEM/validator.cpp` compiles and runs, but
 `package_status` will never see it as done — it checks one specific path,
 not "a validator exists somewhere in this directory":
@@ -432,9 +432,9 @@ or an explicit `A.size()` check) was never expressed to testlib as a
 number. Confirmed against a real validator: a length-bounded
 `readToken("[a-z]{1,20}", "A")`, run through `--testOverviewLogFileName`,
 produces exactly `variable "A"` and nothing else — exit 0, clean-looking
-log, checking nothing. This is `flight`'s own bound shape
-(`1 <= |A| <= 20`), and it is a common one: the reaching check silently
-does nothing for it, and a clean run reads as "nothing to report" when the
+log, checking nothing. This is a common bound shape — a length-bounded
+string, `1 <= |A| <= 20` — and the reaching check silently does nothing
+for it, and a clean run reads as "nothing to report" when the
 truth is "this mechanism cannot see this bound".
 
 **The same blindness applies to a subtask-tightened numeric bound enforced
