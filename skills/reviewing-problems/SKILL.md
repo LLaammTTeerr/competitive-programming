@@ -107,13 +107,14 @@ A term used as though the reader already knows it, with no definition
 anywhere in the statement.
 
 **Operator-facing rationale — not part of the dispatch payload.** The rest
-of this subsection names a specific package and its specific answer; it
-exists to convince *you*, reading this skill, that this class of defect is
-real and easy to miss — never relay it to a subagent you dispatch to review
-that package (see "Run as a subagent" below for what to relay instead).
+of this subsection quotes a specific constraint line and its specific
+answer; it exists to convince *you*, reading this skill, that this class of
+defect is real and easy to miss — never relay it to a subagent you dispatch
+to review a package (see "Run as a subagent" below for what to relay
+instead).
 
-**The live example, and it must be treated as a
-real defect, not a hypothetical:** `flight`'s own constraint line says
+**The worked example, drawn from a real statement, and it must be treated
+as a real defect, not a hypothetical:** the constraint line read
 
 > một trong hai xâu có thể là **xâu con** của xâu còn lại
 
@@ -121,19 +122,20 @@ real defect, not a hypothetical:** `flight`'s own constraint line says
 and as *subsequence* (not necessarily contiguous) to some — the two
 readings disagree on whether `"101"` is a `xâu con` of `"10011"`, which is
 contiguous under neither reading but is a subsequence under one. (Reach for
-an illustration built from the problem's own alphabet: `flight.tex`'s
+an illustration built from the problem's own alphabet: that statement's
 constraint block restricts `A` and `B` to `0` and `1`, so a
 `"1a0a1"`-shaped example is not an input this problem can have, and an
 off-alphabet illustration invites the reader to dismiss the whole finding as
 hypothetical.) The unambiguous phrasing is `xâu con liên tiếp`. It is **not
-fatal** in `flight`'s case — the body of the statement defines the win
+fatal** in this case — the body of the statement defines the win
 condition precisely via `t_A`, which it defines not as "the first index at
 which `A` occurs" but as the smallest index such that the `|A|` consecutive
 characters **ending at** `t_A` spell `A`, i.e. `c_{t_A-|A|+1} … c_{t_A} = A`.
-Start-versus-end is exactly the defect `sol-start-index.cpp` in the zoo
-encodes, so paraphrase it from the `.tex` rather than from memory — a review
-that restates `t_A` loosely as a "first occurrence" index has reproduced the
-wrong solution's reading inside the audit that is supposed to catch it. A
+Start-versus-end is exactly the misreading a `wrong-answer` entry in the
+zoo encodes, so paraphrase it from the `.tex` rather than from memory — a
+review that restates `t_A` loosely as a "first occurrence" index has
+reproduced the wrong solution's reading inside the audit that is supposed
+to catch it. A
 careful reader resolves the ambiguity from that definition even though the
 constraint line alone does not settle it. But it **survived its own
 author's verification pass and would have shipped** unflagged. State this
@@ -222,12 +224,11 @@ awk 'FNR==1{print length($1)}' "$PROBLEM"/tests/g1/*.in | sort -n | sed -n '1p;$
 ```
 
 **Operator-facing rationale — not part of the dispatch payload.** This
-`readToken` limitation was first found on `flight`'s own `1 <= |A| <= 20`
-bound, which is expressed exactly this way. Worth knowing if you are the
-operator deciding whether to trust a clean-looking union, but naming the
-specific package and bound here is exactly the kind of worked example class
-2's marker above warns against relaying verbatim to a fresh subagent
-reviewing that same package.
+`readToken` limitation was first found on a real package's `1 <= |A| <= 20`
+string-length bound, which is expressed exactly this way. Worth knowing if
+you are the operator deciding whether to trust a clean-looking union, but
+naming the specific bound here is exactly the kind of worked example class
+2's marker above warns against relaying verbatim to a fresh subagent.
 
 A bound that turns out unreached is a `test-weakness` flag — hand it back to
 `preparing-tests` for a test that closes it; this audit records the gap, it
@@ -250,15 +251,15 @@ package the way a contestant would, with none of the context that produced
 it. **Stop before any worked example.** A worked example that names the
 package under review — everything under class 2's **"Operator-facing
 rationale"** marker, and class 5's **"Operator-facing rationale"** block,
-which is the one that names `flight`'s `1 <= |A| <= 20` (class 5's
+which is the one that names the `1 <= |A| <= 20` bound (class 5's
 `readToken` limitation *itself*, and the `awk` fallback beside it, are
 generic and **do** belong in the payload) — exists to convince the *operator
 reading this file* that fresh context matters; relaying it to the subagent
 instead hands over that
 package's own answer before the subagent has read a line of the statement,
-which is self-defeating on the one package (`flight`) this file is written
-against, and would be equally self-defeating on any future worked example
-added here. This is a general rule, not a one-off patch for `flight`. Both
+which is self-defeating on the package a worked example was drawn from,
+and would be equally self-defeating on any future worked example added
+here. This is a general rule, not a one-off patch for one package. Both
 package-specific blocks above are marked **"Operator-facing rationale — not
 part of the dispatch payload"** for exactly this reason: read them
 yourself, never paste them into a subagent's prompt.

@@ -5,7 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 from tools import problem_meta
-from tools.package_status import PHASE_ORDER, _matrix, main, next_phase, status
+from tools.package_status import (PHASE_ORDER, _matrix, main, newest_source_mtime,
+                                  next_phase, status)
 
 # Anchored to this file, not to the process's working directory: the suite is
 # documented to run from the repository root, but a fixture path that only
@@ -409,10 +410,6 @@ class TestMain(unittest.TestCase):
         self.assertIn("next: matrix", out)
 
     def test_main_exits_0_when_all_phases_complete(self):
-        # Add invocation.json to make matrix complete
-        (self.dir / "invocation.json").write_text(
-            json.dumps({"schema": 1, "holes": [], "mismatches": []}),
-            encoding="utf-8")
         # Add example with sample files
         problem = json.loads((self.dir / "problem.json").read_text(encoding="utf-8"))
         problem["examples"] = [{"test": "tests/samples/01", "note": ""}]
@@ -420,6 +417,20 @@ class TestMain(unittest.TestCase):
         samples_dir = self.dir / "tests" / "samples"
         samples_dir.mkdir(exist_ok=True)
         (samples_dir / "01.in").write_text("test\n")
+        # Add invocation.json to make matrix complete. Written *last*, and
+        # then stamped strictly newer than every source `_matrix`'s
+        # freshness gate walks: the `problem.json` rewrite and the
+        # `tests/samples/` mkdir above are exactly the edits that gate
+        # exists to catch, so writing the artifact before them (as this
+        # test once did) only passed on machines fast enough to land all
+        # four writes in one mtime tick. The explicit `os.utime` removes
+        # the tick dependence entirely rather than relying on write order.
+        artifact = self.dir / "invocation.json"
+        artifact.write_text(
+            json.dumps({"schema": 1, "holes": [], "mismatches": []}),
+            encoding="utf-8")
+        later = newest_source_mtime(self.dir) + 10
+        os.utime(artifact, (later, later))
         exit_code, out = self.main([None, str(self.dir)])
         self.assertEqual(exit_code, 0)
         self.assertIn("complete", out)

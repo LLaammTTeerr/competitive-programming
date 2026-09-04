@@ -198,12 +198,15 @@ value up to isolate's own box-id ceiling with no check against the core
 count, so raising it past `nproc` is an operator hazard, not a safety net —
 nothing bounds wall-time inflation the way `CONTENTION_BOUND` bounds CPU
 time, so oversubscription is where wall-clock kills start showing up. The
-same is true of memory: each sandbox is capped at the problem's own
-`memory_mb` via `--cg-mem`, but `pool_size()` sandboxes run at once, so this
-driver's own peak memory footprint from live sandboxes is
-`workers × memory_mb`, with nothing here checking that sum against the
-machine's physical RAM — raising `$RUN_MATRIX_BOX_POOL` multiplies memory
-pressure exactly as it multiplies CPU pressure. Raise
+same is true of memory: each sandbox's cgroup is capped via `--cg-mem` at
+the problem's `memory_mb` plus a fixed 256 MB output allowance (on cgroup
+v2 a solution's dirty output pages are charged to its cgroup until written
+back, so the cap must leave room for them; ML itself is judged from the
+child's peak RSS against `memory_mb`), but `pool_size()` sandboxes run at
+once, so this driver's own peak memory footprint from live sandboxes is
+`workers × (memory_mb + 256 MB)`, with nothing here checking that sum
+against the machine's physical RAM — raising `$RUN_MATRIX_BOX_POOL`
+multiplies memory pressure exactly as it multiplies CPU pressure. Raise
 it only on a machine with the resources to match, and set it to `1` for a
 fully quiesced authoritative run *provided this is the only `run_matrix`
 invocation on the machine* — a sibling invocation running at

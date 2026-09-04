@@ -88,8 +88,8 @@ Compile everything the same way — with `$PROBLEM` spelled out on both
 sides, since the working directory is `$PLUGIN_ROOT`, not the problem.
 **`validator.cpp` lives in `$PROBLEM/files/`, not `$PROBLEM/`** — confirmed
 against `tools/package_status.py`'s own `validator` phase check
-(`files / "validator.cpp"`) and against both on-disk packages
-(`flight/files/validator.cpp`, `tools/tests/fixtures/mini/files/validator.cpp`).
+(`files / "validator.cpp"`) and against the in-repo fixture
+(`tools/tests/fixtures/mini/files/validator.cpp`).
 A validator built at `$PROBLEM/validator.cpp` compiles and runs, but
 `package_status` will never see it as done — it checks one specific path,
 not "a validator exists somewhere in this directory":
@@ -175,10 +175,12 @@ paragraph:
   `2×TL`; only a result strictly over `TL` and up through `2×TL` is flagged
   as `timing-band` and never given a pass/fail verdict — it is a coin flip
   on different hardware, not a number to argue with.
-- **Memory is enforced by the kernel**, not observed. isolate's `--cg-mem`
-  plus its `cg-oom-killed` meta field *is* the ML signal — there is no
-  polled RSS reading to second-guess, and none of that reasoning belongs in
-  a generator or validator you write; it lives entirely in `run_matrix.py`.
+- **Memory is measured by the kernel**, not polled. ML is isolate's own
+  `max-rss` for the child strictly over `memory_mb`, or a `cg-oom-killed`
+  from the cgroup — whose `--cg-mem` cap sits a fixed 256 MB *above*
+  `memory_mb`, because on cgroup v2 a solution's dirty output pages are
+  charged to it until written back. None of that reasoning belongs in a
+  generator or validator you write; it lives entirely in `run_matrix.py`.
 
 ## The order is the doctrine: checker, then validator, then generators
 
@@ -430,9 +432,9 @@ or an explicit `A.size()` check) was never expressed to testlib as a
 number. Confirmed against a real validator: a length-bounded
 `readToken("[a-z]{1,20}", "A")`, run through `--testOverviewLogFileName`,
 produces exactly `variable "A"` and nothing else — exit 0, clean-looking
-log, checking nothing. This is `flight`'s own bound shape
-(`1 <= |A| <= 20`), and it is a common one: the reaching check silently
-does nothing for it, and a clean run reads as "nothing to report" when the
+log, checking nothing. This is a common bound shape — a length-bounded
+string, `1 <= |A| <= 20` — and the reaching check silently does nothing
+for it, and a clean run reads as "nothing to report" when the
 truth is "this mechanism cannot see this bound".
 
 **The same blindness applies to a subtask-tightened numeric bound enforced

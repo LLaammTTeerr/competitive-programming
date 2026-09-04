@@ -564,14 +564,90 @@ class TestRunMatrixFixture(PackageFixture):
         finally:
             run_matrix.close_isolate_box(isolate)
 
+        # The unbounded hog runs past `memory_mb + OUTPUT_SLACK_KB` (the
+        # cgroup cap `_run_once` actually applies — see that constant), so
+        # this is the genuine-OOM path to ML, as distinct from the max-rss
+        # path `test_rss_over_the_limit_but_under_the_cgroup_cap_is_ml`
+        # pins below.
         self.assertTrue(r.oom, r)
         self.assertFalse(r.killed, r)
 
         outcome = run_matrix._classify(r, checker=Path("/bin/true"),
                                        test=stdin_path, out=out_path,
                                        ans=stdin_path, limits=Limits(
-                                           t_main_ms=1, tl_ms=1000, kill_ms=2000))
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000),
+                                       mem_limit_kb=64 * 1024)
         self.assertEqual(outcome.verdict, "ML")
+
+    def test_rss_over_the_limit_but_under_the_cgroup_cap_is_ml(self):
+        # `--cg-mem` is `memory_mb + OUTPUT_SLACK_KB`, not `memory_mb`: on
+        # cgroup v2 the page cache a solution dirties while writing its
+        # output is charged to its cgroup until writeback drains it, so a
+        # cap set exactly at `memory_mb` OOM-kills a solution for its
+        # *output* (measured: anon 160 KB, file 32 MB all dirty/writeback,
+        # OOM under a 32 MB cap). The cap therefore carries slack, and ML
+        # is judged from `max-rss` against the *unslacked* limit. A
+        # solution that touches 64 MB under a 32 MB limit must be ML
+        # without ever being OOM-killed — this is the path that did not
+        # exist before: pre-fix, `oom` is True here (the cap was 32 MB).
+        # Same `volatile` pattern as `test_peak_kb_does_not_carry_over`,
+        # so the allocation cannot be constant-folded away.
+        binary = _compile(
+            "#include <cstdlib>\n#include <cstdio>\n"
+            "int main(){ size_t n = 64*1024*1024; "
+            "volatile char *p = (volatile char*)malloc(n); if(!p) return 1; "
+            "for (size_t i = 0; i < n; i += 4096) p[i] = (char)(i & 0xFF); "
+            "printf(\"%d\\n\", (int)p[n-4096]); return 0; }\n",
+            self.tmp / "overshoot", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        out_path = self.tmp / "overshoot.out"
+        mem_limit_kb = 32 * 1024
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            r = run_matrix._run_once(isolate, binary, stdin_path, out_path,
+                                     cpu_limit_s=5.0, wall_limit_s=15.0,
+                                     mem_limit_kb=mem_limit_kb)
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertFalse(r.oom, r)
+        self.assertFalse(r.crashed, r)
+        self.assertFalse(r.killed, r)
+        self.assertGreater(r.peak_kb, mem_limit_kb, r)
+
+        outcome = run_matrix._classify(r, checker=Path("/bin/true"),
+                                       test=stdin_path, out=out_path,
+                                       ans=stdin_path, limits=Limits(
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000),
+                                       mem_limit_kb=mem_limit_kb)
+        self.assertEqual(outcome.verdict, "ML")
+
+    def test_run_once_applies_the_output_slack_to_cg_mem(self):
+        # The slack is a policy with a number attached, so pin the argv:
+        # `--cg-mem` must be the limit plus `OUTPUT_SLACK_KB`, and the slack
+        # must be exactly `--fsize` — the largest single file the sandbox
+        # permits, so any output the harness allows can sit fully dirty in
+        # the page cache without tripping the cap.
+        binary = _compile("int main(){ return 0; }\n", self.tmp / "argv", self.tmp)
+        os.chmod(self.tmp, 0o777)
+        stdin_path = self.tmp / "in.txt"
+        stdin_path.write_text("\n", encoding="utf-8")
+        mem_limit_kb = 32 * 1024
+
+        isolate = run_matrix.open_isolate_box(self.tmp)
+        try:
+            argv = self._isolate_run_argv(lambda: run_matrix._run_once(
+                isolate, binary, stdin_path, self.tmp / "argv.out",
+                cpu_limit_s=5.0, wall_limit_s=15.0, mem_limit_kb=mem_limit_kb))
+        finally:
+            run_matrix.close_isolate_box(isolate)
+
+        self.assertEqual(run_matrix.OUTPUT_SLACK_KB, run_matrix.OUTPUT_LIMIT_KB)
+        self.assertIn(f"--cg-mem={mem_limit_kb + run_matrix.OUTPUT_SLACK_KB}", argv)
+        self.assertIn(f"--fsize={run_matrix.OUTPUT_LIMIT_KB}", argv)
 
     def test_oom_does_not_leak_into_the_next_run_in_the_same_handle(self):
         # Task 9c: the `flight` dogfood found that isolate's cgroup counters
@@ -870,7 +946,8 @@ class TestRunMatrixFixture(PackageFixture):
         outcome = run_matrix._classify(r, checker=Path("/bin/true"),
                                        test=stdin_path, out=out_path,
                                        ans=stdin_path, limits=Limits(
-                                           t_main_ms=1, tl_ms=1000, kill_ms=2000))
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000),
+                                       mem_limit_kb=32 * 1024)
         self.assertEqual(outcome.verdict, "OK")
 
     def test_output_is_bounded_by_fsize_and_surfaces_as_a_crash_not_an_ml(self):
@@ -909,7 +986,8 @@ class TestRunMatrixFixture(PackageFixture):
         outcome = run_matrix._classify(r, checker=Path("/bin/true"),
                                        test=stdin_path, out=out_path,
                                        ans=stdin_path, limits=Limits(
-                                           t_main_ms=1, tl_ms=1000, kill_ms=2000))
+                                           t_main_ms=1, tl_ms=1000, kill_ms=2000),
+                                       mem_limit_kb=256 * 1024)
         self.assertEqual(outcome.verdict, "RE")
 
     # ------------------------------------------------------------------
@@ -1873,7 +1951,8 @@ class TestRunMatrixFixture(PackageFixture):
                 base.update(extra)
                 outcome = run_matrix._classify(
                     run_matrix.RunResult(**base), self.tmp / "no-checker",
-                    self.tmp / "01.in", missing, self.tmp / "01.a", limits)
+                    self.tmp / "01.in", missing, self.tmp / "01.a", limits,
+                    mem_limit_kb=1024)
                 self.assertEqual(outcome.verdict, expected, base)
 
         # And time still beats correctness: a run over the limit that also
@@ -1885,8 +1964,48 @@ class TestRunMatrixFixture(PackageFixture):
         with mock.patch.object(run_matrix, "_check", _never):
             outcome = run_matrix._classify(
                 over, self.tmp / "no-checker", self.tmp / "01.in", missing,
-                self.tmp / "01.a", limits)
+                self.tmp / "01.a", limits, mem_limit_kb=1024)
         self.assertEqual(outcome.verdict, "TL")
+
+    def test_classify_judges_ml_from_peak_kb_against_the_memory_limit(self):
+        # ML is no longer only `cg-oom-killed`: the cgroup cap carries
+        # `OUTPUT_SLACK_KB` of headroom for dirty page cache (see
+        # `_run_once`), so a solution can overshoot `memory_mb` without
+        # ever being OOM-killed. `_classify` must then read the overshoot
+        # off `max-rss` — strictly greater than the limit, so a run exactly
+        # at the limit is *not* ML, mirroring the time rule. Pure, no
+        # sandbox; `_check` is patched to fail loudly so this also pins
+        # that an ML run never reaches the checker, and that ML still
+        # outranks a TL kill exactly as the OOM path always has.
+        limits = Limits(t_main_ms=10, tl_ms=1000, kill_ms=2000)
+        mem_limit_kb = 65536
+        present = self.tmp / "present.out"
+        present.write_text("1\n", encoding="utf-8")
+
+        def _never(*args, **kwargs):
+            raise AssertionError("the checker must not run on an ML run")
+
+        def outcome_for(**extra):
+            base = dict(cpu_ms=5, wall_ms=5, killed=False, oom=False,
+                        crashed=False, exit_code=0, peak_kb=100,
+                        status="", message="", no_output=False)
+            base.update(extra)
+            return run_matrix._classify(
+                run_matrix.RunResult(**base), self.tmp / "no-checker",
+                self.tmp / "01.in", present, self.tmp / "01.a", limits,
+                mem_limit_kb=mem_limit_kb)
+
+        with mock.patch.object(run_matrix, "_check", _never):
+            self.assertEqual(outcome_for(peak_kb=mem_limit_kb + 1).verdict, "ML")
+            self.assertEqual(outcome_for(oom=True, peak_kb=100).verdict, "ML")
+            # Over memory *and* killed for time: ML, as the OOM path did.
+            self.assertEqual(outcome_for(peak_kb=mem_limit_kb + 1,
+                                         killed=True).verdict, "ML")
+            self.assertEqual(outcome_for(peak_kb=mem_limit_kb + 1,
+                                         crashed=True).verdict, "ML")
+        # Exactly at the limit is not over it: the checker runs.
+        with mock.patch.object(run_matrix, "_check", lambda *a, **k: "OK"):
+            self.assertEqual(outcome_for(peak_kb=mem_limit_kb).verdict, "OK")
 
     def test_stage_dir_is_not_on_a_memory_backed_filesystem(self):
         isolate = run_matrix.open_isolate_box(self.problem_dir)
@@ -1950,6 +2069,47 @@ class TestRunMatrixFixture(PackageFixture):
         # machine; it is a declaration and is now named as one.
         self.assertNotIn("cg", machine)
         self.assertTrue(machine["cg_requested"])
+
+    def test_invocation_json_records_the_cgroup_cap_actually_applied(self):
+        # Evidence must show the cap that was enforced, not just the
+        # problem's `memory_mb`: the two differ by `OUTPUT_SLACK_KB` (the
+        # page-cache headroom `_run_once` adds to `--cg-mem`), and a reader
+        # of a recorded ML needs to know whether it was a max-rss judgement
+        # against `memory_mb` or a kernel kill at the cap.
+        payload = run_matrix.run(self.problem_dir, self.testlib_dir)
+        machine = payload["machine"]
+        memory_mb = json.loads((self.problem_dir / "problem.json")
+                               .read_text(encoding="utf-8"))["limits"]["memory_mb"]
+        self.assertEqual(machine["output_slack_kb"], run_matrix.OUTPUT_SLACK_KB)
+        self.assertEqual(machine["cg_mem_kb"],
+                         memory_mb * 1024 + run_matrix.OUTPUT_SLACK_KB)
+        self.assertGreater(machine["cg_mem_kb"], memory_mb * 1024)
+
+    def test_model_solution_over_the_memory_limit_but_under_the_cap_aborts(self):
+        # Pass 1's "model solution exceeded the memory limit" abort used to
+        # fire only on `cg-oom-killed`. With the cap raised by the slack, a
+        # model solution that overshoots `memory_mb` but stays under the cap
+        # is never OOM-killed, and without a max-rss check it would sail
+        # through pass 1 and define the answers while breaking its own
+        # limit. It must still abort, naming the limit.
+        meta_path = self.problem_dir / "problem.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["limits"]["memory_mb"] = 16
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        (self.problem_dir / "solutions" / "sol-main.cpp").write_text(
+            _MAIN_HEADER +
+            "#include <cstdlib>\n#include <cstdio>\n"
+            "int main(){ size_t n = 48*1024*1024; "
+            "volatile char *p = (volatile char*)malloc(n); if(!p) return 1; "
+            "for (size_t i = 0; i < n; i += 4096) p[i] = (char)(i & 0xFF); "
+            "long long a, b; if (scanf(\"%lld %lld\", &a, &b) != 2) return 2; "
+            "printf(\"%lld\\n\", a + b + (p[n-4096] - p[n-4096])); return 0; }\n",
+            encoding="utf-8")
+        with self.assertRaises(run_matrix.MatrixError) as ctx:
+            run_matrix.run(self.problem_dir, self.testlib_dir)
+        self.assertIn("memory limit", str(ctx.exception))
+        self.assertIn("16 MB", str(ctx.exception))
+        self.assertFalse((self.problem_dir / "invocation.json").exists())
 
 
 class ParallelPassTest(PackageFixture):

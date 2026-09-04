@@ -148,13 +148,13 @@ pays for patience — a setter who writes `g1: n ≤ 1000, g2: n ≤ 100000` whe
 the same `O(n log n)` sort passes both has built one subtask with a coffee
 break in the middle, not two subtasks.
 
-Worked example — `flight` (spec §4's own sample problem: two coin sequences
-`A`, `B`, first one to complete its pattern in a random coin stream wins;
-find the probability `A` wins):
+Worked example — spec §4's sample problem (two coin sequences `A`, `B`,
+first one to complete its pattern in a random coin stream wins; find the
+probability `A` wins):
 
 | Subtask | Bound | What it actually admits |
 |---|---|---|
-| `g1` (40%) | `\|A\|, \|B\| ≤ 6` | An absorbing Markov chain over the **raw**, uncompressed window of the last `max(\|A\|,\|B\|) − 1` coins — at most `2^6 − 1 = 63` reachable states at this bound, since the warm-up passes through every shorter window too — discovered by BFS and solved by power iteration. No fail links, no automaton compression. This is exactly what the package's own g1-passing solution, `flight/solutions/sol-exhaustive-tinyn.cpp`, does. |
+| `g1` (40%) | `\|A\|, \|B\| ≤ 6` | An absorbing Markov chain over the **raw**, uncompressed window of the last `max(\|A\|,\|B\|) − 1` coins — at most `2^6 − 1 = 63` reachable states at this bound, since the warm-up passes through every shorter window too — discovered by BFS and solved by power iteration. No fail links, no automaton compression. This is exactly what a g1-only solution does. |
 | `g2` (60%) | `\|A\|, \|B\| ≤ 20` | That raw state space is now `2^20 − 1`, far too large to enumerate. Requires building the Aho–Corasick automaton over `{A, B}` — `O(\|A\| + \|B\|)` states instead of exponentially many — and solving a linear system over its states for absorption probabilities. |
 
 **Note what `g1` does *not* admit: enumerating coin sequences.** A coin
@@ -184,11 +184,11 @@ it from the decisions made above. Changing a decision later means
 **re-opening this gate, not editing the file directly**, because the file is
 the record of the decision, not just its encoding.
 
-Required shape (schema 1, validated by `tools/problem_meta.py`). This is a
-transcript of the real, on-disk `~/Projects/my_cp_problems/flight/problem.json`
-— not the spec's illustrative shorthand — so it is safe to cross-check
-byte-for-byte against the shipped package rather than treated as a rounded
-example:
+Required shape (schema 1, validated by `tools/problem_meta.py`), filled in
+for the coin-sequence problem above so every field is shown in use — not
+the spec's illustrative shorthand. The smallest file that actually loads is
+`tools/tests/fixtures/mini/problem.json` (one subtask, no examples); diff a
+fresh `problem.json` against that when a field name is in doubt:
 
 ```jsonc
 {
@@ -225,7 +225,7 @@ example:
 Note `g2.depends_on` is `[]`, not `["g1"]` — the ladder's *logical* shape
 (§ above: `g2` is the unconstrained superset of `g1`) is not the same thing
 as a `depends_on` edge, which only affects Polygon's subtask dependency
-graph. `flight` doesn't declare one; a problem where a later subtask's
+graph. The example doesn't declare one; a problem where a later subtask's
 scoring genuinely requires an earlier one to pass first would.
 
 Field notes, since a wrong shape here fails to load rather than fails
