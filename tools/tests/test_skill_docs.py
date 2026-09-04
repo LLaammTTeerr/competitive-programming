@@ -29,6 +29,7 @@ from tools import bootstrap_testlib, box_pool, preferences, problem_meta, run_ma
 from tools.matrix_core import _SEVERITY
 from tools.package_status import PHASE_ORDER
 from tools.problem_meta import FORMAT_VALUES
+from tools.scan_solutions import TAGS as SOLUTION_ZOO_TAGS
 from tools.scan_solutions import VERDICTS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -865,7 +866,7 @@ class TestReadmeLayoutMatchesDisk(unittest.TestCase):
     def test_every_skill_directory_is_in_the_layout_tree(self):
         tree = self._layout_block()
         skills = sorted(p.name for p in SKILLS.iterdir() if (p / "SKILL.md").is_file())
-        self.assertEqual(len(skills), 9)
+        self.assertEqual(len(skills), 10)
         missing = [s for s in skills if f"{s}/SKILL.md" not in tree]
         self.assertEqual(missing, [], f"skills absent from README layout: {missing}")
 
@@ -1159,11 +1160,11 @@ class TestWritingEditorialsSkill(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"competitive-programming:{self.SKILL}", readme,
                       "the README component table has no row for this skill")
-        self.assertIn("nine skills", readme,
+        self.assertIn("ten skills", readme,
                       "the README intro still counts the skills without this one")
-        self.assertIn("9 skills, 2 MCP servers", readme,
-                      "the README's `claude plugin details` expectation still "
-                      "says 8 skills")
+        self.assertIn("10 skills, 2 MCP servers", readme,
+                      "the README's `claude plugin details` expectation counts "
+                      "fewer skills than are on disk")
 
     def test_the_manifest_description_counts_this_skill(self):
         # The manifest description enumerates the plugin's capabilities one
@@ -1195,20 +1196,9 @@ class TestPreferencesDocs(unittest.TestCase):
     # add the line to, and inventing a block for it is not this pin's call.
     BOOTSTRAP_SKILLS = ("creating-problems", "shaping-problems",
                         "preparing-tests", "reviewing-problems",
-                        "validating-solutions")
+                        "validating-solutions", "uploading-to-polygon")
 
     PREFS_LINE = 'PREFS="$(python3 -m tools.preferences)"'
-
-    # `[polygon]` ships complete but is consumed by the Polygon upload work,
-    # which is a later PR: no skill reads these yet. They are exempt from the
-    # no-dead-keys check below, and asserted *absent* from the skills, so
-    # whoever wires the upload has to shrink this set rather than silently
-    # inherit an exemption.
-    RESERVED_FOR_LATER_PR = frozenset({
-        "polygon.statement_language",
-        "polygon.notify_on_commit",
-        "polygon.grant_codeforces_read",
-    })
 
     def shipped(self) -> dict:
         path = ROOT / "preferences.toml"
@@ -1250,29 +1240,18 @@ class TestPreferencesDocs(unittest.TestCase):
                         f"{sorted(shipped)}")
 
     def test_every_shipped_key_is_read_by_at_least_one_skill(self):
+        # No exemptions. `[polygon]` shipped unread for one PR behind a
+        # `RESERVED_FOR_LATER_PR` set; `uploading-to-polygon` is the skill
+        # that reads those three, so the set is gone and every key in the
+        # file is now covered by this check again.
         named = set().union(*self.mentions().values())
-        dead = sorted(self.shipped_keys() - named - self.RESERVED_FOR_LATER_PR)
+        dead = sorted(self.shipped_keys() - named)
         self.assertEqual(
             dead, [],
             f"preferences.toml ships keys no skill reads: {dead}. A default "
             f"nothing consults is drift wearing a config file's clothes — "
             f"either name it in the skill that should honour it, or delete it "
             f"from the file.")
-
-    def test_the_reserved_keys_are_still_reserved(self):
-        shipped = self.shipped_keys()
-        named = set().union(*self.mentions().values())
-        for key in sorted(self.RESERVED_FOR_LATER_PR):
-            with self.subTest(key=key):
-                self.assertIn(key, shipped,
-                              f"{key} left preferences.toml; drop it from "
-                              f"RESERVED_FOR_LATER_PR too")
-                self.assertNotIn(
-                    key, named,
-                    f"a skill now reads `{key}` — the exemption that let it "
-                    f"ship unread has served its purpose. Remove it from "
-                    f"RESERVED_FOR_LATER_PR so the no-dead-keys check covers "
-                    f"it.")
 
     def test_the_bootstrap_block_reads_preferences_the_same_way_everywhere(self):
         for skill in self.BOOTSTRAP_SKILLS:
@@ -1384,6 +1363,199 @@ class TestPolygonToolTableMatchesTheServer(unittest.TestCase):
         # "thirty-five tools" in the prose, and a row apiece in the table.
         self.assertEqual(len(self._declared()), 35)
         self.assertIn("thirty-five tools", self.README)
+
+
+class TestUploadingToPolygonSkill(unittest.TestCase):
+    """`uploading-to-polygon` describes a tool contract it does not own.
+
+    Every call the skill and its reference name has to exist on
+    `polygon_mcp/server.py`, with the method its own docstring claims — a
+    skill that instructs the model to call `save_problem_test` (the fork's
+    name for it) sends the model looking for a tool no server here has, and
+    nothing in the skill itself can notice. `TestPolygonToolTableMatchesTheServer`
+    holds the server's README to the same source; this holds the skill and
+    its reference.
+
+    The credential guard is the other half. Rule one of this skill is that
+    the secrets live in the server's environment and never reach the agent,
+    and the cheapest way for that to rot is a well-meant "set
+    POLYGON_API_KEY first" paragraph — so both names are asserted *absent*
+    from prose that is loaded into a model's context.
+    """
+
+    SKILL = "uploading-to-polygon"
+    REFERENCE = SKILLS / SKILL / "references" / "polygon-tools.md"
+    SERVER = (
+        ROOT / "mcp-server" / "src" / "polygon_mcp" / "server.py"
+    ).read_text(encoding="utf-8")
+
+    # A backtick immediately before the name, so `mcp-server/src/polygon_mcp/…`
+    # in a path is not read as a tool called `polygon_mcp`.
+    _MENTION = re.compile(r"`(polygon_\w+)")
+    _TOOL = re.compile(r"^async def (polygon_\w+)\(", re.MULTILINE)
+    _METHOD = re.compile(r"→ `([\w.]+)`")
+
+    def documents(self) -> dict[str, str]:
+        self.assertTrue(self.REFERENCE.is_file(), f"{self.REFERENCE} is missing")
+        return {f"{self.SKILL}/SKILL.md": skill_text(self.SKILL),
+                f"{self.SKILL}/references/polygon-tools.md":
+                    self.REFERENCE.read_text(encoding="utf-8")}
+
+    def declared(self) -> dict[str, str]:
+        """Every tool on the server, paired with the method it wraps."""
+        starts = [(m.group(1), m.start()) for m in self._TOOL.finditer(self.SERVER)]
+        self.assertTrue(starts, "no tools found in polygon_mcp/server.py")
+        pairs = {}
+        for i, (name, start) in enumerate(starts):
+            end = starts[i + 1][1] if i + 1 < len(starts) else len(self.SERVER)
+            found = self._METHOD.search(self.SERVER, start, end)
+            self.assertIsNotNone(found, f"{name}'s docstring names no method")
+            pairs[name] = found.group(1)
+        return pairs
+
+    def description(self) -> str:
+        """The frontmatter `description:`, whitespace collapsed.
+
+        It is a YAML folded block hard-wrapped at ~76 columns, so every
+        assertion below has to be made against the flattened form or it
+        passes and fails on where the block happened to wrap.
+        """
+        text = skill_text(self.SKILL)
+        match = re.search(r"^description: >\n(.*?)^---$", text,
+                          re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(match, f"{self.SKILL} has no folded description")
+        return flatten(match.group(1)).strip()
+
+    def test_the_skill_exists_and_its_name_matches_its_directory(self):
+        self.assertIn(self.SKILL, skill_dirs())
+        self.assertIn(f"name: {self.SKILL}\n", skill_text(self.SKILL))
+
+    def test_the_description_says_only_when_explicitly_asked(self):
+        # Routing happens before the skill loads, so this sentence is the
+        # only thing standing between "the package is finished" and a
+        # helpful unasked-for upload to a live account.
+        self.assertTrue(
+            self.description().startswith(
+                "Use ONLY when the user explicitly asks to upload"),
+            f"{self.SKILL}'s description no longer opens by restricting "
+            f"itself to an explicit request: {self.description()[:120]!r}")
+
+    def test_the_description_names_the_bundled_server(self):
+        self.assertIn("`polygon` MCP server", self.description(),
+                      f"{self.SKILL}'s description no longer says which "
+                      f"server it drives")
+
+    def test_the_skill_names_both_preconditions_by_tool(self):
+        body = flatten(skill_text(self.SKILL))
+        for tool in ("tools.package_status", "tools.review_checks"):
+            with self.subTest(precondition=tool):
+                self.assertIn(
+                    tool, body,
+                    f"{self.SKILL} no longer names {tool}. Both are required: "
+                    f"package_status says every phase produced its artifact, "
+                    f"review_checks says nothing drifted across them.")
+
+    # The calls the skill's own phases are built on. Listed because the ghost
+    # check below only catches an invented name that still *looks* like one
+    # of this server's — and the failure actually worth catching is the fork's
+    # vocabulary (`create_problem`, `save_problem_test`,
+    # `commit_problem_changes`) surviving a paraphrase, which looks like no
+    # polygon tool at all and so casts no ghost.
+    LOAD_BEARING = (
+        "polygon_whoami", "polygon_problems_list", "polygon_problem_create",
+        "polygon_problem_update_info", "polygon_save_statement",
+        "polygon_save_file", "polygon_set_checker", "polygon_set_validator",
+        "polygon_save_solution", "polygon_save_script", "polygon_save_test",
+        "polygon_tests", "polygon_enable_groups", "polygon_enable_points",
+        "polygon_save_test_group", "polygon_commit", "polygon_build_package",
+        "polygon_packages", "polygon_set_access",
+    )
+
+    def test_every_tool_the_prose_names_exists_on_the_server(self):
+        real = set(self.declared())
+        for name, body in self.documents().items():
+            found = set(self._MENTION.findall(body))
+            with self.subTest(document=name):
+                self.assertTrue(found, f"{name} names no polygon tool at all")
+                ghosts = sorted(found - real)
+                self.assertEqual(
+                    ghosts, [],
+                    f"{name} tells the model to call {ghosts}, which "
+                    f"polygon_mcp/server.py does not define. Tools: "
+                    f"{sorted(real)}")
+
+    def test_the_skill_still_names_every_call_its_phases_are_built_on(self):
+        real = set(self.declared())
+        body = skill_text(self.SKILL)
+        for tool in self.LOAD_BEARING:
+            with self.subTest(tool=tool):
+                self.assertIn(tool, real,
+                              f"{tool} left polygon_mcp/server.py — the skill "
+                              f"and this list both need updating")
+                # Closed by `(` or a backtick, so `polygon_save_test` is not
+                # satisfied by a mention of `polygon_save_test_group` — the
+                # exact way a prefix check goes vacuous on this server, whose
+                # tool names nest.
+                #
+                # `assertTrue`, not `assertIn`: the container here is the
+                # whole skill, and unittest would render all 340 lines of it
+                # around the one sentence that says which tool went missing.
+                self.assertTrue(
+                    re.search(rf"`{tool}(?:\(|`)", body) is not None,
+                    f"{self.SKILL} no longer names {tool}. Either the phase "
+                    f"that called it is gone, or it was renamed to something "
+                    f"this server does not have — the fork's vocabulary "
+                    f"(`create_problem`, `save_problem_test`) reads as prose, "
+                    f"not as a ghost, so nothing else would notice.")
+
+    def test_the_reference_maps_every_tool_to_the_method_it_wraps(self):
+        body = self.documents()[f"{self.SKILL}/references/polygon-tools.md"]
+        rows = {line for line in body.splitlines() if line.startswith("| `polygon_")}
+        for tool, method in self.declared().items():
+            with self.subTest(tool=tool):
+                matching = [r for r in rows if r.startswith(f"| `{tool}(")]
+                self.assertEqual(len(matching), 1,
+                                 f"the reference has {len(matching)} rows for {tool}")
+                self.assertIn(f"`{method}`", matching[0],
+                              f"the reference says {tool} wraps something "
+                              f"other than {method}")
+
+    def test_neither_document_names_a_credential_variable(self):
+        # Rule one, guarded: the server reads these from its own environment
+        # and the agent never sees them. A skill that names one is one
+        # paragraph away from telling a model to go and read it.
+        for name, body in self.documents().items():
+            for variable in ("POLYGON_API_KEY", "POLYGON_API_SECRET"):
+                with self.subTest(document=name, variable=variable):
+                    self.assertTrue(
+                        variable not in body,
+                        f"{name} names {variable}. The credentials live in "
+                        f"the server's environment and never reach the "
+                        f"agent; setup belongs in mcp-server/README.md.")
+
+    def test_the_tag_table_is_total_over_the_packages_own_tag_set(self):
+        # The mapping the skill calls "total over `scan_solutions.TAGS`",
+        # checked against that tuple and against the server's own list of
+        # tags Polygon accepts — not against a third copy typed here.
+        body = skill_text(self.SKILL)
+        rows = dict(re.findall(r"^\| `([a-z-]+)` \| `([A-Z]{2})` \|$", body,
+                               re.MULTILINE))
+        self.assertEqual(
+            sorted(rows), sorted(SOLUTION_ZOO_TAGS),
+            f"{self.SKILL}'s @tag table no longer covers exactly "
+            f"scan_solutions.TAGS. A tag with no row leaves the model "
+            f"inventing a Polygon tag for it.")
+        accepted = re.search(r"^SOLUTION_TAGS = \((.*?)\)$", self.SERVER,
+                             re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(accepted, "server.py no longer declares SOLUTION_TAGS")
+        accepted = set(re.findall(r'"(\w+)"', accepted.group(1)))
+        self.assertTrue(
+            set(rows.values()) <= accepted,
+            f"{self.SKILL} maps a tag to {sorted(set(rows.values()) - accepted)}, "
+            f"which polygon_save_solution refuses before the request goes out")
+        self.assertEqual(rows["main"], "MA",
+                         "the model solution must map to Polygon's MA — "
+                         "Polygon computes every answer by running it")
 
 
 class TestMcpJsonRegistersBothServers(unittest.TestCase):

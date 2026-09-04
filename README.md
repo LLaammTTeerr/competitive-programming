@@ -1,12 +1,13 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: nine skills — two for solving
-(one problem, one whole contest), six for setting one (shaping the constraints,
-test data, solution validation, statement, package review, and end-to-end
-orchestration), and one optional writeup skill that explains a finished problem
-to the contestants who could not solve it — plus two bundled MCP servers, one
-for Codeforces and one for Polygon. This repository is also a **marketplace**,
-so it can be used in place or installed on another machine.
+Claude Code plugin for competitive programming: ten skills — two for solving
+(one problem, one whole contest), seven for setting one (shaping the
+constraints, test data, solution validation, statement, package review,
+end-to-end orchestration, and the opt-in upload to Polygon), and one optional
+writeup skill that explains a finished problem to the contestants who could not
+solve it — plus two bundled MCP servers, one for Codeforces and one for
+Polygon. This repository is also a **marketplace**, so it can be used in place
+or installed on another machine.
 
 | Component | Invoked as | What it does |
 |---|---|---|
@@ -19,6 +20,7 @@ so it can be used in place or installed on another machine.
 | Skill `reviewing-problems` | `competitive-programming:reviewing-problems` | Audits a finished problem package before it ships: mechanical checks (drift, unreached bounds, holes, checker/validator disagreement) via `tools/review_checks.py`, plus judgement checks (ambiguity, assumed definitions, unproven invariants) run fresh from the statement, recorded to `flags.json` |
 | Skill `creating-problems` | `competitive-programming:creating-problems` | The umbrella over the other five setting skills: drives a problem from an idea, finished or half-formed, to a Polygon-ready package end to end, gated phase by phase with machine-readable evidence from `tools/package_status.py` |
 | Skill `writing-editorials` | `competitive-programming:writing-editorials` | Writes a standalone HTML editorial for a solved problem — lore-stripped restatement, the derivation that reaches the intended solution, time complexity — into `$PROBLEM/editorial/editorial.html`. Opt-in and detached from the pipeline: it runs only when a conversation explicitly asks for one |
+| Skill `uploading-to-polygon` | `competitive-programming:uploading-to-polygon` | Publishes a finished, reviewed package to Codeforces Polygon over the bundled `polygon` server: create, limits, statement, sources, solutions with their measured tags, the generator script and samples, subtask groups and points, commit and verified build, then read access for the coordinators. Opt-in — it runs only when asked for, never off the end of `creating-problems` |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 | MCP server `polygon` | tools `polygon_*` | Upload a finished package to Polygon: statement and resources, sources, solutions with their expected verdicts, script and manual tests, groups and points, commit and build, then grant a coordinator access to it |
 
@@ -40,6 +42,7 @@ competitive-programming/
 │   ├── writing-statements/SKILL.md
 │   ├── reviewing-problems/SKILL.md
 │   ├── creating-problems/SKILL.md
+│   ├── uploading-to-polygon/SKILL.md (+ references/polygon-tools.md)
 │   └── writing-editorials/SKILL.md  (+ references/vi-glossary.md,
 │                                        references/themes/space-dark.html)
 ├── tools/                    # Python pipeline the setting skills drive
@@ -138,7 +141,7 @@ solution's `@expect`.
 **Preferences.** The judgement calls the setting pipeline would otherwise ask
 about on every problem — OI or ICPC, who proposes the subtask ladder, how many
 files a test group gets, how many stress rounds — have standing answers in
-`preferences.toml` at the repository root. Five of the six setting skills
+`preferences.toml` at the repository root. Six of the seven setting skills
 read it before asking anything it already answers — writing-statements has
 no Bootstrap block and does not read the file; a value of `"ask"` means the
 file declines to decide and the question is put to you. One file is used **whole**,
@@ -199,7 +202,7 @@ directory is not importable`.
 ```bash
 cd <this repo>
 claude plugin validate . --strict                 # manifests
-claude plugin details competitive-programming     # inventory: 9 skills, 2 MCP servers
+claude plugin details competitive-programming     # inventory: 10 skills, 2 MCP servers
 
 python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
 (cd mcp-server && uv run --extra dev pytest -q)        # server suite (subshell)
