@@ -1153,8 +1153,8 @@ class TestWritingEditorialsSkill(unittest.TestCase):
         # clause per skill, and it is what a marketplace listing shows — the
         # externally visible twin of the README count above. It drifted
         # silently when this skill was added because nothing read it.
-        for description in manifest_descriptions().values():
-            with self.subTest():
+        for manifest, description in manifest_descriptions().items():
+            with self.subTest(manifest=manifest):
                 self.assertIn(
                     "editorial", description,
                     "the plugin description enumerates every skill but this "
