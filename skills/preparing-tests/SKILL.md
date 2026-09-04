@@ -273,6 +273,23 @@ int main(int argc, char* argv[]) {
   is keyed on the name string.
 - **Branch on `validator.group()`** for subtask-specific tightening; the
   global bound is always enforced regardless of group.
+- **Accept the group name Polygon actually sends.** On Polygon the
+  validator is invoked with whatever group name the package's tests were
+  assigned there, and a branch written against the wrong spelling fails
+  in one of two ways depending on how it's written. A bare `if` with no
+  `else` — like the sketch above — matches nothing and does not reject:
+  it silently skips the subtask-specific bound, and the under-checked
+  test sails through Polygon validation. A branch that does have an
+  `else` calling `quitf(_fail, ...)` / `ensuref(false, ...)` rejects the
+  whole package outright (testlib's `_fail`, exit code 3). This has been
+  observed with numeric names (`"1"`, `"2"`) where the validator's
+  branches expected `g1`/`g2` — whether Polygon renames groups or the
+  upload was just named differently isn't established, only that the
+  mismatch happens. Defend against both outcomes by accepting both
+  spellings for the same group (strip a leading `g`, or map both to one
+  branch) and by keeping the package's Polygon group names identical to
+  `problem.json`'s own, so the reaching check later in this skill runs
+  against the names actually in play.
 - **Enforce format strictly**: `readSpace()`, `readEoln()`, `readEof()`
   between and after every token. A validator that accepts extra whitespace
   accepts a test the judge's real input parser might not.
