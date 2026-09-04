@@ -216,7 +216,7 @@ Things that are non-obvious about Codeforces and are handled here:
 The other half of the loop. Codeforces is where problems are *solved*;
 [Polygon](https://polygon.codeforces.com) is where they are *prepared*, and it
 has a real API — no cookies, no scraping, no anti-bot challenge. This server
-wraps that API in thirty-five tools, so a package can be uploaded from the working
+wraps that API in thirty-six tools, so a package can be uploaded from the working
 directory the setting skills built it in: statement, sources, solutions with
 their expected verdicts, tests and groups, then commit and build.
 
@@ -311,6 +311,7 @@ what went wrong and corrects itself.
 | `polygon_delete_test(problem_id, testset, test_index)` | `problem.deleteTest` |
 | `polygon_enable_groups(problem_id, testset, enable)` | `problem.enableGroups` |
 | `polygon_enable_points(problem_id, enable)` | `problem.enablePoints` |
+| `polygon_set_test_group(problem_id, testset, test_group, test_indices)` | `problem.setTestGroup` |
 | `polygon_test_groups(problem_id, testset, group)` | `problem.viewTestGroup` |
 | `polygon_save_test_group(problem_id, testset, group, points_policy, feedback_policy, dependencies)` | `problem.saveTestGroup` |
 | `polygon_tags(problem_id)` | `problem.viewTags` |
@@ -346,6 +347,14 @@ deletes, so a refusal changes nothing and the failure carries
 `details.failures`, each naming a test `index` and a `reason` of `DUPLICATE`,
 `NOT_FOUND`, `FREEMARKER_SCRIPT_TEST` or `DELETE_FAILED`.
 
+Two tools put a test into a group, and they are not interchangeable.
+`polygon_set_test_group` names a group and a list of indices and nothing
+else, so it cannot touch a test's input — that is the one to use on tests the
+script generates. `polygon_save_test`'s `test_group` sets the group of a test
+it is also writing, which is the manual-test case. Neither carries points:
+`problem.setTestGroup` and `problem.saveTestGroup` have no points parameter,
+so per-test points are always `polygon_save_test`'s `test_points`.
+
 ## Typical upload loop
 
 ```
@@ -360,6 +369,7 @@ polygon_save_solution(123456, "brute.cpp", "TL", path="solutions/brute.cpp")
 polygon_save_script(123456, "tests", "gen_random 1000 1 > $\n…")
 polygon_enable_groups(123456, "tests", true)
 polygon_enable_points(123456, true)
+polygon_set_test_group(123456, "tests", "2", [3, 4, 5])
 polygon_save_test_group(123456, "tests", "2", "COMPLETE_GROUP", "ICPC", ["1"])
 polygon_save_statement(123456, "english", name="Candy Shop", legend="…")
 polygon_commit(123456, message="initial package")

@@ -115,23 +115,33 @@ every test's answer by running it.
 | `polygon_delete_test(problem_id, testset, test_index)` | `problem.deleteTest` |
 | `polygon_enable_groups(problem_id, testset, enable)` | `problem.enableGroups` |
 | `polygon_enable_points(problem_id, enable)` | `problem.enablePoints` |
+| `polygon_set_test_group(problem_id, testset, test_group, test_indices)` | `problem.setTestGroup` |
 | `polygon_test_groups(problem_id, testset, group=)` | `problem.viewTestGroup` |
 | `polygon_save_test_group(problem_id, testset, group, points_policy=, feedback_policy=, dependencies=)` | `problem.saveTestGroup` |
 
 `polygon_save_script` replaces the whole script — it is not a line appended.
 
-`polygon_save_test` both **adds** a manual test and **edits** an existing one:
-when editing, everything but `testset` and `test_index` is optional and an
-omitted field is left alone, which is how a test the script generated is
-given its group and its points without disturbing its input.
+Two tools carry three routes into a test's group and points, and they are
+not interchangeable:
 
-`polygon_save_test_group` only *edits* a group. A group is **created** by
-giving a test that group name — so tests get their groups first and policies
-second, never the other way round.
+- `polygon_set_test_group` names a group and a list of indices and **nothing
+  else**, so there is no field through which it could disturb a test's input.
+  It is the route for tests the *script* generates.
+- `polygon_save_test`'s `test_group` sets the group of a test it is also
+  writing — the manual-test case, samples included.
+- `polygon_save_test`'s `test_points` is the **only** route to per-test
+  points: neither `problem.setTestGroup` nor `problem.saveTestGroup` has a
+  points parameter, so an OI ladder's points can arrive no other way. Sent on
+  its own, with no `test_group` and no `test_input`, it is a points update
+  and the server omits every parameter left unset. Expect it to leave the
+  group and the input alone; it is not documented in so many words for a
+  script-generated index, so confirm it against `manual` and `scriptLine` in
+  the readback rather than assuming it — and a refusal comes back as
+  `{"ok": false}`, which is a stop, not something to work around.
 
-There is no `problem.setTestGroup` wrapper: that method takes a repeated
-`testIndex` parameter, which a signed request built from a parameter mapping
-cannot express. One test per `polygon_save_test` call is the route.
+`polygon_save_test_group` only *edits* a group. A group is **created** by a
+test being put into it — so tests get their groups first and policies second,
+never the other way round.
 
 ## Commit and build
 

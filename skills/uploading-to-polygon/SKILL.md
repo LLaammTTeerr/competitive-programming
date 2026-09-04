@@ -88,7 +88,7 @@ The server's tools are not in your catalogue until you load them: call
 `ToolSearch` with a `select:` list of the names each phase needs, and **read
 the loaded schema**, which always wins over anything written down.
 [`references/polygon-tools.md`](references/polygon-tools.md) lists all
-thirty-five with the API method each wraps and the failure shape they share;
+thirty-six with the API method each wraps and the failure shape they share;
 it is a map, not an authority.
 
 Never retry an identical request, and never invent a tool the server does not
@@ -122,7 +122,7 @@ python3 -c "import sys;from tools.polygon_ref import load;print(load(sys.argv[1]
 ```
 
 `None` means the package has never been uploaded — go on to Phase 1. Anything
-else means it has, and you ask, and do not proceed until answered:
+else means it has. Ask, and do not proceed until answered:
 **re-sync** the problem the record names — uploading only the files whose
 mtime is newer than its `committed_at`, the RFC 3339 timestamp of the last
 revision this skill committed, then committing again — or **stop**. There is
@@ -299,20 +299,37 @@ For `format == "oi"`:
    with the validator's own `FAIL unknown group` and nothing else explains
    why. The subtask id is the spelling every part of the package agrees on;
    keep it.
-3. Give each test its group and its points in the same
-   `polygon_save_test(problem_id, "tests", test_index=…, test_group=…,
-   test_points=…)` call — both together, with no `test_input`, so the script
-   line is left alone. A group comes into existence by a test naming it, and
-   `subtasks[].points` is split across that group's tests to sum **exactly**
-   to the subtask's points.
-4. Then the policies:
+3. **Points first**, one call per test:
+   `polygon_save_test(problem_id, "tests", test_index=…, test_points=…)` —
+   `test_points` and nothing else. `subtasks[].points` is split across that
+   subtask's tests to sum **exactly** to the subtask's points. This is the
+   only route to per-test points: neither `problem.setTestGroup` nor
+   `problem.saveTestGroup` takes any.
+4. **Then the groups**, one call per subtask:
+   `polygon_set_test_group(problem_id, "tests", test_group=<subtask id>,
+   test_indices=[…])`. It names a group and indices and nothing else, so
+   there is no field through which it could disturb a script-generated
+   test's input — which is why groups go through it rather than through
+   `polygon_save_test`. Groups **after** points, deliberately: this call
+   cannot touch points, so a points update that cleared a group is repaired
+   here rather than left standing — which the other order would not be. A
+   group comes into existence by a test being put into it.
+5. Then the policies:
    `polygon_save_test_group(problem_id, "tests", group=<subtask id>,
    points_policy="COMPLETE_GROUP", dependencies=<subtasks[].depends_on>)` —
-   only after the tests exist, because it edits a group rather than
-   creating one.
-5. Read back with `polygon_test_groups` and `polygon_tests` before
-   committing: every group present, dependencies as `problem.json` declares
-   them, points summing to 100 across the ladder.
+   only after the tests are in the group, because it edits a group rather
+   than creating one.
+6. **Read back before committing**, and treat it as a gate, not a glance.
+   `polygon_tests(problem_id, no_inputs=true)` — `no_inputs` because a real
+   suite's inputs are megabytes and none of this needs them. Every index the
+   script produced must still come back with **`manual: false` and its
+   `scriptLine`**, alongside the `group` and `points` you set. Those two
+   fields are the discriminator: a generated test that an edit clobbered
+   into a manual *add* flips `manual` to true and loses its `scriptLine`, and
+   nothing later in the run would say so. If one has, **stop** — do not
+   commit over it. Then `polygon_test_groups(problem_id, "tests")`: every
+   group present with the dependencies `problem.json` declares, points
+   summing to 100 across the ladder.
 
 ## Phase 8 — commit
 

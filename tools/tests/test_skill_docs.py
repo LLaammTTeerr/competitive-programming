@@ -1369,9 +1369,9 @@ class TestPolygonToolTableMatchesTheServer(unittest.TestCase):
         self.assertEqual(ghosts, [], f"README documents tools that do not exist: {ghosts}")
 
     def test_the_readme_counts_the_tools_it_lists(self):
-        # "thirty-five tools" in the prose, and a row apiece in the table.
-        self.assertEqual(len(self._declared()), 35)
-        self.assertIn("thirty-five tools", self.README)
+        # "thirty-six tools" in the prose, and a row apiece in the table.
+        self.assertEqual(len(self._declared()), 36)
+        self.assertIn("thirty-six tools", self.README)
 
 
 class TestUploadingToPolygonSkill(unittest.TestCase):
@@ -1479,7 +1479,7 @@ class TestUploadingToPolygonSkill(unittest.TestCase):
         "polygon_save_file", "polygon_set_checker", "polygon_set_validator",
         "polygon_save_solution", "polygon_save_script", "polygon_save_test",
         "polygon_tests", "polygon_enable_groups", "polygon_enable_points",
-        "polygon_save_test_group", "polygon_commit", "polygon_build_package",
+        "polygon_set_test_group", "polygon_save_test_group", "polygon_commit", "polygon_build_package",
         "polygon_packages", "polygon_set_access",
     )
 
@@ -1519,6 +1519,25 @@ class TestUploadingToPolygonSkill(unittest.TestCase):
                     f"this server does not have — the fork's vocabulary "
                     f"(`create_problem`, `save_problem_test`) reads as prose, "
                     f"not as a ghost, so nothing else would notice.")
+
+    # Only the counts this table can plausibly reach; an unmapped count fails
+    # loudly rather than passing by not being looked for.
+    _COUNT_WORDS = {34: "thirty-four", 35: "thirty-five", 36: "thirty-six",
+                    37: "thirty-seven", 38: "thirty-eight"}
+
+    def test_the_skill_counts_the_tools_the_reference_lists(self):
+        # The skill tells the reader the reference lists them *all*, which is
+        # what makes it safe to stop looking there. A stale count is how a
+        # tool added to the server stays invisible to the skill that would
+        # have used it — the drift that left Phase 7 assigning groups through
+        # `polygon_save_test` while `problem.setTestGroup` sat unwrapped.
+        total = len(self.declared())
+        self.assertIn(total, self._COUNT_WORDS,
+                      f"{total} tools on the server — add the word for it")
+        self.assertIn(f"{self._COUNT_WORDS[total]} with the API method",
+                      skill_text(self.SKILL),
+                      f"{self.SKILL} no longer says the reference lists all "
+                      f"{total} of the server's tools")
 
     def test_the_reference_maps_every_tool_to_the_method_it_wraps(self):
         body = self.documents()[f"{self.SKILL}/references/polygon-tools.md"]

@@ -734,6 +734,52 @@ async def polygon_enable_points(problem_id: int, enable: bool) -> dict[str, Any]
 
 
 @mcp.tool()
+async def polygon_set_test_group(
+    problem_id: int, testset: str, test_group: str, test_indices: list[int]
+) -> dict[str, Any]:
+    """Put one or more tests into a test group. → `problem.setTestGroup`
+
+    The way a *script-generated* test is given its group: it names the group
+    and the indices and nothing else, so it cannot disturb a test's input the
+    way an edit through `polygon_save_test` could. Groups have to be enabled
+    for the testset first (`polygon_enable_groups`), and a group comes into
+    existence by a test being put into it.
+
+    The indices go over the wire as `testIndices`, the API's comma-separated
+    form. It is the alternative to repeating `testIndex`, which a signed
+    request built from a parameter mapping cannot express.
+
+    This method carries no points: `problem.setTestGroup` has no points
+    parameter and neither does `problem.saveTestGroup`, so per-test points
+    remain `polygon_save_test`'s `test_points`.
+    """
+    try:
+        # Inside the try, like every other guard in this file: a raise out of
+        # a tool reaches the model as a protocol error instead of the
+        # `{"ok": false}` it can read. An empty list would otherwise send
+        # `testIndices=""` and let Polygon answer for it.
+        if not test_indices:
+            raise PolygonError("test_indices must name at least one test.")
+        await api.call(
+            "problem.setTestGroup",
+            {
+                "problemId": problem_id,
+                "testset": testset,
+                "testGroup": test_group,
+                "testIndices": ",".join(str(i) for i in test_indices),
+            },
+        )
+        return {
+            "ok": True,
+            "testset": testset,
+            "test_group": test_group,
+            "test_indices": list(test_indices),
+        }
+    except Exception as error:
+        return _fail(error, "problem.setTestGroup")
+
+
+@mcp.tool()
 async def polygon_test_groups(
     problem_id: int, testset: str, group: str = ""
 ) -> dict[str, Any]:
