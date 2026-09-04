@@ -181,11 +181,13 @@ entirely. Figures the statement includes go up with
 
 ## Phase 4 — checker, validator, generators
 
-`polygon_save_file` takes `path=`, resolved under `POLYGON_MCP_ROOT`. Tell
-the user to point that variable at the directory holding `$PROBLEM` before
-the first upload; a `path=` outside it is refused, by design. Pass `content=`
-inline only for something genuinely small — a few KB — never as a way around
-the guard.
+`polygon_save_file` takes `path=`, resolved under `POLYGON_MCP_ROOT`, and a
+`path=` outside that root is refused by design. The server reads the root from
+the environment of the shell that **launched Claude Code**, so if it is unset
+the fix is to export it there and restart — exporting it in some other
+terminal mid-session changes nothing, because the server process is already
+running without it. Pass `content=` inline only for something genuinely small
+— a few KB — never as a way around the guard.
 
 1. **Checker.** `checker.kind == "stock"` → `polygon_set_checker(problem_id,
    "std::<checker.name>.cpp")`; the package spells stock names bare (`ncmp`,
