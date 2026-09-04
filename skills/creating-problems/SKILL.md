@@ -232,9 +232,10 @@ format. Every deliberately-wrong solution carries an `@expect` line — one
 claim. The two formats make different claims:
 
 - **`icpc`** — every wrong solution must be expected to fail on at least
-  one group. Scoring is binary and there is one group, so a wrong solution
-  the manifest expects `OK` on everywhere is a hole by definition: the
-  suite has been told in writing that nothing needs to kill it.
+  one group. Scoring is binary, so a group a wrong solution is expected to
+  survive is a group nobody is testing it on, and a wrong solution the
+  manifest expects `OK` on everywhere is a hole by definition: the suite
+  has been told in writing that nothing needs to kill it.
 - **`oi`** — kill some, not all. A solution that is genuinely correct for
   subtask `k` is expected `OK` on the groups up to `k` and non-`OK` on
   every stronger one. Expecting it to fail everywhere throws away the
