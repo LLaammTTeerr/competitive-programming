@@ -296,6 +296,75 @@ class TestFormatFieldDocs(unittest.TestCase):
                       "format among what the gate settles")
 
 
+class TestMultiTestAndKillPolicyDocs(unittest.TestCase):
+    """Two pieces of doctrine keyed on `format`, split across two skills.
+
+    The small-`T` file and the OI kill policy are the same argument seen
+    from two ends — a ladder that pays partial credit must leave something
+    for a slightly-slow solution to score on — so the two skills state it in
+    the two places the decision is actually made (`shaping-problems` picks
+    the numbers, `creating-problems` decides the zoo's expectations). Both
+    halves are pinned, because a half deleted on its own reads as complete.
+    """
+
+    SECTION = "## Kill policy, by format"
+
+    def kill_policy_section(self) -> str:
+        text = skill_text("creating-problems")
+        start = text.find(self.SECTION)
+        self.assertNotEqual(
+            start, -1,
+            f"creating-problems has no {self.SECTION!r} section — the kill "
+            f"policy is the only place the zoo's expectations are decided "
+            f"per format")
+        end = text.find("\n## ", start + len(self.SECTION))
+        return text[start:end if end != -1 else len(text)]
+
+    def test_both_skills_state_the_small_T_file(self):
+        # The one test file that makes the OI ladder pay what it promises. It
+        # is stated in both skills on purpose (skills load independently,
+        # there is no include mechanism), which is why it needs a test
+        # holding the two copies together.
+        phrase = "one file with a small `T`"
+        for skill in ("shaping-problems", "creating-problems"):
+            with self.subTest(skill=skill):
+                body = flatten(skill_text(skill))
+                # `assertTrue`, not `assertIn`: the container is a whole
+                # normalized skill, and unittest would render all of it.
+                self.assertTrue(
+                    phrase in body,
+                    f"{skill} no longer states the `T` protocol's "
+                    f"{phrase!r} — without it an OI package times every "
+                    f"rung out at T = X and pays no partial credit at all.")
+
+    def test_creating_problems_states_a_kill_policy_for_every_format(self):
+        # The bullet markers are read back out of the section and checked
+        # against the constant, not against a second copy of the two values
+        # typed here: a format added to FORMAT_VALUES with no kill policy
+        # written for it must fail this, and so must a renamed one.
+        section = self.kill_policy_section()
+        found = re.findall(r"^- \*\*`(\w+)`\*\*", section, re.MULTILINE)
+        self.assertEqual(
+            sorted(found), sorted(FORMAT_VALUES),
+            f"creating-problems' kill policy covers {sorted(found)}; "
+            f"problem_meta.FORMAT_VALUES is {sorted(FORMAT_VALUES)}. Every "
+            f"accepted format needs its own policy — the zoo's `@expect` "
+            f"lines are written from it.")
+
+    def test_the_kill_policy_points_at_the_matrix_not_a_manual_sweep(self):
+        # `run_matrix` is the enforcement, and `holes` is how a violation
+        # surfaces. Prose describing a second manual pass over every
+        # solution × every stronger group is prose telling a setter to
+        # re-run, by hand, the one thing the tooling already does.
+        section = flatten(self.kill_policy_section())
+        for term in ("`@expect`", "`run_matrix`", "`holes`"):
+            with self.subTest(term=term):
+                self.assertTrue(
+                    term in section,
+                    f"the kill policy no longer names {term}, the mechanism "
+                    f"that actually enforces subtask separation")
+
+
 class TestWritingStatementsRoutingTable(unittest.TestCase):
     """The routing table `writing-statements` carries, pinned to the things
     outside it that it names.

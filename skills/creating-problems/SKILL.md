@@ -145,6 +145,32 @@ other flag in the register. This is the same hard stop the arbiter
 independently — this skill is what enforces it as an actual stop rather
 than a note in a log nobody reads.
 
+## What else G1 asks: multi-test input
+
+The scoring model is not the only thing about the input's shape that has to
+be settled before a single file is generated. G1 asks, in the same breath
+as the ladder: **does one input file carry several test cases?** If yes, it
+asks for the maximum number of them — call it `X` — and `shaping-problems`
+records `X` as a constraint row in `problem.json` like any other bound,
+because that is what it is: the statement renders it and the validator
+enforces it.
+
+The answer changes what the test files look like, and the two formats want
+opposite things from it. Under `icpc` every file runs at `T = X`. Under
+`oi` most files sit in roughly the top tenth of the range up to `X`, and
+**one file with a small `T`** carries a single max-size case instead — a
+solution slightly over budget per case then fails the crowded files but
+still scores on the groups its insight pays for, which is the entire reason
+a ladder exists. Neither `X` nor any Σ-bound over the file (`ΣN`, `ΣQ`) is
+invented downstream: where the statement declares none, `preparing-tests`
+assumes none and the model solution's budget is the per-file worst case.
+
+`shaping-problems` carries these numbers and the arithmetic behind them,
+and `preparing-tests` designs the generator families that realize them.
+This skill's job at G1 is narrower: make sure the question was asked before
+the gate closed, because a `T` discovered later invalidates every test file
+built without it.
+
 ## The phase sequence, and its loop-back edges
 
 ```
@@ -196,6 +222,37 @@ patched by writing a different wrong solution. A disagreement between two
 first; only if the arbiter itself cannot decide — the behaviour genuinely
 isn't defined anywhere in the statement — does it surface here as the one
 hard stop above.
+
+## Kill policy, by format
+
+`validating-solutions` owns the zoo; what the zoo is *expected* to do is a
+decision about the problem, and it is made here, from `problem.json`'s
+format. Every deliberately-wrong solution carries an `@expect` line — one
+`group=VERDICT` token per declared subtask — and that line is the whole
+claim. The two formats make different claims:
+
+- **`icpc`** — every wrong solution must be expected to fail on at least
+  one group. Scoring is binary and there is one group, so a wrong solution
+  the manifest expects `OK` on everywhere is a hole by definition: the
+  suite has been told in writing that nothing needs to kill it.
+- **`oi`** — kill some, not all. A solution that is genuinely correct for
+  subtask `k` is expected `OK` on the groups up to `k` and non-`OK` on
+  every stronger one. Expecting it to fail everywhere throws away the
+  partial credit the ladder was built to pay; expecting it to pass a
+  stronger group concedes a separation leak before a single test has run.
+
+**Subtask separation, stated once:** no solution that only solves an
+earlier subtask may score in a later group, and the `@expect` line of each
+per-subtask solution is where that promise is written down. `run_matrix`
+holds the suite to it — a solution declared failing that no test killed
+comes back in `invocation.json`'s `holes`, and a hole routes to
+`preparing-tests` for a test that reaches the failure mode, never to a
+rewritten wrong solution. There is no second, manual sweep of every
+solution against every stronger group to run afterwards; the matrix *is*
+that sweep. What the matrix cannot do is notice a claim that was never
+made — an `@expect` promising `OK` everywhere is met by any suite at all —
+which is why the line is written from the policy above rather than from
+whatever the suite happens to return.
 
 ## Resumability
 
