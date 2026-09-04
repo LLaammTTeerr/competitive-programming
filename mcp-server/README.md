@@ -180,7 +180,7 @@ cf_submit_solution(2000, "C", source_file="sol.cpp", language="GNU G++23")
 uv run --extra dev pytest -q
 ```
 
-134 tests, no network required — 56 for `cf-mcp` and 78 for `polygon-mcp`. On
+148 tests, no network required — 56 for `cf-mcp` and 92 for `polygon-mcp`. On
 the Codeforces side: AES against the NIST vectors, statement and status-table
 parsing, language resolution, and the whole submit flow against a fake
 Codeforces. On the Polygon side, see [its own test notes](#tests-1).
@@ -216,7 +216,7 @@ Things that are non-obvious about Codeforces and are handled here:
 The other half of the loop. Codeforces is where problems are *solved*;
 [Polygon](https://polygon.codeforces.com) is where they are *prepared*, and it
 has a real API — no cookies, no scraping, no anti-bot challenge. This server
-wraps that API in thirty tools, so a package can be uploaded from the working
+wraps that API in thirty-five tools, so a package can be uploaded from the working
 directory the setting skills built it in: statement, sources, solutions with
 their expected verdicts, tests and groups, then commit and build.
 
@@ -292,6 +292,8 @@ what went wrong and corrects itself.
 | `polygon_problem_create(name)` | `problem.create` |
 | `polygon_problem_info(problem_id)` | `problem.info` |
 | `polygon_problem_update_info(problem_id, input_file, output_file, interactive, well_formed, time_limit_ms, memory_limit_mb)` | `problem.updateInfo` |
+| `polygon_accesses(problem_id)` | `problem.accesses` |
+| `polygon_set_access(problem_id, login, access)` | `problem.setAccess` |
 | `polygon_statements(problem_id)` | `problem.statements` |
 | `polygon_save_statement(problem_id, lang, encoding, name, legend, input, output, scoring, interaction, notes, tutorial)` | `problem.saveStatement` |
 | `polygon_save_statement_resource(problem_id, name, content\|path)` | `problem.saveStatementResource` |
@@ -306,6 +308,7 @@ what went wrong and corrects itself.
 | `polygon_save_script(problem_id, testset, source)` | `problem.saveScript` |
 | `polygon_tests(problem_id, testset, no_inputs)` | `problem.tests` |
 | `polygon_save_test(problem_id, testset, test_index, test_input\|path, test_group, test_points, test_description, use_in_statements, input_for_statements, output_for_statements, verify_for_statements)` | `problem.saveTest` |
+| `polygon_delete_test(problem_id, testset, test_index)` | `problem.deleteTest` |
 | `polygon_enable_groups(problem_id, testset, enable)` | `problem.enableGroups` |
 | `polygon_enable_points(problem_id, enable)` | `problem.enablePoints` |
 | `polygon_test_groups(problem_id, testset, group)` | `problem.viewTestGroup` |
@@ -314,6 +317,8 @@ what went wrong and corrects itself.
 | `polygon_save_tags(problem_id, tags)` | `problem.saveTags` |
 | `polygon_general_description(problem_id)` | `problem.viewGeneralDescription` |
 | `polygon_save_general_description(problem_id, description)` | `problem.saveGeneralDescription` |
+| `polygon_update_working_copy(problem_id)` | `problem.updateWorkingCopy` |
+| `polygon_discard_working_copy(problem_id)` | `problem.discardWorkingCopy` |
 | `polygon_commit(problem_id, minor_changes, message)` | `problem.commitChanges` |
 | `polygon_build_package(problem_id, full, verify)` | `problem.buildPackage` |
 | `polygon_packages(problem_id)` | `problem.packages` |
@@ -324,6 +329,22 @@ shadowing a Python builtin; the value goes over the wire unchanged.
 checkers work under their own names — `std::wcmp.cpp` for token sequences,
 `std::ncmp.cpp` for int64 sequences, `std::rcmp6.cpp` for doubles to 1e-6,
 `std::lcmp.cpp` and `std::fcmp.cpp` for line-oriented output.
+
+`polygon_set_access` takes `READ`, `WRITE` or `NONE` — Polygon does not let the
+API assign `OWNER`, and `NONE` removes only the *direct* entry, leaving
+whatever the user gets through a group. Access changes take effect at once and
+need no commit.
+
+Read `polygon_commit`'s `committed`, not its `ok`. A commit with nothing to
+commit is a *successful* call reporting `committed: false` and the message
+`No changes`, and a working copy that fell behind the repository comes back
+with `conflict_occurred: true` — run `polygon_update_working_copy` and commit
+again.
+
+`polygon_delete_test` deletes one test per call. Polygon checks before it
+deletes, so a refusal changes nothing and the failure carries
+`details.failures`, each naming a test `index` and a `reason` of `DUPLICATE`,
+`NOT_FOUND`, `FREEMARKER_SCRIPT_TEST` or `DELETE_FAILED`.
 
 ## Typical upload loop
 
@@ -343,6 +364,7 @@ polygon_save_test_group(123456, "tests", "2", "COMPLETE_GROUP", "ICPC", ["1"])
 polygon_save_statement(123456, "english", name="Candy Shop", legend="…")
 polygon_commit(123456, message="initial package")
 polygon_build_package(123456, verify=true)         → then poll polygon_packages
+polygon_set_access(123456, "codeforces", "READ")   → hand it over
 ```
 
 `polygon_build_package` returns as soon as the build is *queued*. Poll
@@ -355,14 +377,17 @@ polygon_build_package(123456, verify=true)         → then poll polygon_package
 uv run --extra dev pytest -q tests/test_polygon_offline.py
 ```
 
-78 tests, no network: nothing leaves `httpx.MockTransport`, so the signature,
+92 tests, no network: nothing leaves `httpx.MockTransport`, so the signature,
 the verb split, the pacing and the retry are all the real code and only the
 socket is fake. They cover the signature against independently computed SHA-512
 hashes, the `FAILED` and HTTP-error mappings, the path guard (inside, outside,
 traversal, symlink, unreadable, no root at all), one happy path per tool
-asserting the wire method and its parameters, and a grep of every tool's JSON —
-over the success path *and* four failure paths — for both halves of the
-credential.
+asserting the wire method and its parameters, every write proving it went out
+as a POST, the three `CommitResult` shapes (committed, "No changes",
+conflict), a `400`-with-a-`FAILED`-envelope reaching the caller as Polygon's
+comment rather than as "HTTP 400", the structured deletion failures surviving
+into `details`, and a grep of every tool's JSON — over the success path *and*
+four failure paths — for both halves of the credential.
 
 ## Implementation notes
 

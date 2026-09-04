@@ -1318,7 +1318,7 @@ class TestPolygonServerEnvTableMatchesConfig(TestServerEnvTableMatchesConfig):
 
 
 class TestPolygonToolTableMatchesTheServer(unittest.TestCase):
-    """The Polygon README's tool table is thirty claims about `server.py`.
+    """The Polygon README's tool table is thirty-five claims about `server.py`.
 
     Each tool's docstring names the one API method it wraps, and the README
     repeats that mapping in a table a reader consults instead of reading the
@@ -1365,9 +1365,9 @@ class TestPolygonToolTableMatchesTheServer(unittest.TestCase):
         self.assertEqual(ghosts, [], f"README documents tools that do not exist: {ghosts}")
 
     def test_the_readme_counts_the_tools_it_lists(self):
-        # "thirty tools" in the prose, and a row apiece in the table.
-        self.assertEqual(len(self._declared()), 30)
-        self.assertIn("thirty tools", self.README)
+        # "thirty-five tools" in the prose, and a row apiece in the table.
+        self.assertEqual(len(self._declared()), 35)
+        self.assertIn("thirty-five tools", self.README)
 
 
 class TestMcpJsonRegistersBothServers(unittest.TestCase):

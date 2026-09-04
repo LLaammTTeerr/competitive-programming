@@ -24,12 +24,17 @@ class PolygonError(Exception):
     """Anything a tool should report as `{"ok": false, "error": ...}`.
 
     Carries the API method so a failure names what was being attempted, which
-    matters when a tool call is one step of a long upload flow.
+    matters when a tool call is one step of a long upload flow. `details` holds
+    whatever structured `result` a FAILED envelope carried alongside its
+    comment — `problem.deleteTest` says which tests it refused that way, and a
+    comment reading "Some tests can not be deleted." on its own is not enough
+    for the caller to act on.
     """
 
-    def __init__(self, message: str, method: str = ""):
+    def __init__(self, message: str, method: str = "", details: object = None):
         super().__init__(message)
         self.method = method
+        self.details = details
 
 
 def _env(name: str, default: str = "") -> str:

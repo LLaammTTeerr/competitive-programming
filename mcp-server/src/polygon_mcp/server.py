@@ -27,6 +27,9 @@ SOLUTION_TAGS = ("MA", "OK", "RJ", "TL", "TO", "TM", "WA", "PE", "ML", "NR", "RE
 FILE_TYPES = ("resource", "source", "aux")
 POINTS_POLICIES = ("COMPLETE_GROUP", "EACH_TEST")
 FEEDBACK_POLICIES = ("NONE", "POINTS", "ICPC", "COMPLETE")
+# The three states `problem.setAccess` accepts. OWNER is deliberately absent:
+# the API documents that ownership cannot be assigned through this method.
+ACCESS_TYPES = ("READ", "WRITE", "NONE")
 
 
 def _fail(error: Exception, method: str) -> dict[str, Any]:
@@ -39,11 +42,17 @@ def _fail(error: Exception, method: str) -> dict[str, Any]:
     the request URL into everything it raises, and a signed GET's URL carries
     `apiKey`.
     """
-    return {
+    failure = {
         "ok": False,
         "error": str(error),
         "method": getattr(error, "method", "") or method,
     }
+    # Only when Polygon sent structured failure details, so every other tool's
+    # failure shape is exactly what it was.
+    details = getattr(error, "details", None)
+    if details is not None:
+        failure["details"] = details
+    return failure
 
 
 def _read_source(
@@ -224,6 +233,61 @@ async def polygon_problem_update_info(
         return {"ok": True, "updated": True}
     except Exception as error:
         return _fail(error, "problem.updateInfo")
+
+
+# -------------------------------------------------------------------- access
+
+
+@mcp.tool()
+async def polygon_accesses(problem_id: int) -> dict[str, Any]:
+    """List who has direct access to the problem. → `problem.accesses`
+
+    Each entry is a `login` and an `accessType` of READ, WRITE or OWNER. These
+    are the *stored direct* entries, not anyone's effective access: a login
+    beginning with `@` is a user group, and its members are not expanded. The
+    access list lives at problem level, so it is not part of the working copy
+    and needs no commit.
+
+    Reading it needs WRITE or OWNER access on the problem, which access
+    inherited through a group satisfies.
+    """
+    try:
+        result = await api.call("problem.accesses", {"problemId": problem_id})
+        return {"ok": True, "count": len(result or []), "accesses": result or []}
+    except Exception as error:
+        return _fail(error, "problem.accesses")
+
+
+@mcp.tool()
+async def polygon_set_access(
+    problem_id: int, login: str, access: str
+) -> dict[str, Any]:
+    """Grant or remove one user's direct access. → `problem.setAccess`
+
+    This is how a finished problem is handed over — `polygon_set_access(id,
+    "codeforces", "READ")` gives the Codeforces coordinators a look at it.
+    `access` is READ, WRITE or NONE; NONE removes the direct entry and leaves
+    any access the user has through a group intact. OWNER is not on the list
+    because Polygon does not let this method assign ownership, and a direct
+    owner can be neither downgraded nor removed.
+
+    Takes effect immediately — no commit — and `login` must be a real user, not
+    a `@group`. Setting the access a user already has is a successful no-op.
+    Calling it needs *direct* WRITE or OWNER access; access held only through a
+    group is not enough.
+    """
+    try:
+        await api.call(
+            "problem.setAccess",
+            {
+                "problemId": problem_id,
+                "login": login,
+                "accessType": _one_of("access", access, ACCESS_TYPES),
+            },
+        )
+        return {"ok": True, "login": login, "access": access}
+    except Exception as error:
+        return _fail(error, "problem.setAccess")
 
 
 # ---------------------------------------------------------------- statements
@@ -595,6 +659,42 @@ async def polygon_save_test(
         return _fail(error, "problem.saveTest")
 
 
+@mcp.tool()
+async def polygon_delete_test(
+    problem_id: int, testset: str, test_index: int
+) -> dict[str, Any]:
+    """Delete one test from a testset. → `problem.deleteTest`
+
+    Polygon checks the test before deleting anything, so a refusal leaves the
+    testset untouched: the failure comes back with `details.failures`, each
+    naming the test's `index` and a `reason` of DUPLICATE, NOT_FOUND,
+    FREEMARKER_SCRIPT_TEST or DELETE_FAILED. A test the script generates cannot
+    be deleted this way — edit the script instead.
+
+    The index goes over the wire as `testIndices`, the API's comma-separated
+    form. It is the alternative to repeating `testIndex`, which a signed
+    request built from a parameter mapping cannot express; one test per call is
+    what this tool offers.
+    """
+    try:
+        await api.call(
+            "problem.deleteTest",
+            {
+                "problemId": problem_id,
+                "testset": testset,
+                "testIndices": str(test_index),
+            },
+        )
+        return {
+            "ok": True,
+            "deleted": True,
+            "testset": testset,
+            "test_index": test_index,
+        }
+    except Exception as error:
+        return _fail(error, "problem.deleteTest")
+
+
 # --------------------------------------------------------- groups and points
 
 
@@ -769,6 +869,36 @@ async def polygon_save_general_description(
 
 
 @mcp.tool()
+async def polygon_update_working_copy(problem_id: int) -> dict[str, Any]:
+    """Pull the latest revision into the working copy. → `problem.updateWorkingCopy`
+
+    Needed when someone else committed while this one was open; a working copy
+    behind the repository is what makes `polygon_commit` come back with
+    `conflict_occurred`.
+    """
+    try:
+        await api.call("problem.updateWorkingCopy", {"problemId": problem_id})
+        return {"ok": True, "problem_id": problem_id}
+    except Exception as error:
+        return _fail(error, "problem.updateWorkingCopy")
+
+
+@mcp.tool()
+async def polygon_discard_working_copy(problem_id: int) -> dict[str, Any]:
+    """Throw away every uncommitted change. → `problem.discardWorkingCopy`
+
+    Destructive and not undoable: everything saved since the last commit is
+    gone. This is the way out of a working copy that will not commit, and the
+    way to start a re-upload from the last known-good revision.
+    """
+    try:
+        await api.call("problem.discardWorkingCopy", {"problemId": problem_id})
+        return {"ok": True, "problem_id": problem_id}
+    except Exception as error:
+        return _fail(error, "problem.discardWorkingCopy")
+
+
+@mcp.tool()
 async def polygon_commit(
     problem_id: int, minor_changes: bool = False, message: str = ""
 ) -> dict[str, Any]:
@@ -777,9 +907,17 @@ async def polygon_commit(
     Nothing saved by the tools above is visible to anyone else until this runs.
     `minor_changes=true` suppresses the email notification to the problem's
     other authors.
+
+    Read `committed` rather than `ok`. Polygon answers a no-op with a
+    *successful* envelope carrying `committed=false` and the message "No
+    changes", and it reports a working copy that fell behind the repository as
+    `conflict_occurred=true` — so `ok: true` means the call went through, not
+    that a revision was created. On a conflict, `polygon_update_working_copy`
+    and then commit again. A missing field is reported false: this tool does
+    not claim a commit Polygon did not confirm.
     """
     try:
-        await api.call(
+        result = await api.call(
             "problem.commitChanges",
             {
                 "problemId": problem_id,
@@ -787,7 +925,14 @@ async def polygon_commit(
                 "message": message or None,
             },
         )
-        return {"ok": True, "committed": True}
+        commit_result = result if isinstance(result, dict) else {}
+        return {
+            "ok": True,
+            "committed": bool(commit_result.get("committed")),
+            "conflict_occurred": bool(commit_result.get("conflictOccurred")),
+            "message": str(commit_result.get("message") or ""),
+            "commit_result": result,
+        }
     except Exception as error:
         return _fail(error, "problem.commitChanges")
 

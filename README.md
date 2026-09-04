@@ -20,7 +20,7 @@ so it can be used in place or installed on another machine.
 | Skill `creating-problems` | `competitive-programming:creating-problems` | The umbrella over the other five setting skills: drives a problem from an idea, finished or half-formed, to a Polygon-ready package end to end, gated phase by phase with machine-readable evidence from `tools/package_status.py` |
 | Skill `writing-editorials` | `competitive-programming:writing-editorials` | Writes a standalone HTML editorial for a solved problem — lore-stripped restatement, the derivation that reaches the intended solution, time complexity — into `$PROBLEM/editorial/editorial.html`. Opt-in and detached from the pipeline: it runs only when a conversation explicitly asks for one |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
-| MCP server `polygon` | tools `polygon_*` | Upload a finished package to Polygon: statement and resources, sources, solutions with their expected verdicts, script and manual tests, groups and points, commit and build |
+| MCP server `polygon` | tools `polygon_*` | Upload a finished package to Polygon: statement and resources, sources, solutions with their expected verdicts, script and manual tests, groups and points, commit and build, then grant a coordinator access to it |
 
 ## Layout
 

@@ -30,6 +30,7 @@ from .config import Config, PolygonError
 WRITE_METHODS = frozenset(
     {
         "problem.create",
+        "problem.setAccess",
         "problem.updateInfo",
         "problem.updateWorkingCopy",
         "problem.discardWorkingCopy",
@@ -46,6 +47,7 @@ WRITE_METHODS = frozenset(
         "problem.editSolutionExtraTags",
         "problem.saveScript",
         "problem.saveTest",
+        "problem.deleteTest",
         "problem.setTestGroup",
         "problem.enableGroups",
         "problem.enablePoints",
@@ -238,7 +240,15 @@ class PolygonApi:
 
         enveloped = isinstance(payload, dict) and "status" in payload
         if enveloped and payload["status"] == "FAILED":
-            raise PolygonError(str(payload.get("comment") or "unknown error"), method)
+            # A FAILED envelope can still carry a structured `result`:
+            # `problem.deleteTest` reports which tests it refused, and why,
+            # that way. Throwing it away would leave the caller with only the
+            # comment "Some tests can not be deleted."
+            raise PolygonError(
+                str(payload.get("comment") or "unknown error"),
+                method,
+                details=payload.get("result"),
+            )
 
         if response.status_code >= 400:
             raise PolygonError(
