@@ -1145,7 +1145,7 @@ class TestWritingEditorialsSkill(unittest.TestCase):
                       "the README component table has no row for this skill")
         self.assertIn("nine skills", readme,
                       "the README intro still counts the skills without this one")
-        self.assertIn("9 skills, 1 MCP server", readme,
+        self.assertIn("9 skills, 2 MCP servers", readme,
                       "the README's `claude plugin details` expectation still "
                       "says 8 skills")
 
@@ -1298,3 +1298,61 @@ class TestPreferencesDocs(unittest.TestCase):
                 self.assertIn(fragment, readme,
                               f"the README's Preferences paragraph no longer "
                               f"names {fragment}")
+
+
+class TestPolygonServerEnvTableMatchesConfig(TestServerEnvTableMatchesConfig):
+    """The same three-way check for the second server.
+
+    `TestServerEnvTableMatchesConfig` is keyed to the `CODEFORCES_*`/`CF_*`
+    namespace and reads `cf_mcp/config.py`; widening its regex would make every
+    Polygon row a ghost, since `cf_mcp` reads none of them. So the Polygon
+    server gets its own three-way pin over its own config module.
+    """
+
+    CONFIG = (
+        TestServerEnvTableMatchesConfig.SERVER
+        / "src" / "polygon_mcp" / "config.py"
+    ).read_text(encoding="utf-8")
+
+    _NAME = r"POLYGON_[A-Z_]+"
+
+
+class TestMcpJsonRegistersBothServers(unittest.TestCase):
+    """`.mcp.json` is what actually launches the servers, and the root README
+    tells the reader what to expect from it. Three claims that can drift apart:
+    the console script each server is launched with, the credentials passed
+    through to it, and the inventory line naming how many servers there are.
+    """
+
+    MCP_JSON = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+    README = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def test_both_servers_are_registered(self):
+        self.assertEqual(sorted(self.MCP_JSON), ["codeforces", "polygon"])
+
+    def test_each_server_is_launched_with_its_own_console_script(self):
+        scripts = (ROOT / "mcp-server" / "pyproject.toml").read_text(encoding="utf-8")
+        for server, script in (("codeforces", "cf-mcp"), ("polygon", "polygon-mcp")):
+            self.assertEqual(self.MCP_JSON[server]["args"][-1], script)
+            self.assertIn(f"{script} = ", scripts,
+                          f"pyproject.toml declares no {script} console script")
+
+    def test_the_polygon_server_is_handed_the_variables_it_needs(self):
+        # Credentials plus the path guard's root: a `path=` argument is refused
+        # outright when POLYGON_MCP_ROOT never reaches the server's environment.
+        env = self.MCP_JSON["polygon"]["env"]
+        self.assertEqual(
+            sorted(env),
+            ["POLYGON_API_KEY", "POLYGON_API_SECRET", "POLYGON_MCP_ROOT"],
+        )
+        for name, reference in env.items():
+            self.assertEqual(reference, "${%s}" % name,
+                             "a literal value here would put a secret in the repo")
+
+    def test_the_readme_inventory_line_counts_both_servers(self):
+        self.assertIn("2 MCP servers", self.README)
+        self.assertIn("MCP server `polygon`", self.README)
+
+    def test_the_handshake_probe_is_run_against_both_servers(self):
+        for script in ("cf-mcp", "polygon-mcp"):
+            self.assertIn(f"uvx --from ./mcp-server {script}", self.README)
