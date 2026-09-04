@@ -504,3 +504,78 @@ class TestParallelSafetyDocs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadmeLayoutMatchesDisk(unittest.TestCase):
+    """The root README's layout tree is a claim about what is on disk.
+
+    It drifted once already: `tools/box_pool.py` was added, discussed at
+    length in the README's own prose, and never entered the tree. Nothing
+    held the two together, so this does.
+    """
+
+    README = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def _layout_block(self) -> str:
+        blocks = [m.group("body") for m in _FENCE.finditer(self.README)
+                  if "competitive-programming/" in m.group("body")]
+        self.assertEqual(len(blocks), 1, "expected exactly one layout tree in README.md")
+        return blocks[0]
+
+    def test_every_tools_module_is_in_the_layout_tree(self):
+        tree = self._layout_block()
+        modules = sorted(p.name for p in (ROOT / "tools").iterdir()
+                         if p.suffix in {".py", ".sh"} and p.name != "__init__.py")
+        self.assertTrue(modules)
+        missing = [m for m in modules if m not in tree]
+        self.assertEqual(missing, [], f"tools files absent from README layout: {missing}")
+
+    def test_every_skill_directory_is_in_the_layout_tree(self):
+        tree = self._layout_block()
+        skills = sorted(p.name for p in SKILLS.iterdir() if (p / "SKILL.md").is_file())
+        self.assertEqual(len(skills), 8)
+        missing = [s for s in skills if f"{s}/SKILL.md" not in tree]
+        self.assertEqual(missing, [], f"skills absent from README layout: {missing}")
+
+    def test_the_layout_tree_names_nothing_that_is_not_on_disk(self):
+        tree = self._layout_block()
+        named = re.findall(r"\b([a-z_]+\.(?:py|sh))\b", tree)
+        ghosts = [n for n in named if not (ROOT / "tools" / n).exists()
+                  and not (ROOT / "mcp-server" / n).exists()]
+        self.assertEqual(ghosts, [], f"README layout names files that do not exist: {ghosts}")
+
+
+class TestServerEnvTableMatchesConfig(unittest.TestCase):
+    """The root README says `mcp-server/README.md` owns the environment-variable
+    table and `.env.example` mirrors it. Both are claims about `config.py`, which
+    is the only thing that actually reads the environment, so check all three
+    against each other. `CF_MCP_TIMEOUT` had been read by config.py and listed in
+    `.env.example` while absent from the README table.
+    """
+
+    SERVER = ROOT / "mcp-server"
+    CONFIG = (SERVER / "src" / "cf_mcp" / "config.py").read_text(encoding="utf-8")
+    README = (SERVER / "README.md").read_text(encoding="utf-8")
+    ENV_EXAMPLE = (SERVER / ".env.example").read_text(encoding="utf-8")
+
+    _NAME = r"(?:CODEFORCES|CF_MCP|CF)_[A-Z_]+"
+
+    def _config_names(self) -> set[str]:
+        return set(re.findall(rf'"({self._NAME})"', self.CONFIG))
+
+    def _table_names(self) -> set[str]:
+        return set(re.findall(rf"^\| `({self._NAME})` \|", self.README, re.MULTILINE))
+
+    def _env_example_names(self) -> set[str]:
+        return set(re.findall(rf"^#? ?({self._NAME})=", self.ENV_EXAMPLE, re.MULTILINE))
+
+    def test_every_name_config_reads_is_mentioned_in_the_server_readme(self):
+        missing = sorted(n for n in self._config_names() if n not in self.README)
+        self.assertEqual(missing, [], f"config.py reads variables the README never mentions: {missing}")
+
+    def test_the_readme_table_and_env_example_list_the_same_variables(self):
+        self.assertEqual(self._table_names(), self._env_example_names())
+
+    def test_the_readme_table_lists_only_variables_config_reads(self):
+        ghosts = sorted(self._table_names() - self._config_names())
+        self.assertEqual(ghosts, [], f"README documents variables config.py does not read: {ghosts}")

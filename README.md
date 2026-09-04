@@ -38,8 +38,8 @@ competitive-programming/
 │   └── creating-problems/SKILL.md
 ├── tools/                    # Python pipeline the setting skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
-│   ├── scan_solutions.py  matrix_core.py  run_matrix.py  bootstrap_testlib.sh
-│   ├── package_status.py  review_checks.py
+│   ├── scan_solutions.py  matrix_core.py  run_matrix.py  box_pool.py
+│   ├── package_status.py  review_checks.py  bootstrap_testlib.sh
 │   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
     ├── pyproject.toml  uv.lock
@@ -68,7 +68,9 @@ export CODEFORCES_HANDLE=your_handle
 export CODEFORCES_COOKIE=JSESSIONID=your_cookie_value
 ```
 
-Everything else the server understands is documented in `mcp-server/.env.example`.
+Every other variable the server reads — API key, default language, state dir —
+is documented in [`mcp-server/README.md`](mcp-server/README.md), which owns
+that table; `mcp-server/.env.example` mirrors it as a fill-in template.
 
 **Prerequisite:** [`ioi/isolate`](https://github.com/ioi/isolate) —
 `tools/run_matrix.py` runs every *solution* sandboxed under isolate, never a bare

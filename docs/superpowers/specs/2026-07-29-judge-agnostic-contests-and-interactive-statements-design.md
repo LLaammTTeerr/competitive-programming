@@ -1,5 +1,9 @@
 # Judge-agnostic contest orchestration + interactive statement parsing
 
+Status: **shipped** (see
+[`../decisions/2026-07-29-parallel-contest-solving.md`](../decisions/2026-07-29-parallel-contest-solving.md)).
+Historical record; where it disagrees with the code, the code wins.
+
 Two independent changes to the `competitive-programming` plugin:
 
 1. `running-contests` stops being Codeforces-specific and drives a contest on any
