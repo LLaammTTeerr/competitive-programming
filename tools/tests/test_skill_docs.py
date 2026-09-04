@@ -365,6 +365,72 @@ class TestMultiTestAndKillPolicyDocs(unittest.TestCase):
                     f"that actually enforces subtask separation")
 
 
+class TestShapingProblemsMissionLineJudgementCount(unittest.TestCase):
+    """`shaping-problems`' mission line states how many judgements the gate
+    makes and lists them in order. The `## Multi-test input and the T
+    protocol` section was added as its own peer gate decision — sitting
+    between the subtask ladder and the JSON hand-off — and the stated count
+    went stale the moment that section landed without the mission line being
+    updated alongside it.
+
+    Rather than pin a second literal copy of the number (which drifts the
+    same way the first one did), this counts the `##` sections that fall
+    between the first judgement (`Originality`) and the section that closes
+    the gate out (`Done means`) — that span is exactly the judgements the
+    mission line claims to enumerate, so a section inserted or removed
+    inside it changes the count this test checks against automatically.
+    """
+
+    SKILL = "shaping-problems"
+    FIRST_JUDGEMENT_SECTION = "## Originality — before anything else"
+    # Not itself a judgement — the check that closes the gate out — so it
+    # marks where the judgement span ends rather than being counted in it.
+    POST_JUDGEMENT_SECTION = "## Done means"
+
+    _NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                      "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+    def _judgement_sections(self) -> list[str]:
+        text = skill_text(self.SKILL)
+        start = text.find(self.FIRST_JUDGEMENT_SECTION)
+        end = text.find(self.POST_JUDGEMENT_SECTION)
+        self.assertNotEqual(
+            start, -1,
+            f"{self.SKILL} no longer has a {self.FIRST_JUDGEMENT_SECTION!r} "
+            f"section — the judgement span this test counts starts there")
+        self.assertNotEqual(
+            end, -1,
+            f"{self.SKILL} no longer has a {self.POST_JUDGEMENT_SECTION!r} "
+            f"section — the judgement span this test counts ends there")
+        self.assertLess(
+            start, end,
+            f"{self.FIRST_JUDGEMENT_SECTION!r} must come before "
+            f"{self.POST_JUDGEMENT_SECTION!r} for the span between them to "
+            f"mean anything")
+        return re.findall(r"^## .+$", text[start:end], re.MULTILINE)
+
+    def test_stated_count_matches_the_number_of_judgement_sections(self):
+        sections = self._judgement_sections()
+        body = flatten(skill_text(self.SKILL))
+        match = re.search(r"\. (\w+) judgements, in order:", body)
+        self.assertIsNotNone(
+            match,
+            f"{self.SKILL} no longer states '<N> judgements, in order:' in "
+            f"its mission line — the count this test pins against is gone")
+        word = match.group(1).lower()
+        self.assertIn(
+            word, self._NUMBER_WORDS,
+            f"{word!r} is not a number word this test knows how to check")
+        self.assertEqual(
+            self._NUMBER_WORDS[word], len(sections),
+            f"the mission line claims {word!r} judgements, but "
+            f"{len(sections)} sections sit between "
+            f"{self.FIRST_JUDGEMENT_SECTION!r} and "
+            f"{self.POST_JUDGEMENT_SECTION!r} ({sections}) — a section was "
+            f"added or removed without updating the count, or the count was "
+            f"changed without the sections it describes")
+
+
 class TestWritingStatementsRoutingTable(unittest.TestCase):
     """The routing table `writing-statements` carries, pinned to the things
     outside it that it names.

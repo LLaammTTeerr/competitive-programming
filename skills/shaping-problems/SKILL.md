@@ -15,13 +15,14 @@ description: >
 # Shaping problems
 
 Mission: turn an idea into `problem.json` — the one blocking gate in the
-whole pipeline (spec §6). Four judgements, in order: is this problem already
+whole pipeline (spec §6). Five judgements, in order: is this problem already
 known, what `N` separates the *intended* solution from the *naive* one, what
-subtask ladder pays for distinct insight rather than for typing, and what
-that adds up to as structured JSON. This skill owns the **numbers**. It does
-not own prose (`writing-statements`) and it does not own open-ended dialogue
-about what the problem even is (`superpowers:brainstorming`, which it
-delegates to rather than competes with).
+subtask ladder pays for distinct insight rather than for typing, whether the
+input packs multiple test cases and what `X` bounds them, and what that adds
+up to as structured JSON. This skill owns the **numbers**. It does not own
+prose (`writing-statements`) and it does not own open-ended dialogue about
+what the problem even is (`superpowers:brainstorming`, which it delegates to
+rather than competes with).
 
 ## Am I the right skill?
 
