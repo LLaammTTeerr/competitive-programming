@@ -18,10 +18,12 @@ description: >
 # Uploading to Polygon
 
 Ship a finished package to [Polygon](https://polygon.codeforces.com) through
-this plugin's **own** bundled MCP server. Nothing here writes to the package:
-the upload mirrors what `problem.json` and the files on disk already say, and
-a package that is not finished goes back to a sibling skill rather than being
-patched up on the way out.
+this plugin's **own** bundled MCP server. The upload mirrors what
+`problem.json` and the files on disk already say, and a package that is not
+finished goes back to a sibling skill rather than being patched up on the way
+out. **The one file this skill writes is `polygon.json`** — the record of
+which Polygon problem the package owns. It writes nothing else, and nothing
+in it edits `problem.json`, the statement, the tests or the solutions.
 
 **This skill runs only when asked for.** Every other setting skill is part of
 a pipeline that reaches an end; this one starts after that end, publishes to
@@ -113,38 +115,58 @@ both commands' output and exit codes.
 
 Then read `problem.json`, the single source of truth for every number below.
 
-**Already on Polygon?** If `problem.json` carries a `polygon` block, this
-package has been uploaded before. Ask, and do not proceed until answered:
-**re-sync** the problem that block names — uploading only the files whose
-mtime is newer than the block's `committed_at`, the epoch second of the last
+**Already on Polygon?** Read the package's Polygon record:
+
+```bash
+python3 -c "import sys;from tools.polygon_ref import load;print(load(sys.argv[1]))" "$PROBLEM"
+```
+
+`None` means the package has never been uploaded — go on to Phase 1. Anything
+else means it has, and you ask, and do not proceed until answered:
+**re-sync** the problem the record names — uploading only the files whose
+mtime is newer than its `committed_at`, the RFC 3339 timestamp of the last
 revision this skill committed, then committing again — or **stop**. There is
-no third answer. **Never create a second Polygon problem for a package that
-already has one**: no tidying afterwards undoes the id the user's
-collaborators have already bookmarked.
+no third answer. On a re-sync, **skip Phase 1 entirely**: the problem already
+exists, and `problem_id` for every phase below is the record's `id`. **Never
+create a second Polygon problem for a package that already has one**: no
+tidying afterwards undoes the id the user's collaborators have already
+bookmarked. A record that fails to load is a `PolygonRefError` naming the
+field — report it and stop; do not guess around it.
+
+The record is `polygon.json`, beside `problem.json` rather than inside it,
+and that placement is load-bearing. `problem.json` is matrix evidence: the
+two gates above compare it against `invocation.json` and call the matrix
+stale when it is newer. A Polygon id written into `problem.json` would fail
+the gate this phase has just passed, on every run after the first, over a
+package nothing had changed. `polygon.json` is not walked by either gate, so
+writing it costs nothing.
 
 ## Phase 1 — create, and record where it went
 
 1. `polygon_whoami()` — proves the key, the secret and the clock.
 2. `polygon_problems_list(name=<problem.json name>)`. A live problem with
-   that name and no `polygon` block in `problem.json` means someone else
-   already created it, or a previous run failed after create and before
-   recording. **Stop and report the id** — do not adopt it silently and do
-   not create a second.
+   that name and no `polygon.json` in the package means someone else already
+   created it, or a previous run failed after create and before recording.
+   **Stop and report the id** — do not adopt it silently and do not create a
+   second.
 3. `polygon_problem_create(name=<problem.json name>)`. The Polygon name is
    `problem.json`'s `name`, the ASCII slug; the human title is the
    statement's `name` in Phase 3, and they are not the same thing.
-4. **Record it.** `problem.create` returns `id` and `owner` and **no
-   address**, so ask the user for the problem's URL from their browser and
-   write all three into `problem.json`, leaving the rest byte-identical:
+4. **Record it, immediately.** `problem.create` returns `id` and `owner` and
+   **no address**, so ask the user for the problem's URL from their browser
+   and write all three to `$PROBLEM/polygon.json`:
 
-```json
-"polygon": { "id": 123456, "owner": "<what the server reported>",
-             "url": "<what the user pasted>" }
+```bash
+python3 -c "import sys;from tools.polygon_ref import PolygonRef,save;save(sys.argv[1],PolygonRef(int(sys.argv[2]),sys.argv[3],sys.argv[4]))" \
+  "$PROBLEM" 123456 "<owner, from the create result>" "<url, from the user>"
 ```
 
 `owner` is whatever the create result says — never a name from this skill,
-this repository, or a previous problem. Re-run `tools.package_status` to
-confirm the edited file still loads. This gate closes when it does.
+this repository, or a previous problem. Write it before anything else goes
+up: a create that is not recorded is the state Phase 1 step 2 has to stop
+on next time. `committed_at` stays unset until Phase 8; the module refuses
+anything it could not read back, so a `PolygonRefError` here means the
+values are wrong, not the file.
 
 ## Phase 2 — limits
 
@@ -302,9 +324,17 @@ how Polygon commits without mailing the problem's other authors.
 **Read `committed`, not `ok`.** `ok: true` only means the call went through:
 `committed: false` with the message "No changes" means nothing was saved, and
 `conflict_occurred: true` means the working copy fell behind — then
-`polygon_update_working_copy` and commit again. Record the epoch second of a
-successful commit as `committed_at` in the `polygon` block; the next
-re-sync compares file mtimes against it.
+`polygon_update_working_copy` and commit again.
+
+After a commit that really happened — and only then — stamp the record. The
+next re-sync compares file mtimes against `committed_at`, so a timestamp
+written for a commit that did not happen skips files that had in fact
+changed:
+
+```bash
+python3 -c "import sys;from dataclasses import replace;from tools.polygon_ref import load,save;save(sys.argv[1],replace(load(sys.argv[1]),committed_at=sys.argv[2]))" \
+  "$PROBLEM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
 
 Then `polygon_build_package(problem_id, verify=true)` and poll
 `polygon_packages` until `state` leaves `PENDING`/`RUNNING`. `verify=true` is
@@ -330,15 +360,15 @@ say the step was skipped and which preference skipped it.
 
 - [ ] Both preconditions run fresh in this conversation: `tools.package_status`
       printed `complete`, `tools.review_checks` exited 0
-- [ ] `problem.json` carries `polygon` with the id and owner the server
-      reported and the URL the user gave, and still loads
+- [ ] `$PROBLEM/polygon.json` carries the id and owner the server reported
+      and the URL the user gave, and `polygon_ref.load` reads it back
 - [ ] Limits, statement, checker, validator, generators and every solution
       uploaded, each solution tagged from its own `@tag`, exactly one `MA`
 - [ ] Tests are the package's script with recoverable argv; samples are
       indices `1..S`, marked for the statement, with no uploaded answers
 - [ ] Groups and points enabled iff `format == "oi"`, one group per subtask
       id, points summing to 100
-- [ ] `polygon_commit` reported `committed: true`; `committed_at` recorded;
-      the verified build reached `READY`
+- [ ] `polygon_commit` reported `committed: true`; `committed_at` recorded in
+      `polygon.json`; the verified build reached `READY`
 - [ ] The access step reported: granted, or skipped with the preference that
       skipped it, or refused with the reason

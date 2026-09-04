@@ -1210,15 +1210,24 @@ class TestPreferencesDocs(unittest.TestCase):
                 for section, table in self.shipped().items()
                 for key in table}
 
+    # A section name followed by a file extension is a *filename*, not a key.
+    # `[polygon]` is a section of the file and `polygon.json` is the package
+    # file `uploading-to-polygon` writes its Polygon record into, so without
+    # this the skill naming its own artifact reads as a preferences key
+    # called `json` that the shipped file has never had.
+    FILE_SUFFIXES = ("json", "toml", "lock", "md", "py", "sh", "tex")
+
     def mentions(self) -> dict[str, set[str]]:
         """Every backticked `section.key` in every skill, by skill.
 
         The section names come from the parsed file, so the pattern cannot
         match `tools.package_status` or `problem_meta.FORMAT_VALUES` — only a
-        dotted name whose left half is an actual section of the file.
+        dotted name whose left half is an actual section of the file and
+        whose right half is not a file extension.
         """
         sections = "|".join(sorted(self.shipped()))
-        pattern = re.compile(rf"`({sections})\.([a-z_]+)`")
+        suffixes = "|".join(self.FILE_SUFFIXES)
+        pattern = re.compile(rf"`({sections})\.(?!(?:{suffixes})`)([a-z_]+)`")
         return {skill: {f"{m[0]}.{m[1]}"
                         for m in pattern.findall(skill_text(skill))}
                 for skill in sorted(skill_dirs())}
@@ -1390,8 +1399,11 @@ class TestUploadingToPolygonSkill(unittest.TestCase):
     ).read_text(encoding="utf-8")
 
     # A backtick immediately before the name, so `mcp-server/src/polygon_mcp/…`
-    # in a path is not read as a tool called `polygon_mcp`.
-    _MENTION = re.compile(r"`(polygon_\w+)")
+    # in a path is not read as a tool called `polygon_mcp` — and a closing
+    # `(` or backtick after it, so `polygon_ref.load` (the `tools/` module
+    # this skill writes its Polygon record with) is not read as a tool
+    # called `polygon_ref`. The same anchor `LOAD_BEARING` uses below.
+    _MENTION = re.compile(r"`(polygon_\w+)(?=\(|`)")
     _TOOL = re.compile(r"^async def (polygon_\w+)\(", re.MULTILINE)
     _METHOD = re.compile(r"→ `([\w.]+)`")
 

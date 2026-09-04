@@ -311,6 +311,18 @@ After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new sess
 > siblings write packages into) should gitignore `flags.json.lock`; this repo
 > itself never creates one, since no problem package lives here.
 
+> **Note on `polygon.json`.** `uploading-to-polygon` records which Polygon
+> problem a package owns in `polygon.json` at the package root — id, owner, URL
+> and the timestamp of the last revision it committed, read and written by
+> `tools/polygon_ref.py`. Unlike `flags.json.lock` it belongs in the problem
+> repository's history: **commit it, do not gitignore it.** It is the only
+> record of which Polygon problem a package is, and losing it makes the next
+> upload look like a first one. It deliberately is *not* a key in
+> `problem.json`: that file is matrix evidence (`tools/package_status.py` walks
+> it to decide whether `invocation.json` has gone stale), so a record written
+> into it would fail the very gates the upload skill has to pass before
+> writing it.
+
 ## Author
 
 LamTer <lamtercqh@gmail.com>
