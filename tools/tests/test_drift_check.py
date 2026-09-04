@@ -30,6 +30,7 @@ PROBLEM = Problem(
     constraints=[Constraint(id="len_a", expr="x", min=1, max=20)],
     subtasks=[Subtask(id="g1", points=40), Subtask(id="g2", points=60)],
     examples=[],
+    format="oi",
 )
 
 

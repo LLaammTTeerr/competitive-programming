@@ -213,6 +213,7 @@ fresh `problem.json` against that when a field name is in doubt:
       "constraints_text": ["Không có ràng buộc gì thêm"],
       "depends_on": [] }
   ],
+  "format": "oi",
   "examples": [
     { "test": "tests/samples/01",
       "note": "Hai xâu cùng độ dài và khác nhau nên không thể hoà; p_A = 2/3." },
@@ -247,6 +248,15 @@ quietly:
   readable Vietnamese, and prose can't become a `constexpr`. Both are
   required, not either-or.
 - **`points`** across all subtasks must sum to exactly 100.
+- **`format`** is `"oi"` or `"icpc"` (the closed set
+  `problem_meta.FORMAT_VALUES`) — which scoring model the package is:
+  `"oi"` awards each subtask's points independently, `"icpc"` is binary,
+  pass every test or score zero. It's optional and, when absent, inferred
+  from the ladder just above it: more than one subtask reads as `"oi"`, one
+  (or none) reads as `"icpc"`. That inference only runs one way — a single
+  100-point group is legal OI too, so an explicit `"format": "oi"` is the
+  only way to keep that reading once there's no ladder left to infer it
+  from. Decide it here, at the same gate that already fixes the ladder.
 - **`checker.kind`** is `"stock"` (name one of testlib's 21, e.g. `rcmp6` for
   a real-valued answer — that is `1e-6` **absolute *or* relative** error,
   whichever the submission clears, per `rcmp6.cpp`'s own `setName` and

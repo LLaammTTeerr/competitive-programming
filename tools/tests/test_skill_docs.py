@@ -26,6 +26,7 @@ from pathlib import Path
 from tools import box_pool, run_matrix
 from tools.matrix_core import _SEVERITY
 from tools.package_status import PHASE_ORDER
+from tools.problem_meta import FORMAT_VALUES
 from tools.scan_solutions import VERDICTS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -260,6 +261,39 @@ class TestFileIOProseMatchesTheDriver(unittest.TestCase):
         # solution can earn on its own merits.
         self.assertEqual(_SEVERITY[:2], ["FAIL", "NO_OUTPUT"], _SEVERITY)
         self.assertIn("NO_OUTPUT", self.text("validating-solutions"))
+
+
+class TestFormatFieldDocs(unittest.TestCase):
+    """`shaping-problems` quotes `problem.json`'s `format` values and its
+    inference rule; both are pinned against the code rather than retyped."""
+
+    def test_shaping_problems_names_the_accepted_values_from_the_source(self):
+        # The prose quotes the closed set next to the name of the constant
+        # it came from — pull the two quoted values back out and check them
+        # against the constant itself, not against a second copy typed here.
+        body = flatten(skill_text("shaping-problems"))
+        match = re.search(
+            r'`format`\*\* is `"(\w+)"` or `"(\w+)"` \(the closed set '
+            r'`problem_meta\.FORMAT_VALUES`\)', body)
+        self.assertIsNotNone(
+            match, "shaping-problems no longer quotes the accepted "
+                   "`format` values next to `problem_meta.FORMAT_VALUES`")
+        self.assertEqual(match.groups(), FORMAT_VALUES,
+                         "the format values quoted in shaping-problems have "
+                         "drifted from problem_meta.FORMAT_VALUES")
+
+    def test_shaping_problems_states_the_inference_rule(self):
+        body = flatten(skill_text("shaping-problems"))
+        self.assertIn(
+            'more than one subtask reads as `"oi"`, one (or none) reads '
+            'as `"icpc"`', body,
+            "shaping-problems dropped the format inference rule")
+
+    def test_creating_problems_g1_list_includes_format(self):
+        body = flatten(skill_text("creating-problems"))
+        self.assertIn("G1 — idea, story, subtasks, format.", body,
+                      "creating-problems' G1 summary no longer lists "
+                      "format among what the gate settles")
 
 
 class TestWritingStatementsRoutingTable(unittest.TestCase):
