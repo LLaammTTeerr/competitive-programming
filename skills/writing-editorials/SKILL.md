@@ -11,12 +11,12 @@ description: >
 
 # Writing editorials
 
-One self-contained HTML file a browser can open: a scrollable page, not
-slides. It explains a solved problem to the contestants who could not
-solve it, which is a different job from every other skill here — those
-build the package, this one explains it afterwards. The skill is
-**opt-in and detached**: not a phase of the setting pipeline, no gate to
-satisfy, nothing downstream waiting on it.
+The deliverable is one HTML file that needs nothing but a browser, and it
+scrolls rather than paginating. It explains a solved problem to the
+contestants who could not solve it, which is a different job from every
+other skill here — those build the package, this one explains it
+afterwards. The skill is **opt-in and detached**: not a phase of the
+setting pipeline, no gate to satisfy, nothing downstream waiting on it.
 
 ## Am I the right skill?
 
@@ -238,10 +238,10 @@ Solution → Time complexity, plus Other solutions when there is one.
 
 ## Voice
 
-Students read this, not the setter. State the mathematics and leave the
-setter's asides out: "do not apply observation \(k\) in this branch", "the
-old constraint made this unreachable". Where a case comes down to a closed
-form, the closed form is the whole explanation.
+The page is for the contestant, not for whoever set the problem. State the
+mathematics and leave the setter's asides out: "do not apply observation
+\(k\) in this branch", "the old constraint made this unreachable". Where a
+case comes down to a closed form, the closed form is the whole explanation.
 
 **Avoid the writing signals that mark generated prose.** These are
 concrete, and each one is worth a pass over the draft:
