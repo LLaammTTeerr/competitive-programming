@@ -977,6 +977,22 @@ class TestManifestDescriptionsAgree(unittest.TestCase):
                          "differently; they are meant to be one sentence kept "
                          "in two places")
 
+    def test_both_manifests_mention_polygon(self):
+        # The plugin bundles two MCP servers now, not one; the description
+        # must say so or the marketplace listing undersells the Polygon
+        # server the same way it once undersold the editorial skill. Match
+        # the two-servers clause specifically ("one for Polygon"), not a
+        # bare "Polygon" substring — that already appeared in the stale
+        # description via "Polygon-ready package" and would never catch
+        # regressing back to "the bundled Codeforces MCP server".
+        described = manifest_descriptions()
+        for manifest, description in described.items():
+            with self.subTest(manifest=manifest):
+                self.assertIn(
+                    "one for Polygon", description,
+                    f"{manifest}'s description no longer says one of the "
+                    "bundled MCP servers is for Polygon")
+
 
 class TestWritingEditorialsSkill(unittest.TestCase):
     """`writing-editorials` is the one skill nothing in the pipeline calls.
