@@ -93,14 +93,14 @@ Rough sizes at which a naive solution stops being survivable, assuming
 ~10^8 simple operations per second and a 1 s budget.
 
 Aim for roughly ten times the budget, not one. `TL` is
-`max(2 × t_main, 1000 ms floor)`; a run landing in `(TL, 2×TL]` is still
-verdict `TL`, re-timed serially and additionally flagged `timing-band` (a
-`medium` flag in `flags.json`) because that reading is close enough to the
-limit for contention to have decided it — not because the verdict is left
-open — so a naive solution has to land past `2×TL` — more than four times
-the model solution's own time — to be a decisive kill rather than a coin
-flip on the next machine. `tools/matrix_core.py` (`classify`) is the source
-of truth for that arithmetic.
+`max(2 × t_main, 1000 ms floor)`. A run whose CPU time lands in `(TL,
+2×TL]` is verdict `TL`; the driver re-times it serially and also records a
+medium `timing-band` flag in `flags.json`, because a verdict that close to
+the limit is hardware-sensitive — on another machine the same solution
+could land on either side of TL — so a naive solution has to land past
+`2×TL` — more than four times the model solution's own time — to be a
+decisive kill rather than a coin flip on the next machine. `tools/matrix_core.py`
+(`classify`) is the source of truth for that arithmetic.
 
 | Naive class | Kills at | Shape that makes it real |
 |---|---|---|
