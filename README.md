@@ -122,9 +122,10 @@ solution's `@expect`.
 **Preferences.** The judgement calls the setting pipeline would otherwise ask
 about on every problem — OI or ICPC, who proposes the subtask ladder, how many
 files a test group gets, how many stress rounds — have standing answers in
-`preferences.toml` at the repository root. The six setting skills read it
-before asking anything it already answers; a value of `"ask"` means the file
-declines to decide and the question is put to you. One file is used **whole**,
+`preferences.toml` at the repository root. Five of the six setting skills
+read it before asking anything it already answers — writing-statements has
+no Bootstrap block and does not read the file; a value of `"ask"` means the
+file declines to decide and the question is put to you. One file is used **whole**,
 with no layering: `$CP_PREFERENCES` if set (an explicit path, and an error if
 it does not load), else
 `$XDG_CONFIG_HOME/competitive-programming/preferences.toml` (default
