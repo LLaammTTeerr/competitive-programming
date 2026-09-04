@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="space-dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#121014" />
+  <title><!-- PROBLEM_NAME --> — solution</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css" />
+  <style>
+    /* Space dark — BrewBit / Caffeine tokens. Do not mix with another theme.
+       Left bars: .toc + Observation → --accent; .meta + Lemma → --gold;
+       .complexity → --warning-text. */
+    :root,
+    [data-theme="space-dark"] {
+      --background: #121014;
+      --surface: #1A1820;
+      --surface-muted: #221F2A;
+      --espresso: #EDE8F0;
+      --mocha: #A098A8;
+      --latte: #2E2A38;
+      --caramel: #D4A0B8;
+      --gold: #E8C060;
+      --text: #E8E4EC;
+      --text-muted: #A098A8;
+      --heading: #F2EEF6;
+      --text-inverse: #121014;
+      --border: #2E2A38;
+      --accent: #D4A0B8;
+      --link: #D4A0B8;
+      --selection: #D4A0B8;
+      --success: #6ED890;
+      --success-bg: #1A2E28;
+      --success-text: #90E8B8;
+      --warning-bg: #2E2830;
+      --warning-text: #E8C8A0;
+      --code-bg: #0A080C;
+      --code-fg: #E8E4EC;
+      --wash-accent: rgba(212, 160, 184, 0.1);
+      --wash-accent-soft: rgba(212, 160, 184, 0.06);
+      --font: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      color-scheme: dark;
+      background: var(--background);
+    }
+
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 15px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    ::selection {
+      background: color-mix(in oklab, var(--selection) 35%, transparent);
+    }
+
+    a { color: var(--link); }
+
+    .bar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      border-bottom: 1px solid var(--border);
+      background: var(--background);
+    }
+
+    .bar-inner {
+      max-width: 60rem;
+      margin: 0 auto;
+      padding: 0.85rem 1.25rem;
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+    }
+
+    .bar-kicker {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--heading);
+    }
+
+    .bar-name {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .page {
+      max-width: 60rem;
+      margin: 0 auto;
+      padding: 2.25rem 1.25rem 4.5rem;
+    }
+
+    mark {
+      background: var(--wash-accent);
+      color: var(--heading);
+      padding: 0.05em 0.28em;
+      border-radius: 0;
+      box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 28%, transparent);
+    }
+
+    .kicker {
+      margin: 0 0 0.45rem;
+      font-size: 0.7rem;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    h1, h2, h3 {
+      color: var(--heading);
+      font-weight: 700;
+      letter-spacing: 0;
+      line-height: 1.25;
+    }
+
+    h1 {
+      margin: 0 0 1.25rem;
+      font-size: 1.85rem;
+    }
+
+    h1::before {
+      content: "> ";
+      color: var(--accent);
+    }
+
+    h2 {
+      margin: 2.4rem 0 0.7rem;
+      font-size: 1.05rem;
+    }
+
+    h2::before {
+      content: "[+] ";
+      color: var(--accent);
+    }
+
+    h3 {
+      margin: 1.5rem 0 0.5rem;
+      font-size: 0.95rem;
+    }
+
+    h3::before {
+      content: "[*] ";
+      color: var(--gold);
+    }
+
+    p { margin: 0.75em 0; }
+
+    ul, ol {
+      margin: 0.75em 0;
+      padding-left: 1.25rem;
+    }
+
+    li + li { margin-top: 0.2rem; }
+
+    .meta {
+      display: grid;
+      grid-template-columns: 9.5rem 1fr;
+      gap: 0.35rem 1rem;
+      margin: 0 0 1rem;
+      padding: 0.9rem 1rem;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--gold);
+      background: var(--surface);
+    }
+
+    .meta dt {
+      margin: 0;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .meta dd {
+      margin: 0;
+      color: var(--heading);
+    }
+
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin: 0 0 2rem;
+      padding: 0;
+      list-style: none;
+    }
+
+    td .tags {
+      margin: 0;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      background: var(--surface-muted);
+      color: var(--text-muted);
+      box-shadow: inset 0 0 0 1px var(--border);
+      font-size: 0.75rem;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 0;
+      padding: 1rem 1.05rem;
+      margin: 1rem 0;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      border-radius: 0;
+      padding: 0.95rem 1.05rem 1.05rem;
+      margin: 1.1rem 0;
+    }
+
+    .card-label {
+      margin: 0 0 0.45rem;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .card.lemma {
+      border-left-color: var(--gold);
+    }
+
+    .card.lemma .card-label { color: var(--gold); }
+
+    .card p:first-of-type { margin-top: 0; }
+    .card p:last-child { margin-bottom: 0; }
+
+    .bridge {
+      margin: 1.35rem 0;
+      padding: 0.15rem 0 0.15rem 1rem;
+      border-left: 2px solid var(--accent);
+      color: var(--text);
+    }
+
+    .toc {
+      margin: 1em 0;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+    }
+
+    .toc table {
+      margin: 0;
+    }
+
+    .complexity {
+      margin: 1.5rem 0;
+      padding: 0.95rem 1.05rem;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--warning-text);
+      background: var(--surface);
+    }
+
+    .complexity .card-label {
+      color: var(--warning-text);
+    }
+
+    .complexity .muted {
+      color: var(--text-muted);
+    }
+
+    .fun {
+      margin: 1.5rem 0;
+      padding: 0.95rem 1.05rem;
+      border: 1px solid var(--border);
+      background: var(--warning-bg);
+      color: var(--warning-text);
+    }
+
+    .fun .card-label { color: var(--warning-text); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1em 0;
+      font-size: 0.9em;
+    }
+
+    th, td {
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.6rem;
+      text-align: left;
+    }
+
+    th {
+      background: var(--surface-muted);
+      font-weight: 500;
+      color: var(--heading);
+    }
+
+    pre {
+      background: var(--code-bg);
+      color: var(--code-fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1rem;
+      overflow-x: auto;
+      font-family: var(--font);
+      font-size: 0.85em;
+      line-height: 1.5;
+    }
+
+    :not(pre) > code {
+      background: var(--surface-muted);
+      padding: 0.1em 0.35em;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+
+    .katex { font-size: 1.05em; color: var(--text); }
+    .katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.25rem 0; }
+
+    .problem {
+      margin: 4.75rem 0 0;
+      padding: 2.75rem 0 0.5rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .problem h1 {
+      margin-top: 0;
+    }
+
+    .subtask {
+      margin: 2.4rem 0 0;
+      padding: 0.35rem 0 0.25rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .subtask h2 { margin-top: 1.4rem; }
+
+    svg { max-width: 100%; height: auto; display: block; margin: 1rem 0; }
+
+    footer.page-end {
+      margin-top: 3rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 0.75rem;
+    }
+
+    @media print {
+      * {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+      html, body {
+        margin: 0;
+        background: var(--background);
+      }
+      @page {
+        size: A4;
+        margin: 0;
+      }
+      .bar { position: static; }
+      .bar-inner,
+      .page {
+        max-width: none;
+        padding-left: 14mm;
+        padding-right: 14mm;
+      }
+      .page {
+        padding-top: 8mm;
+        padding-bottom: 10mm;
+      }
+      .katex-display,
+      pre {
+        overflow: visible;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <div class="bar-inner">
+      <span class="bar-kicker">Solution</span>
+      <span class="bar-name"><!-- PROBLEM_NAME --></span>
+    </div>
+  </div>
+
+  <main class="page">
+    <h1><!-- PROBLEM_NAME --></h1>
+
+    <dl class="meta">
+      <dt>Time limit</dt>
+      <dd><!-- TIME_LIMIT e.g. 2 s --></dd>
+      <dt>Memory limit</dt>
+      <dd><!-- MEMORY_LIMIT e.g. 256 MB --></dd>
+      <dt>Difficulty</dt>
+      <dd><!-- EXPECTED_RATING e.g. 2100 — no leading * --></dd>
+    </dl>
+
+    <ul class="tags">
+      <!-- <li class="tag">data structures</li> -->
+    </ul>
+
+    <section id="statement">
+      <h2>The problem</h2>
+      <!-- Vietnamese page: set <html lang="vi"> and swap this heading for
+           "Đề bài", Requirement for "Yêu cầu", Constraints for "Giới hạn",
+           "… points" for "… điểm". The order is fixed either way:
+           restatement (+ <mark>) → Requirement → Constraints → Subtask 1, 2, …
+           Requirement is the last line of the restatement, above Constraints —
+           not after the subtask list.
+           Do not name OI/IOI/ICPC. simple graph = đơn đồ thị, never đồ thị đơn. -->
+      <p><!-- restatement --></p>
+      <p><strong>Requirement:</strong> <!-- what to compute --></p>
+      <p><strong>Constraints:</strong></p>
+      <ul>
+        <li><!-- bounds --></li>
+      </ul>
+      <!-- <p><strong>Subtask:</strong></p>
+      <ul>
+        <li>Subtask 1 (… points): …</li>
+      </ul> -->
+    </section>
+
+    <section id="tutorial">
+      <h2>Solution</h2>
+      <!--
+        Continuous prose, one reasoning step per <p>. Cards only for pivotal
+        claims: <article class="card"> for an Observation,
+        <article class="card lemma"> for a genuine Lemma.
+        Bridges between complexity jumps: <p class="bridge">…</p>
+        No pseudocode / algorithm box. A displayed recurrence or matrix is fine.
+      -->
+      <p>Replace this paragraph with the derivation.</p>
+      <article class="card">
+        <p class="card-label">Observation</p>
+        <p>Delete this card unless the solution genuinely hinges on a claim.</p>
+      </article>
+    </section>
+
+    <!-- Subtasks only: one <section class="subtask" id="g1"> per rung. Visible title is "Subtask 1", not g_1. Each has its own complexity box. -->
+
+    <!-- Whole-contest page only: <div class="toc"> with the problem table,
+         then one <section class="problem" id="a"> per problem, inner ids
+         prefixed (a-statement, a-tutorial, …). -->
+
+    <section id="complexity">
+      <h2>Time complexity</h2>
+      <div class="complexity">
+        <p class="card-label">Time complexity</p>
+        <p>\(O(\ldots)\) <span class="muted">non-amortized</span></p>
+      </div>
+      <!-- Never put the formula in <pre> — KaTeX will not render. Drop query/update lines when they do not apply. -->
+    </section>
+
+    <!-- Optional other approaches. Delete the whole section if none.
+    <section id="other">
+      <h2>Other solutions</h2>
+      <p>We can solve the problem in \(O(N)\) using …</p>
+    </section>
+    -->
+
+    <!-- Fun fact: emit this section ONLY if the user asked. Delete otherwise.
+    <section id="fun" class="fun">
+      <p class="card-label">Fun fact</p>
+      <p>…</p>
+    </section>
+    -->
+
+    <footer class="page-end"><!-- PROBLEM_NAME --> · solution</footer>
+  </main>
+
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.renderMathInElement) {
+        renderMathInElement(document.body, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "\\[", right: "\\]", display: true },
+            { left: "$", right: "$", display: false },
+            { left: "\\(", right: "\\)", display: false }
+          ],
+          throwOnError: false
+        });
+      }
+    });
+  </script>
+</body>
+</html>
