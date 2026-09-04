@@ -536,6 +536,133 @@ class TestParallelSafetyDocs(unittest.TestCase):
                       "promise readers can look for one")
 
 
+class TestTestGenerationReference(unittest.TestCase):
+    """`preparing-tests` delegates its generator-design doctrine to a
+    reference file, the same way `solving-problems` delegates the black-magic
+    toolbox and `running-contests` the judge registry.
+
+    A pointer to a file that does not exist reads as authoritative and
+    delivers nothing, so the pointer and the file are pinned to each other.
+    The seven sections are pinned in order: they are a sequence — kill policy
+    decides what the rest of the doctrine is even for — and a section quietly
+    dropped from the middle would otherwise leave the pointer's one-sentence
+    summary promising content that is gone.
+    """
+
+    REFERENCE = SKILLS / "preparing-tests" / "references" / "test-generation.md"
+    POINTER = "references/test-generation.md"
+
+    # A stable phrase from each section, in the order the file must carry
+    # them. Matched against the flattened text, since these files are
+    # hard-wrapped and a heading's neighbours move whenever a paragraph above
+    # them is reflowed.
+    SECTIONS = (
+        "## Kill policy by format",
+        "## Subtask separation",
+        "## Parameter saturation",
+        "## Brute-kill table",
+        "## Shape catalogue",
+        "## Corners present but rare",
+        "## Multi-test `T` policy",
+    )
+
+    # Claims inside those sections that the brief's correctness turns on, and
+    # which a later editor could plausibly "simplify" back into being wrong.
+    CLAIMS = (
+        # OI-style partial credit is the half that gets lost first.
+        '"Kill everything" is wrong here',
+        # The undersized-group leak, stated concretely.
+        "never exceed `n = 5000`",
+        # Saturation and the reaching check are different properties.
+        "Saturation is not the reaching check",
+        # The fork claimed a random tree is ~log N tall. Both facts, and the
+        # conclusion that a bamboo is needed regardless, are load-bearing.
+        "has height `Θ(√N)`",
+        "a bamboo is required either way",
+        # The one rule that cannot be softened into a convenience.
+        "Never invent a Σ-constraint the statement does not state",
+    )
+
+    def body(self) -> str:
+        self.assertTrue(self.REFERENCE.is_file(),
+                        f"{self.REFERENCE} is missing, but "
+                        f"preparing-tests/SKILL.md tells the reader to open it")
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        # Extractor guard, as elsewhere in this module: a truncated read must
+        # not make the ordering assertion below trivially pass.
+        self.assertGreater(len(text), 1000,
+                           f"{self.REFERENCE} read back nearly empty")
+        return text
+
+    def test_the_skill_points_at_the_reference(self):
+        self.assertIn(self.POINTER, flatten(skill_text("preparing-tests")),
+                      "preparing-tests/SKILL.md no longer sends the reader to "
+                      "the generator-design reference before it lists the "
+                      "five families")
+
+    def test_the_reference_carries_every_section_in_order(self):
+        text = self.body()
+        positions = []
+        for heading in self.SECTIONS:
+            with self.subTest(section=heading):
+                # `assertNotEqual` on `find`, not `assertIn`: an assertIn
+                # failure would print the whole reference around the one
+                # heading that is missing.
+                where = text.find(heading)
+                self.assertNotEqual(
+                    where, -1,
+                    f"{self.REFERENCE.name} no longer carries the "
+                    f"{heading!r} section, which SKILL.md's pointer promises")
+                positions.append(where)
+        self.assertEqual(
+            positions, sorted(positions),
+            f"the sections of {self.REFERENCE.name} have been reordered; "
+            f"the doctrine reads as a sequence, so keep them in the order "
+            f"{list(self.SECTIONS)}")
+
+    def test_the_corrected_claims_survive(self):
+        flat = flatten(self.body())
+        for claim in self.CLAIMS:
+            with self.subTest(claim=claim):
+                self.assertTrue(
+                    flatten(claim) in flat,
+                    f"{self.REFERENCE.name} no longer states {claim!r}. Each "
+                    f"of these is a correction over the doctrine as it was "
+                    f"first written — fix the prose, do not relax this test.")
+
+    def test_the_reference_reinforces_the_reaching_check(self):
+        # The doctrine this reference was adapted from downgraded the
+        # reaching check to optional. Pinned positively — the sentence that
+        # hands authority back to SKILL.md's loop — rather than as a
+        # blacklist of softening words: a substring guard that also fires on
+        # a future *true* sentence gets deleted rather than obeyed, which is
+        # the lesson RETIRED_CLAIMS above is annotated with.
+        self.assertIn(
+            "treat its output as the answer", flatten(self.body()),
+            f"{self.REFERENCE.name} no longer defers to SKILL.md's "
+            f"reaching-check loop as the authority on which bounds are "
+            f"reached. Saturation is a design target; the union of the "
+            f"per-test logs is the evidence, and the reference must not "
+            f"leave a reader thinking the first substitutes for the second.")
+
+    def test_the_reference_does_not_grow_its_own_copy_of_the_recipe(self):
+        # The recipe is pinned byte-for-byte between two SKILL.md files by
+        # TestReachingCheckRecipeDoesNotDrift. A third copy here would drift
+        # out from under that pin, since nothing would be holding it. Scoped
+        # to ```bash blocks — the same shape `recipe()` uses — so that prose
+        # naming the flag, which the reference legitimately does, is fine.
+        for block in [m.group("body")
+                      for m in _FENCE.finditer(self.body())
+                      if m.group("lang") == "bash"]:
+            self.assertNotIn(
+                "--testOverviewLogFileName", block,
+                f"{self.REFERENCE.name} carries a runnable copy of the "
+                f"reaching-check recipe. That recipe is pinned "
+                f"byte-for-byte between preparing-tests and "
+                f"reviewing-problems; a third copy is held by nothing. "
+                f"Link to ../SKILL.md#reaching-check instead.")
+
+
 if __name__ == "__main__":
     unittest.main()
 
