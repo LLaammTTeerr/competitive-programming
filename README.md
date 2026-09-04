@@ -1,11 +1,12 @@
 # competitive-programming
 
-Claude Code plugin for competitive programming: eight skills — two for solving
+Claude Code plugin for competitive programming: nine skills — two for solving
 (one problem, one whole contest), six for setting one (shaping the constraints,
 test data, solution validation, statement, package review, and end-to-end
-orchestration) — plus the bundled Codeforces MCP server. This repository
-is also a **marketplace**, so it can be used in place or installed on another
-machine.
+orchestration), and one optional writeup skill that explains a finished problem
+to the contestants who could not solve it — plus the bundled Codeforces MCP
+server. This repository is also a **marketplace**, so it can be used in place
+or installed on another machine.
 
 | Component | Invoked as | What it does |
 |---|---|---|
@@ -17,6 +18,7 @@ machine.
 | Skill `writing-statements` | `competitive-programming:writing-statements` | Authors, translates, and reviews problem statements for the vnolymp LaTeX template — the Vietnamese statement package for problems prepared on Polygon |
 | Skill `reviewing-problems` | `competitive-programming:reviewing-problems` | Audits a finished problem package before it ships: mechanical checks (drift, unreached bounds, holes, checker/validator disagreement) via `tools/review_checks.py`, plus judgement checks (ambiguity, assumed definitions, unproven invariants) run fresh from the statement, recorded to `flags.json` |
 | Skill `creating-problems` | `competitive-programming:creating-problems` | The umbrella over the other five setting skills: drives a problem from an idea, finished or half-formed, to a Polygon-ready package end to end, gated phase by phase with machine-readable evidence from `tools/package_status.py` |
+| Skill `writing-editorials` | `competitive-programming:writing-editorials` | Writes a standalone HTML editorial for a solved problem — lore-stripped restatement, the derivation that reaches the intended solution, time complexity — into `$PROBLEM/editorial/editorial.html`. Opt-in and detached from the pipeline: it runs only when a conversation explicitly asks for one |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
 
 ## Layout
@@ -35,7 +37,9 @@ competitive-programming/
 │   ├── validating-solutions/SKILL.md
 │   ├── writing-statements/SKILL.md
 │   ├── reviewing-problems/SKILL.md
-│   └── creating-problems/SKILL.md
+│   ├── creating-problems/SKILL.md
+│   └── writing-editorials/SKILL.md  (+ references/vi-glossary.md,
+│                                        references/themes/space-dark.html)
 ├── tools/                    # Python pipeline the setting skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  box_pool.py
@@ -158,7 +162,7 @@ directory is not importable`.
 ```bash
 cd <this repo>
 claude plugin validate . --strict                 # manifests
-claude plugin details competitive-programming     # inventory: 8 skills, 1 MCP server
+claude plugin details competitive-programming     # inventory: 9 skills, 1 MCP server
 
 python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
 (cd mcp-server && uv run --extra dev pytest -q)        # server suite (subshell)
