@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "competitive-programming",
   "version": "0.6.0",
-  "description": "Competitive programming: single-problem solving, full-contest orchestration on any judge, shaping a problem idea into constraints and a subtask ladder, authoring Vietnamese problem statements, preparing testlib-based test data, validating solutions against a matrix of deliberately-wrong submissions, reviewing a finished package before it ships, end-to-end problem creation from idea to Polygon-ready package, and the bundled Codeforces MCP server",
+  "description": "Competitive programming: single-problem solving, full-contest orchestration on any judge, shaping a problem idea into constraints and a subtask ladder, authoring Vietnamese problem statements, preparing testlib-based test data, validating solutions against a matrix of deliberately-wrong submissions, reviewing a finished package before it ships, end-to-end problem creation from idea to Polygon-ready package, writing a standalone HTML editorial for a finished problem when asked, and the bundled Codeforces MCP server",
   "author": {
     "name": "LamTer",
     "email": "lamtercqh@gmail.com"

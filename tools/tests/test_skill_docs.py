@@ -19,11 +19,12 @@ module is that mechanism.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import unittest
 from pathlib import Path
 
-from tools import bootstrap_testlib, box_pool, run_matrix
+from tools import bootstrap_testlib, box_pool, problem_meta, run_matrix
 from tools.matrix_core import _SEVERITY
 from tools.package_status import PHASE_ORDER
 from tools.problem_meta import FORMAT_VALUES
@@ -31,6 +32,7 @@ from tools.scan_solutions import VERDICTS
 
 ROOT = Path(__file__).resolve().parents[2]
 SKILLS = ROOT / "skills"
+PLUGIN_DIR = ROOT / ".claude-plugin"
 
 # A fenced block, tagged with its language. Non-greedy so each match is one
 # complete fence rather than everything between the first and last one.
@@ -70,6 +72,24 @@ def bash_blocks(skill: str) -> list[str]:
     text = skill_text(skill)
     return [m.group("body") for m in _FENCE.finditer(text)
             if m.group("lang") == "bash"]
+
+
+def manifest_descriptions() -> dict[str, str]:
+    """The plugin `description` as each of the two manifests spells it.
+
+    `plugin.json` is what an installed plugin reports; `marketplace.json` is
+    what the listing shows before anyone installs it. They are two copies of
+    one sentence, with nothing between them.
+    """
+    plugin = json.loads((PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))
+    market = json.loads((PLUGIN_DIR / "marketplace.json").read_text(encoding="utf-8"))
+    entries = [p for p in market["plugins"] if p["name"] == plugin["name"]]
+    if len(entries) != 1:
+        raise AssertionError(
+            f"marketplace.json lists {len(entries)} entries named "
+            f"{plugin['name']!r}; expected exactly one")
+    return {"plugin.json": plugin["description"],
+            "marketplace.json": entries[0]["description"]}
 
 
 class TestFenceExtraction(unittest.TestCase):
@@ -844,7 +864,7 @@ class TestReadmeLayoutMatchesDisk(unittest.TestCase):
     def test_every_skill_directory_is_in_the_layout_tree(self):
         tree = self._layout_block()
         skills = sorted(p.name for p in SKILLS.iterdir() if (p / "SKILL.md").is_file())
-        self.assertEqual(len(skills), 8)
+        self.assertEqual(len(skills), 9)
         missing = [s for s in skills if f"{s}/SKILL.md" not in tree]
         self.assertEqual(missing, [], f"skills absent from README layout: {missing}")
 
@@ -936,3 +956,206 @@ class TestP5ProseFixesPin(unittest.TestCase):
             flat,
             "validating-solutions no longer forbids a time-limit-exceeded "
             "entry strictly weaker than one already in the zoo")
+
+
+class TestManifestDescriptionsAgree(unittest.TestCase):
+    """The two manifests carry the same sentence, and nothing held them there.
+
+    This is the same failure this module was written for: two copies with no
+    mechanism between them, and the half that drifts is the one the next
+    editor did not have open. Here the half nobody opens is
+    `marketplace.json`, which is the copy every prospective user reads.
+    """
+
+    def test_both_manifests_spell_the_description_the_same_way(self):
+        described = manifest_descriptions()
+        self.assertGreater(len(described["plugin.json"]), 100,
+                           "plugin.json's description read back nearly empty")
+        self.assertEqual(described["plugin.json"], described["marketplace.json"],
+                         "plugin.json and marketplace.json describe the plugin "
+                         "differently; they are meant to be one sentence kept "
+                         "in two places")
+
+
+class TestWritingEditorialsSkill(unittest.TestCase):
+    """`writing-editorials` is the one skill nothing in the pipeline calls.
+
+    Every other skill is reached from `creating-problems`, so a phase that
+    stopped loading would surface the next time a package was built. This one
+    is opt-in: it runs only when a conversation asks for an editorial, and a
+    broken `name:`, a lost theme file, or a description that stopped saying
+    "only when asked" would be discovered by nobody — the failure mode is
+    either silence or an editorial written after a package the user never
+    asked to have explained.
+
+    The slot pins below are the same shape as
+    `test_prose_names_the_drivers_real_staged_stdout_file`: the prose names
+    markers in a file that lives next to it, so the file is what they are
+    checked against.
+    """
+
+    SKILL = "writing-editorials"
+    DIR = SKILLS / SKILL
+    THEME = DIR / "references" / "themes" / "space-dark.html"
+    GLOSSARY = DIR / "references" / "vi-glossary.md"
+
+    # The page frame the SKILL.md documents, as it appears in the theme file.
+    # A slot the skill tells the writer to fill has to be there to fill.
+    SLOTS = (
+        "<!-- PROBLEM_NAME -->", "TIME_LIMIT", "MEMORY_LIMIT",
+        "EXPECTED_RATING", 'class="tag"', 'id="statement"', 'id="tutorial"',
+        'id="complexity"', 'id="other"', 'id="fun"', 'class="subtask"',
+        'class="toc"', 'class="problem"',
+    )
+
+    def body(self) -> str:
+        text = skill_text(self.SKILL)
+        # Extractor guard, as elsewhere in this module: a truncated read would
+        # make the "no stale skill name" assertion below trivially pass.
+        self.assertGreater(len(text), 4000,
+                           f"{self.SKILL}/SKILL.md read back nearly empty")
+        return text
+
+    def frontmatter(self) -> str:
+        text = self.body()
+        match = re.match(r"---\n(.*?)\n---\n", text, re.DOTALL)
+        self.assertIsNotNone(match, f"{self.SKILL}/SKILL.md has no frontmatter")
+        return match.group(1)
+
+    def description_lines(self) -> list[str]:
+        """The folded `description: >` block, one entry per source line."""
+        lines = self.frontmatter().splitlines()
+        start = next((i for i, l in enumerate(lines)
+                      if l.startswith("description:")), None)
+        self.assertIsNotNone(start, "the frontmatter has no `description:` key")
+        out = []
+        for line in lines[start + 1:]:
+            if line and not line[0].isspace():   # the next top-level key
+                break
+            out.append(line.strip())
+        self.assertTrue(out, "the `description:` block is empty")
+        return out
+
+    def test_the_skill_ships_its_default_theme_and_glossary(self):
+        # The skill copies the theme verbatim and reads the glossary before
+        # writing Vietnamese. Neither is optional, and neither is generated.
+        for path in ((self.DIR / "SKILL.md"), self.THEME, self.GLOSSARY):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), f"{path} is missing")
+        self.assertIn(self.SKILL, skill_dirs(),
+                      f"{self.SKILL} is not loadable as a skill directory")
+
+    def test_the_frontmatter_name_matches_the_directory(self):
+        # A `name:` that disagrees with its directory does not fail loudly —
+        # the skill simply is not there under the name everything else uses.
+        match = re.search(r"^name:\s*(\S+)\s*$", self.frontmatter(), re.MULTILINE)
+        self.assertIsNotNone(match, "the frontmatter has no `name:` key")
+        self.assertEqual(match.group(1), self.DIR.name)
+
+    def test_the_description_says_the_skill_runs_only_when_asked(self):
+        # The opt-in rule lives in the description because that is the only
+        # part of the file a router reads. Lose it there and the skill starts
+        # firing off the end of a finished package, which is the exact
+        # behaviour it exists to refuse.
+        flat = flatten(" ".join(self.description_lines()))
+        self.assertIn("Use ONLY when this conversation explicitly asks", flat)
+        self.assertIn("editorial.html", flat)
+        self.assertIn("creating-problems is not", flat,
+                      "the description no longer refuses to run off the end "
+                      "of a finished package")
+        self.assertLessEqual(
+            len(self.description_lines()), 6,
+            "the description grew past six lines; routing reads it in full "
+            "on every request, so it is kept short deliberately")
+
+    def test_every_slot_the_skill_documents_exists_in_the_default_theme(self):
+        skill = self.body()
+        theme = self.THEME.read_text(encoding="utf-8")
+        self.assertGreater(len(theme), 4000, f"{self.THEME} read back empty")
+        for slot in self.SLOTS:
+            with self.subTest(slot=slot):
+                # `assertTrue`, not `assertIn` — the containers here are a
+                # whole SKILL.md and a whole theme file, and unittest would
+                # print both around the one marker that matters.
+                self.assertTrue(
+                    slot in theme,
+                    f"the default theme no longer carries the {slot!r} slot "
+                    f"that {self.SKILL} tells the writer to fill")
+        for marker in ("PROBLEM_NAME", "TIME_LIMIT", "MEMORY_LIMIT",
+                       "EXPECTED_RATING"):
+            with self.subTest(marker=marker):
+                self.assertTrue(
+                    marker in skill,
+                    f"{self.SKILL} stopped naming the {marker!r} slot, so its "
+                    f"page-frame table no longer describes the theme it ships")
+
+    def test_no_retired_transformation_box_survives(self):
+        # Transformation was retired as a box type: a pivotal transformation
+        # is an Observation, a routine one is prose. A `.card.transform` rule
+        # left in the theme is an invitation to author one anyway.
+        self.assertNotIn("card.transform", self.THEME.read_text(encoding="utf-8"))
+        self.assertIn("no Transformation box", self.body())
+
+    def test_the_skill_routes_only_to_skills_that_exist(self):
+        # Same failure as the `writing-statements` routing table guards
+        # against: a router handed a dead name follows it, while one that
+        # finds nothing falls back to asking.
+        real = skill_dirs()
+        named = set(re.findall(r"competitive-programming:([a-z][a-z-]*)",
+                               self.body()))
+        self.assertTrue(named, f"{self.SKILL} names no sibling skill at all")
+        for name in sorted(named):
+            with self.subTest(destination=name):
+                self.assertIn(
+                    name, real,
+                    f"{self.SKILL} routes to {name!r}, which is not a skill "
+                    f"directory. Skills on disk: {sorted(real)}")
+
+    def test_the_limit_keys_the_skill_quotes_are_the_ones_problem_meta_reads(self):
+        # The skill tells the writer to fill the header from
+        # `limits.time_ms_published` and `limits.memory_mb`. Those names are
+        # `problem_meta.Problem` fields, not string literals to be copied:
+        # renaming one there must fail here rather than leaving the skill
+        # instructing a reader to look up a key that no longer exists.
+        fields = problem_meta.Problem.__dataclass_fields__
+        skill = self.body()
+        for key in ("time_ms_published", "memory_mb"):
+            with self.subTest(key=key):
+                self.assertIn(key, fields,
+                              f"{key!r} left problem_meta.Problem")
+                self.assertTrue(
+                    f"`limits.{key}`" in skill,
+                    f"{self.SKILL} no longer names `limits.{key}`, the field "
+                    f"its header is filled from")
+
+    def test_the_answer_extension_the_skill_diffs_against_is_the_driver_s(self):
+        # `sol-editorial.cpp` is verified by diffing against the jury's `.a`
+        # answer files. That suffix is `run_matrix`'s, not this skill's, and
+        # a reader following the instruction against a renamed extension
+        # would diff against nothing and see a clean run.
+        self.assertIn('.with_suffix(".a")', inspect.getsource(run_matrix),
+                      "run_matrix.py no longer writes `.a` answer files; the "
+                      "editorial skill still tells readers to diff against one")
+        self.assertIn("`.a` answer file", self.body())
+
+    def test_the_readme_counts_this_skill(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"competitive-programming:{self.SKILL}", readme,
+                      "the README component table has no row for this skill")
+        self.assertIn("nine skills", readme,
+                      "the README intro still counts the skills without this one")
+        self.assertIn("9 skills, 1 MCP server", readme,
+                      "the README's `claude plugin details` expectation still "
+                      "says 8 skills")
+
+    def test_the_manifest_description_counts_this_skill(self):
+        # The manifest description enumerates the plugin's capabilities one
+        # clause per skill, and it is what a marketplace listing shows — the
+        # externally visible twin of the README count above. It drifted
+        # silently when this skill was added because nothing read it.
+        for manifest, description in manifest_descriptions().items():
+            with self.subTest(manifest=manifest):
+                self.assertIn(
+                    "editorial", description,
+                    "the plugin description enumerates every skill but this "
+                    "one, so the marketplace listing undersells the plugin")
