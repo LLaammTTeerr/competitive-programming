@@ -175,10 +175,12 @@ paragraph:
   `2×TL`; only a result strictly over `TL` and up through `2×TL` is flagged
   as `timing-band` and never given a pass/fail verdict — it is a coin flip
   on different hardware, not a number to argue with.
-- **Memory is enforced by the kernel**, not observed. isolate's `--cg-mem`
-  plus its `cg-oom-killed` meta field *is* the ML signal — there is no
-  polled RSS reading to second-guess, and none of that reasoning belongs in
-  a generator or validator you write; it lives entirely in `run_matrix.py`.
+- **Memory is measured by the kernel**, not polled. ML is isolate's own
+  `max-rss` for the child strictly over `memory_mb`, or a `cg-oom-killed`
+  from the cgroup — whose `--cg-mem` cap sits a fixed 256 MB *above*
+  `memory_mb`, because on cgroup v2 a solution's dirty output pages are
+  charged to it until written back. None of that reasoning belongs in a
+  generator or validator you write; it lives entirely in `run_matrix.py`.
 
 ## The order is the doctrine: checker, then validator, then generators
 

@@ -19,29 +19,40 @@ proven, opposite defects that no amount of polishing fixed: the `ru_maxrss`
 fallback occasionally reported the *driver's* memory (a false-positive ML on
 a correct solution), and `VmHWM` polling could only under-report a peak,
 never over it (a false-negative ML on a solution engineered just over the
-limit). isolate enforces both time and memory *in the kernel* and reports
-the outcome in a meta file: a memory kill is `cg-oom-killed:1` from the
-cgroup, not an after-the-fact comparison against a polled reading, and a
-time kill is `status:TO` from the sandbox's own clock, not a wait-loop
-deadline this process has to race against.
+limit). isolate runs the solution in its own cgroup and reports the
+outcome in a meta file: `max-rss` is the kernel's own peak for that child
+(not a polled reading, and not this driver's), a memory kill is
+`cg-oom-killed:1` from the cgroup, and a time kill is `status:TO` from the
+sandbox's own clock, not a wait-loop deadline this process has to race
+against.
 
 What this module *does* guarantee about accounting, stated precisely
 because a stronger claim ("neither defect is possible here") stood in this
 docstring for two tasks and was false the whole time — see the staging
 paragraph below for the third relocation of the same defect class:
 
-    Memory is bounded by `--cg-mem` and reported by `max-rss`. Output size
-    is bounded by `--fsize` (`OUTPUT_LIMIT_KB`) and is *not* reported at
-    all. These are two different limits over two different resources, and
-    the only thing that keeps them independent is that the file a solution
-    writes its stdout to lives on a **disk-backed** filesystem. On tmpfs
-    they are the same limit, because tmpfs pages are charged to the writing
-    cgroup and are never reclaimable — a solution printing 70 MB under a
-    64 MB memory limit is OOM-killed for its *output*, and reported ML on
-    2.5% of the limit it was actually given. That is why `_stage_base()`
-    refuses to stage on a memory-backed filesystem rather than warning, and
-    why `--fsize` is passed explicitly rather than left to the accident of
-    where the staging directory happened to land.
+    Memory is judged from `max-rss` (`_classify`: ML iff the child's peak
+    RSS is strictly over `memory_mb`, or the cgroup killed it). Output
+    size is bounded by `--fsize` (`OUTPUT_LIMIT_KB`) and is *not* reported
+    at all. The cgroup cap `--cg-mem` is **not** `memory_mb`: it is
+    `memory_mb + OUTPUT_SLACK_KB`. On cgroup v2 the page cache a solution
+    dirties by writing its output is charged to its cgroup until writeback
+    drains it — on a disk-backed filesystem too, not only on tmpfs — so a
+    cap set exactly at `memory_mb` was OOM-killing solutions for their
+    *output*, with almost no RSS of their own, on whichever runs the
+    flusher happened to lose the race (measured here: 48 MB of output under
+    a 32 MB cap, OOM on anywhere from one run in five to two in three,
+    varying between sessions). Disk-backed page cache is
+    reclaimable once written back, so the slack — sized to `--fsize`, the
+    largest file the sandbox permits — is enough headroom for any allowed
+    output to sit fully dirty; `max-rss` never includes page cache, so the
+    verdict itself is unaffected by output either way. tmpfs is a different
+    case, and `_stage_base()` still refuses it rather than warning: its
+    pages are *never* reclaimable, so no finite slack makes output and
+    memory independent there (measured: 70 MB of output at a 64 MB limit
+    reported `max-rss:1668 cg-oom-killed:1`). `--fsize` is passed
+    explicitly rather than left to the accident of where the staging
+    directory happened to land, and the slack is sized to it.
 
 There is no fallback runner. If isolate is missing, or installed but not
 usable (unconfigured cgroup delegation, no subuid/subgid range, the
@@ -97,7 +108,7 @@ isolate 2.6 build on this machine, not read off documentation):
     OK:  no `status` line at all; `exitcode:0`; `max-rss`; `cg-mem`.
     TLE: `status:TO`; `killed:1`; `time`; `message:Time limit exceeded`
          (the message differs for a wall-clock kill, the status does not).
-    MLE: `status:SG`; `cg-oom-killed:1`; `cg-mem` pinned at the limit;
+    MLE: `status:SG`; `cg-oom-killed:1`; `cg-mem` pinned at the cgroup cap (`memory_mb + OUTPUT_SLACK_KB`, not `memory_mb`);
          `exitsig:9`; no `exitcode` line.
     RE:  `status:RE`; `exitcode:N`; `message:Exited with error status N`.
 
@@ -154,7 +165,7 @@ relocation of one defect class. The staging directory 9b introduced was a
 plain `tempfile.mkdtemp()`, which lands under `$TMPDIR` — `/tmp` — and
 `/tmp` is `tmpfs` on this machine and on most modern Linux. `--stdout`
 points into that directory while `--cg-mem` caps the same cgroup, and
-tmpfs pages are charged to the writing cgroup and are not reclaimable, so
+tmpfs pages are charged to the writing cgroup and are never reclaimable, so
 **a solution's own stdout counted against its memory limit**. Reproduced
 with bare isolate, no involvement from this module: a 1.6 MB program
 writing 70 MB to stdout under a 64 MB limit reported
@@ -163,7 +174,10 @@ program using 2.5% of the limit it was given. This is the same class as
 the two above (memory accounting contaminated by something other than the
 process being measured): it was the parent's `mm` (9), then the box's
 cgroup (9c), and then the directory the output was staged in. The fix has
-two halves and both are load-bearing:
+two halves and both are load-bearing — plus a third, found later, without
+which the first two were not enough (`OUTPUT_SLACK_KB`: disk-backed page
+cache is charged too, only transiently, and the cap must leave room for
+it):
 
   * `_stage_base()` picks a **disk-backed** location — by default the
     problem directory's parent (the same filesystem as the work being
@@ -292,6 +306,30 @@ MEMORY_BACKED_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 # deliberate price of not truncating a legitimate answer.
 OUTPUT_LIMIT_KB = 256 * 1024
 
+# Headroom added to `--cg-mem` on top of the problem's `memory_mb`, in KB.
+#
+# On cgroup v2 every page a process writes to a file — even on a disk-backed
+# filesystem — is charged to its cgroup while dirty or in writeback, and
+# `--cg-mem` becomes the cgroup's hard `memory.max`. A solution that dirties
+# output faster than the flusher drains it therefore hits the cap and is
+# OOM-killed with almost no RSS of its own (kernel report on this machine:
+# anon 160 KB, file 32 MB — all of it dirty/writeback — under a 32 MB cap;
+# a `GFP_NOFS|__GFP_NOFAIL` allocation cannot reclaim dirty pages and forces
+# the kill). Page cache is *reclaimable* once written back, so unlike tmpfs
+# this is not a permanent charge; but it is a real one at the moment the
+# cap is checked, and it made a solution's verdict depend on the flusher's
+# timing rather than on its memory.
+#
+# So the cap `_run_once` applies is `memory_mb + OUTPUT_SLACK_KB`, sized to
+# `--fsize`: the largest single file the sandbox permits can sit fully
+# dirty without tripping the cap. ML is then judged by `_classify` from
+# `max-rss` against the *unslacked* `memory_mb`, and `cg-oom-killed` only
+# fires for a solution that overshoots the limit by more than the slack.
+# Deliberately not a multiplier: an output allowance is a fixed number of
+# bytes, and scaling it with `memory_mb` would let a 64 MB problem keep
+# false-OOMing on 70 MB of output.
+OUTPUT_SLACK_KB = OUTPUT_LIMIT_KB
+
 
 class MatrixError(RuntimeError):
     """The matrix could not be run: a build, fixture, or environment problem."""
@@ -335,9 +373,10 @@ class IsolateHandle:
 
     `stage_root` is the disk-backed parent of every per-run staging
     directory. Disk-backed, never `/tmp`: on tmpfs the bytes a solution
-    writes to its output are charged to the same cgroup `--cg-mem` caps,
-    which is a false ML on any solution with a large answer. See
-    `_stage_base()`.
+    writes to its output are charged to the same cgroup `--cg-mem` caps
+    and never reclaimed, which is a false ML on any solution with a large
+    answer no matter how much slack the cap carries. See `_stage_base()`
+    and `OUTPUT_SLACK_KB`.
 
     Box ids are not a field here at all — `_run_once` leases one per run from
     `tools.box_pool`, which is cross-process and therefore also excludes
@@ -397,8 +436,9 @@ def _stage_base(problem_dir: str | Path | None) -> Path:
     is the entire point of it existing: `tempfile.mkdtemp()` with no `dir=`
     lands in `/tmp`, `/tmp` is tmpfs here and on most modern Linux, and a
     file written to tmpfs is charged to the writing cgroup — the same
-    cgroup `--cg-mem` caps. See the module docstring for the measured false
-    ML that produced.
+    cgroup `--cg-mem` caps — and is never reclaimable, so the slack the cap
+    carries for disk-backed page cache (`OUTPUT_SLACK_KB`) does not help.
+    See the module docstring for the measured false ML that produced.
 
     Raises `MatrixError` — never warns — when the chosen location is
     unusable or memory-backed. A warning would be the wrong call twice
@@ -623,7 +663,8 @@ def open_isolate_box(problem_dir: str | Path | None = None) -> IsolateHandle:
     # meta file per run, created and removed by `_run_once` itself, and its
     # only requirement is to live somewhere a sandboxed process can never
     # reach. It does not need to be disk-backed the way `stage_root` does:
-    # nothing here is charged against a solution's `--cg-mem` limit.
+    # isolate writes it, not the sandboxed process, so nothing here is
+    # charged against a solution's cgroup.
     meta_dir = Path(tempfile.mkdtemp(prefix=".run_matrix_meta_", dir=stage_base))
 
     # The parent of every per-run `:rw` mount (see module docstring: a real
@@ -870,14 +911,19 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
     function safe to call from multiple threads sharing one `isolate`
     handle: two concurrent calls never see the same `:rw` mount.
 
-    Two limits apply to that write and they are deliberately separate.
-    `--cg-mem` caps the solution's *memory*; `--fsize=OUTPUT_LIMIT_KB` caps
-    its *output*. They are only separate because `_stage_base()` refuses a
-    memory-backed staging location — on tmpfs the output would be charged
-    to the same cgroup as the memory, which is the false-ML this driver
-    spent three tasks relocating (see module docstring). A solution that
-    exceeds `--fsize` dies of SIGXFSZ and arrives here as `status:SG` with
-    no `cg-oom-killed`, i.e. classified `crashed`/RE — not ML.
+    Two limits apply to that write. `--fsize=OUTPUT_LIMIT_KB` caps the
+    solution's *output*; `--cg-mem` caps its cgroup, and is passed as
+    `mem_limit_kb + OUTPUT_SLACK_KB`, not `mem_limit_kb`, because on cgroup
+    v2 the output's dirty page cache is charged to that same cgroup until
+    writeback drains it (see `OUTPUT_SLACK_KB`). The slack is what keeps
+    the two limits independent on a disk-backed staging directory; on a
+    memory-backed one nothing could, because tmpfs pages are never
+    reclaimable, which is why `_stage_base()` refuses it. The memory limit
+    itself is enforced by `_classify` from `max-rss`; a `cg-oom-killed`
+    here means the solution overshot the limit by more than the slack. A
+    solution that exceeds `--fsize` dies of SIGXFSZ and arrives here as
+    `status:SG` with no `cg-oom-killed`, i.e. classified `crashed`/RE —
+    not ML.
 
     This is the fix for a real bug an earlier version of this module had:
     bind-mounting a real `tests/<group>/` or `.build/` directory as the
@@ -918,8 +964,11 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
         every other call's (`isolate.stage_root`, chosen by `_stage_base()`):
         a second, memory-backed writable mount for the solution's output
         would recreate — a fourth time — the accounting bug of charging a
-        solution's output to its own `--cg-mem` (see the module docstring's
-        staging paragraph).
+        solution's output to its own `--cg-mem` with no way to reclaim it
+        (see the module docstring's staging paragraph). Note that file-IO
+        mode has *two* `--fsize`-capped files (`io_output` and the staged
+        stdout), while `OUTPUT_SLACK_KB` is sized to one; a solution that
+        fills both would need the flusher to keep up.
       * `--chdir` points at that staging mount rather than at the binary's,
         which is mounted read-only. A file-IO solution chdir'd into a
         read-only mount cannot create its output file at all.
@@ -1115,7 +1164,8 @@ def _run_once(isolate: IsolateHandle, binary: Path, stdin_path: Path,
                 isolate.binary, "--cg", f"--box-id={box_id}", "--run",
                 f"--meta={meta_path}", f"--processes={ISOLATE_PROCESSES}",
                 f"--time={cpu_limit_s:.3f}", f"--wall-time={wall_limit_s:.3f}",
-                f"--cg-mem={mem_limit_kb}", f"--fsize={OUTPUT_LIMIT_KB}",
+                f"--cg-mem={mem_limit_kb + OUTPUT_SLACK_KB}",
+                f"--fsize={OUTPUT_LIMIT_KB}",
             ]
             for resolved, label in mounts.items():
                 opt = ":rw" if resolved == run_dir_resolved else ""
@@ -1407,18 +1457,28 @@ def _ensure_dir_traversable(path: Path) -> None:
 
 
 def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
-              limits: Limits) -> Outcome:
+              limits: Limits, mem_limit_kb: int) -> Outcome:
     """Turn one sandboxed execution into an `Outcome`.
 
-    Memory classification is authoritative, not inferred: `cg-oom-killed`
-    *is* the ML signal (isolate enforced `--cg-mem` in the kernel), so an
-    OOM run short-circuits straight to `Outcome("ML", ...)` without ever
-    consulting `classify()` or the checker — there is no comparison against
-    a polled peak-RSS reading left to make. A killed (TL) or crashed (RE)
-    run likewise skips the checker: "a judge stops a solution at the limit,
-    so the checker never runs on one that exceeded it" is already
-    `classify()`'s own stated doctrine for the TL case, and it applies just
-    as much to a run that never produced valid output to check at all.
+    Memory is decided first and from two signals, either of which is ML:
+    `cg-oom-killed` (the kernel killed the cgroup at its cap, which is
+    `mem_limit_kb + OUTPUT_SLACK_KB` — see `_run_once`) or `peak_kb`, the
+    sandbox's own `max-rss` of the child, strictly greater than
+    `mem_limit_kb`. The second is the ordinary path: the cap carries slack
+    for the output's dirty page cache, so a solution that overshoots the
+    limit by less than the slack finishes rather than being killed, and
+    only `max-rss` shows it. `max-rss` is isolate's reading of the child's
+    resident peak (never this driver's own memory, and never the box's
+    cumulative `cg-mem` — see the module docstring), and it does not
+    include page cache, so output never inflates it. Exactly at the limit
+    is accepted, mirroring the time rule. An ML run short-circuits to
+    `Outcome("ML", ...)` without consulting `classify()` or the checker,
+    and takes precedence over a kill or a crash exactly as the OOM-only
+    check always did. A killed (TL) or crashed (RE) run likewise skips
+    the checker: "a judge stops a solution at the limit, so the checker
+    never runs on one that exceeded it" is already `classify()`'s own
+    stated doctrine for the TL case, and it applies just as much to a run
+    that never produced valid output to check at all.
 
     `no_output` (file-IO mode only: the process exited cleanly and never
     created the problem's output file, typically because it wrote the wrong
@@ -1433,7 +1493,7 @@ def _classify(r: RunResult, checker: Path, test: Path, out: Path, ans: Path,
     being killed is TL, not NO_OUTPUT. The checker is never invoked on this
     path, so it is never handed a nonexistent file.
     """
-    if r.oom:
+    if r.oom or r.peak_kb > mem_limit_kb:
         return Outcome("ML", banded=False)
     if r.killed:
         verdict_src = ""  # unused: classify() returns TL before consulting it
@@ -1606,13 +1666,13 @@ def _run_pass2(isolate: IsolateHandle, problem: Problem, problem_dir: Path,
                             f"run_matrix invocation could still have been "
                             f"running); the median came out {r.cpu_ms} ms",
                     changes_if_wrong=f"the expected tag of {name}")
-        outcome = _classify(r, checker, test, out, answer, limits)
+        outcome = _classify(r, checker, test, out, answer, limits, mem_limit_kb)
         if outcome.banded:
             first_run_ms = r.cpu_ms
             r = _time_median(isolate, binaries[name], test, out,
                              cpu_limit_s, wall_limit_s, mem_limit_kb, runs,
                              io_input=problem.input, io_output=problem.output)
-            outcome = _classify(r, checker, test, out, answer, limits)
+            outcome = _classify(r, checker, test, out, answer, limits, mem_limit_kb)
             flags.append(
                 problem_dir, phase="validate-solutions", severity="medium",
                 kind="timing-band",
@@ -1756,10 +1816,19 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
                         f"{kind} time on {test} (hard safety kill during "
                         "pass 1, before real limits exist; isolate reported: "
                         f"{r.message or '(no message)'})")
-                if r.oom:
+                # Same two signals as `_classify`: the cgroup cap sits
+                # `OUTPUT_SLACK_KB` above the limit, so a model solution
+                # that overshoots by less than that is never OOM-killed
+                # and only `max-rss` (`_time_median`'s max over runs) shows
+                # it. Without this half it would define the answers while
+                # breaking its own limit.
+                if r.oom or r.peak_kb > mem_limit_kb:
                     raise MatrixError(
                         f"model solution exceeded the memory limit "
-                        f"({problem.memory_mb} MB) on {test}")
+                        f"({problem.memory_mb} MB) on {test}: "
+                        + ("OOM-killed at the cgroup cap of "
+                           f"{(mem_limit_kb + OUTPUT_SLACK_KB) // 1024} MB"
+                           if r.oom else f"peak max-rss {r.peak_kb} KB"))
                 if r.crashed or r.exit_code != 0:
                     # A signal death (status SG, a real segfault/abort, not
                     # an OOM — that's handled above) carries no `exitcode`
@@ -1856,6 +1925,14 @@ def run(problem_dir: str | Path, testlib_dir: str | Path, runs: int = 3) -> dict
             # reader of an old invocation.json still needs to know which
             # mode the runner asked for.
             "cg_requested": True,
+            # The cgroup cap actually passed as `--cg-mem`, and the slack
+            # that separates it from the problem's `memory_mb`. Provenance
+            # for every ML in `results`: a `peak_kb` over `memory_mb` with
+            # `oom` false was judged from max-rss against the limit, and
+            # an `oom` true was a kernel kill at *this* cap, not at the
+            # limit. See `OUTPUT_SLACK_KB` for why they differ.
+            "cg_mem_kb": mem_limit_kb + OUTPUT_SLACK_KB,
+            "output_slack_kb": OUTPUT_SLACK_KB,
             # Pins the testlib revision the checker in this run was
             # compiled against. `bootstrap_testlib.sh` runs `git pull` on
             # every invocation, so without this the artifact certifying

@@ -95,9 +95,16 @@ with what you observe, `tools/matrix_core.py`'s `compute_limits` and
   on different hardware, and it is why the zoo has a
   `time-limit-exceeded-or-accepted` tag: a solution you expect to time out
   but only barely goes there, not into a flat `TL`.
-- **Memory is kernel-enforced.** `--cg-mem` plus `cg-oom-killed` in isolate's
-  own meta file *is* the ML signal — not a polled RSS reading compared
-  against a limit after the fact.
+- **Memory is kernel-measured.** ML is isolate's own `max-rss` for the
+  child strictly over `memory_mb` — the kernel's peak for that process, not
+  a reading this driver polled — or a `cg-oom-killed` from the cgroup. The
+  cgroup's `--cg-mem` cap is `memory_mb` plus a fixed 256 MB output
+  allowance (`invocation.json` records it as `machine.cg_mem_kb`): on cgroup
+  v2 a solution's dirty output pages are charged to its cgroup until
+  written back, and a cap set exactly at `memory_mb` OOM-killed correct
+  solutions for printing large answers. A recorded ML with `oom: false`
+  was judged from `peak_kb`; one with `oom: true` overshot the limit by
+  more than the allowance.
 - **Both IO modes run.** `problem.json`'s `io.input` / `io.output` are either
   the sentinels `"stdin"` / `"stdout"` or a pair of bare filenames
   (`flight.inp` / `flight.out`, the shape most VOI-style packages use).
