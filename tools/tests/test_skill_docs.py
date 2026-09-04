@@ -579,3 +579,49 @@ class TestServerEnvTableMatchesConfig(unittest.TestCase):
     def test_the_readme_table_lists_only_variables_config_reads(self):
         ghosts = sorted(self._table_names() - self._config_names())
         self.assertEqual(ghosts, [], f"README documents variables config.py does not read: {ghosts}")
+
+
+class TestP5ProseFixesPin(unittest.TestCase):
+    """Three one-paragraph facts adapted from a fork's prose, pinned so a
+    later rewrite of the surrounding section cannot silently drop the fact
+    along with the prose around it. These are knowledge pins, not code
+    pins — there is no importable value to check them against — so each
+    one pins a distinctive clause of the actual sentence rather than a
+    paraphrase."""
+
+    def test_preparing_tests_states_the_unknown_group_defence(self):
+        flat = flatten(skill_text("preparing-tests"))
+        self.assertIn(
+            "it silently skips the subtask-specific bound, and the "
+            "under-checked test sails through Polygon validation",
+            flat,
+            "preparing-tests no longer states what an unguarded `if` on "
+            "the wrong group spelling costs (a silent skip, not a "
+            "rejection)")
+        self.assertIn(
+            "testlib's `_fail`, exit code 3", flat,
+            "preparing-tests no longer states what an `else`-guarded "
+            "branch on the wrong group spelling costs (an outright "
+            "package rejection)")
+        self.assertIn(
+            "accepting both spellings for the same group", flat,
+            "preparing-tests no longer prescribes accepting both the "
+            "`g1` spelling and the bare-number spelling of a group")
+
+    def test_writing_statements_states_explanations_never_argue(self):
+        flat = flatten(skill_text("writing-statements"))
+        self.assertIn(
+            "an explanation that argues is an editorial leaking into "
+            "the statement",
+            flat,
+            "writing-statements no longer states that a sample "
+            "\\Explanation must describe rather than argue")
+
+    def test_validating_solutions_states_the_zoo_strength_rule(self):
+        flat = flatten(skill_text("validating-solutions"))
+        self.assertIn(
+            "the new class can never surface a hole the stronger one "
+            "wouldn't already have found",
+            flat,
+            "validating-solutions no longer forbids a time-limit-exceeded "
+            "entry strictly weaker than one already in the zoo")

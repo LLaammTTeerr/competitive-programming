@@ -189,7 +189,7 @@ run's own report, anything durable — because a silently absent class reads
 identically to one the writer simply forgot, and only one of those two is
 fine.
 
-Two rules make the zoo worth writing:
+Three rules make the zoo worth writing:
 
 - **Each wrong solution is wrong in exactly one named way.** One wrong in
   three ways proves nothing about which test caught it — a solution that is
@@ -200,6 +200,14 @@ Two rules make the zoo worth writing:
   competent contestant submit this at 2am?"* A greedy nobody would write
   catches nothing and inflates the report with a class that was never a real
   risk.
+- **Never add a `time-limit-exceeded` entry strictly weaker than one
+  already in the zoo.** If the suite already kills the O(N²) walk, an
+  O(N³) walk added next to it proves nothing — anywhere the suite reaches
+  the O(N²) entry's bound it reaches the O(N³) entry's too, so the new
+  class can never surface a hole the stronger one wouldn't already have
+  found. Each `time-limit-exceeded` entry earns its slot by being the
+  strongest wrong solution of its kind; a new one must fail somewhere
+  every existing entry of that class still passes.
 
 ### Convergence-based `time-limit-exceeded` needs a floor
 

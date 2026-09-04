@@ -211,6 +211,13 @@ whose problems agree on it reads as one paper:
    `\Explanation` ("Giải thích"), not `\Note` ("Chú ý"), when the content
    explains a sample — reserve `\Note` for a genuine aside.
 
+The explanation itself only narrates: it walks through what happens in
+that sample, using the concrete numbers already in it, and shows why the
+printed answer is the answer. It never argues that a different choice
+would be worse, never names the technique, and never gestures at the
+intended solution — an explanation that argues is an editorial leaking
+into the statement.
+
 Keep `\begin{problem}`'s key list to bare numbers for `time` and `memory`;
 the package owns the units. Everything else about the key list is in
 `AUTHORING.md` §2.
