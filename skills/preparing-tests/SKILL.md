@@ -319,6 +319,13 @@ two documents and silent disagreement.
   files, no hidden state — reproducibility means the same invocation
   produces the same test forever.
 
+**Read `references/test-generation.md` before designing the families** — it
+carries the design doctrine the family names alone do not: the kill policy
+for OI-style subtasks versus ICPC-style, subtask separation, parameter
+saturation with `rnd.wnext`, the sizes at which each naive complexity class
+actually dies, the shape catalogue, how rare corner cases should be, and the
+multi-test `T` policy.
+
 Five families, and writing them is independent work with no shared state —
 invoke `superpowers:dispatching-parallel-agents` to fan them out:
 
