@@ -296,6 +296,141 @@ class TestFormatFieldDocs(unittest.TestCase):
                       "format among what the gate settles")
 
 
+class TestMultiTestAndKillPolicyDocs(unittest.TestCase):
+    """Two pieces of doctrine keyed on `format`, split across two skills.
+
+    The small-`T` file and the OI kill policy are the same argument seen
+    from two ends — a ladder that pays partial credit must leave something
+    for a slightly-slow solution to score on — so the two skills state it in
+    the two places the decision is actually made (`shaping-problems` picks
+    the numbers, `creating-problems` decides the zoo's expectations). Both
+    halves are pinned, because a half deleted on its own reads as complete.
+    """
+
+    SECTION = "## Kill policy, by format"
+
+    def kill_policy_section(self) -> str:
+        text = skill_text("creating-problems")
+        start = text.find(self.SECTION)
+        self.assertNotEqual(
+            start, -1,
+            f"creating-problems has no {self.SECTION!r} section — the kill "
+            f"policy is the only place the zoo's expectations are decided "
+            f"per format")
+        end = text.find("\n## ", start + len(self.SECTION))
+        return text[start:end if end != -1 else len(text)]
+
+    def test_both_skills_state_the_small_T_file(self):
+        # The one test file that makes the OI ladder pay what it promises. It
+        # is stated in both skills on purpose (skills load independently,
+        # there is no include mechanism), which is why it needs a test
+        # holding the two copies together.
+        phrase = "one file with a small `T`"
+        for skill in ("shaping-problems", "creating-problems"):
+            with self.subTest(skill=skill):
+                body = flatten(skill_text(skill))
+                # `assertTrue`, not `assertIn`: the container is a whole
+                # normalized skill, and unittest would render all of it.
+                self.assertTrue(
+                    phrase in body,
+                    f"{skill} no longer states the `T` protocol's "
+                    f"{phrase!r} — without it an OI package times every "
+                    f"rung out at T = X and pays no partial credit at all.")
+
+    def test_creating_problems_states_a_kill_policy_for_every_format(self):
+        # The bullet markers are read back out of the section and checked
+        # against the constant, not against a second copy of the two values
+        # typed here: a format added to FORMAT_VALUES with no kill policy
+        # written for it must fail this, and so must a renamed one.
+        section = self.kill_policy_section()
+        found = re.findall(r"^- \*\*`(\w+)`\*\*", section, re.MULTILINE)
+        self.assertEqual(
+            sorted(found), sorted(FORMAT_VALUES),
+            f"creating-problems' kill policy covers {sorted(found)}; "
+            f"problem_meta.FORMAT_VALUES is {sorted(FORMAT_VALUES)}. Every "
+            f"accepted format needs its own policy — the zoo's `@expect` "
+            f"lines are written from it.")
+
+    def test_the_kill_policy_points_at_the_matrix_not_a_manual_sweep(self):
+        # `run_matrix` is the enforcement, and `holes` is how a violation
+        # surfaces. Prose describing a second manual pass over every
+        # solution × every stronger group is prose telling a setter to
+        # re-run, by hand, the one thing the tooling already does.
+        section = flatten(self.kill_policy_section())
+        for term in ("`@expect`", "`run_matrix`", "`holes`"):
+            with self.subTest(term=term):
+                self.assertTrue(
+                    term in section,
+                    f"the kill policy no longer names {term}, the mechanism "
+                    f"that actually enforces subtask separation")
+
+
+class TestShapingProblemsMissionLineJudgementCount(unittest.TestCase):
+    """`shaping-problems`' mission line states how many judgements the gate
+    makes and lists them in order. The `## Multi-test input and the T
+    protocol` section was added as its own peer gate decision — sitting
+    between the subtask ladder and the JSON hand-off — and the stated count
+    went stale the moment that section landed without the mission line being
+    updated alongside it.
+
+    Rather than pin a second literal copy of the number (which drifts the
+    same way the first one did), this counts the `##` sections that fall
+    between the first judgement (`Originality`) and the section that closes
+    the gate out (`Done means`) — that span is exactly the judgements the
+    mission line claims to enumerate, so a section inserted or removed
+    inside it changes the count this test checks against automatically.
+    """
+
+    SKILL = "shaping-problems"
+    FIRST_JUDGEMENT_SECTION = "## Originality — before anything else"
+    # Not itself a judgement — the check that closes the gate out — so it
+    # marks where the judgement span ends rather than being counted in it.
+    POST_JUDGEMENT_SECTION = "## Done means"
+
+    _NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                      "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+    def _judgement_sections(self) -> list[str]:
+        text = skill_text(self.SKILL)
+        start = text.find(self.FIRST_JUDGEMENT_SECTION)
+        end = text.find(self.POST_JUDGEMENT_SECTION)
+        self.assertNotEqual(
+            start, -1,
+            f"{self.SKILL} no longer has a {self.FIRST_JUDGEMENT_SECTION!r} "
+            f"section — the judgement span this test counts starts there")
+        self.assertNotEqual(
+            end, -1,
+            f"{self.SKILL} no longer has a {self.POST_JUDGEMENT_SECTION!r} "
+            f"section — the judgement span this test counts ends there")
+        self.assertLess(
+            start, end,
+            f"{self.FIRST_JUDGEMENT_SECTION!r} must come before "
+            f"{self.POST_JUDGEMENT_SECTION!r} for the span between them to "
+            f"mean anything")
+        return re.findall(r"^## .+$", text[start:end], re.MULTILINE)
+
+    def test_stated_count_matches_the_number_of_judgement_sections(self):
+        sections = self._judgement_sections()
+        body = flatten(skill_text(self.SKILL))
+        match = re.search(r"\. (\w+) judgements, in order:", body)
+        self.assertIsNotNone(
+            match,
+            f"{self.SKILL} no longer states '<N> judgements, in order:' in "
+            f"its mission line — the count this test pins against is gone")
+        word = match.group(1).lower()
+        self.assertIn(
+            word, self._NUMBER_WORDS,
+            f"{word!r} is not a number word this test knows how to check")
+        self.assertEqual(
+            self._NUMBER_WORDS[word], len(sections),
+            f"the mission line claims {word!r} judgements, but "
+            f"{len(sections)} sections sit between "
+            f"{self.FIRST_JUDGEMENT_SECTION!r} and "
+            f"{self.POST_JUDGEMENT_SECTION!r} ({sections}) — a section was "
+            f"added or removed without updating the count, or the count was "
+            f"changed without the sections it describes")
+
+
 class TestWritingStatementsRoutingTable(unittest.TestCase):
     """The routing table `writing-statements` carries, pinned to the things
     outside it that it names.

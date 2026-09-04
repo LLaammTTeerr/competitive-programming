@@ -15,13 +15,14 @@ description: >
 # Shaping problems
 
 Mission: turn an idea into `problem.json` — the one blocking gate in the
-whole pipeline (spec §6). Four judgements, in order: is this problem already
+whole pipeline (spec §6). Five judgements, in order: is this problem already
 known, what `N` separates the *intended* solution from the *naive* one, what
-subtask ladder pays for distinct insight rather than for typing, and what
-that adds up to as structured JSON. This skill owns the **numbers**. It does
-not own prose (`writing-statements`) and it does not own open-ended dialogue
-about what the problem even is (`superpowers:brainstorming`, which it
-delegates to rather than competes with).
+subtask ladder pays for distinct insight rather than for typing, whether the
+input packs multiple test cases and what `X` bounds them, and what that adds
+up to as structured JSON. This skill owns the **numbers**. It does not own
+prose (`writing-statements`) and it does not own open-ended dialogue about
+what the problem even is (`superpowers:brainstorming`, which it delegates to
+rather than competes with).
 
 ## Am I the right skill?
 
@@ -176,6 +177,54 @@ deficiency: a ladder is not obligated to have more rungs than the problem
 has distinct insights, and inventing a third rung here (say, `|A|, |B| ≤ 12`)
 would only interpolate between the same two algorithms without rewarding
 anything new.
+
+A rung is also a promise, and the promise is machine-checked downstream:
+**subtask separation** — no solution that only solves rung `k` may score in
+a later group — is written down in the `@expect` line of each per-subtask
+solution, and `creating-problems` decides what those lines must say (its
+kill policy differs by format). Nothing to write here beyond the ladder
+itself, but the ladder is what makes such a line writable at all: two rungs
+the same algorithm clears cannot be separated by any test, however the zoo
+is expected to behave.
+
+## Multi-test input and the `T` protocol
+
+Does one input file carry several independent test cases? Ask it at this
+gate, before any generator exists — a `T` discovered afterwards invalidates
+every file already built. If it does, the number of cases per file has a
+maximum, call it `X`, and `X` is a constraint like every other: its own row
+in `constraints` below, with `min`, `max` and an `expr` the statement
+renders and the validator enforces. There is no default `X` to fall back
+on, and none to infer from the shape of the problem — the setter picks it
+out loud, by the same arithmetic that picked `N`.
+
+`X` is the bound; what the test files do with it depends on which scoring
+model the format field records:
+
+- **`icpc`** — every file at `T = X`. Scoring is binary, so a file running
+  below the declared maximum tests nothing the maximal file does not
+  already test, and every unit of slack is slack a too-slow solution
+  survives on.
+- **`oi`** — most files at a `T` in roughly the top tenth of the range up
+  to `X`, plus **one file with a small `T`** holding a single max-size
+  case. That last file is the point of the whole policy: a solution
+  slightly over budget per case fails the crowded files and still clears
+  the sparse one, so it scores on the groups its insight actually pays for
+  instead of collecting nothing. A ladder that offers partial credit and
+  then times every rung out at `T = X` has thrown away the credit it exists
+  to pay.
+
+**Σ-constraints are never invented.** If the statement does not say that
+`ΣN` (or `ΣQ`, or any other total taken across the file) is bounded, then
+it is not bounded: generators must not quietly assume one, and the model
+solution's budget is the per-file worst case — `X` cases each at full size.
+A setter who wants such a bound gets it as a stated constraint, with its
+own row in `constraints` and its own line in the statement, decided here
+alongside `X` itself.
+
+Both of these are *inputs* to `preparing-tests`, not instructions to it:
+the generator families that realize a `T` distribution are designed there,
+against the numbers this skill records.
 
 ## What it hands over
 
