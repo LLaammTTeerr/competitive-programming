@@ -1457,6 +1457,22 @@ class TestUploadingToPolygonSkill(unittest.TestCase):
                       f"{self.SKILL}'s description no longer says which "
                       f"server it drives")
 
+    def test_the_manifest_description_counts_this_skill(self):
+        # Mirrors TestWritingEditorialsSkill's own pin below: the manifest
+        # description enumerates every skill in one clause each, and it
+        # drifted silently when this skill was added because nothing read
+        # it. "Polygon" alone would not catch that drift — the stale
+        # description already said "Polygon" via the two-servers clause and
+        # via "Polygon-ready package" — so this pins the distinct word
+        # "uploading" instead.
+        for manifest, description in manifest_descriptions().items():
+            with self.subTest(manifest=manifest):
+                self.assertIn(
+                    "uploading", description,
+                    f"{manifest}'s description enumerates every skill but "
+                    f"uploading-to-polygon, so the marketplace listing "
+                    f"undersells the plugin")
+
     def test_the_skill_names_both_preconditions_by_tool(self):
         body = flatten(skill_text(self.SKILL))
         for tool in ("tools.package_status", "tools.review_checks"):
