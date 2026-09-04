@@ -269,9 +269,12 @@ For `format == "oi"`:
    `polygon_enable_points(problem_id, true)`. Both come first — a test
    cannot carry a group or points until they are on.
 2. **One group per subtask, named with the subtask's own id** (`g1`, `g2`, …
-   from `problem.json`). The uploaded validator branches on exactly those
-   names; renaming them to `1`, `2`, … makes the build fail with the
-   validator's own `FAIL unknown group`, and nothing else explains why.
+   from `problem.json`). Polygon hands the group name to the validator, so a
+   group renamed to `1`, `2`, … is only safe if that validator accepts the
+   bare-number spelling too — and when it does not, the package build fails
+   with the validator's own `FAIL unknown group` and nothing else explains
+   why. The subtask id is the spelling every part of the package agrees on;
+   keep it.
 3. Give each test its group and its points in the same
    `polygon_save_test(problem_id, "tests", test_index=…, test_group=…,
    test_points=…)` call — both together, with no `test_input`, so the script
