@@ -53,7 +53,7 @@ class Problem:
     constraints: list[Constraint]
     subtasks: list[Subtask]
     examples: list[dict]
-    format: str = "icpc"
+    format: str
 
     def constraint(self, cid: str) -> Constraint:
         for c in self.constraints:

@@ -27,6 +27,7 @@ PROBLEM = Problem(
         Subtask(id="g2", points=60, bounds={}, constraints_text=[], depends_on=["g1"]),
     ],
     examples=[],
+    format="oi",
 )
 
 
@@ -91,6 +92,7 @@ class TestRender(unittest.TestCase):
                         constraints_text=[], depends_on=[]),
             ],
             examples=[],
+            format="icpc",
         )
         header = render(problem)
         self.assertIn("static const long long G1_SPECIAL_MIN = 1;", header)
@@ -112,6 +114,7 @@ class TestRender(unittest.TestCase):
             constraints=[],
             subtasks=[],
             examples=[],
+            format="icpc",
         )
         header = render(problem)
         self.assertIn("#pragma once", header)
@@ -173,6 +176,7 @@ class TestRender(unittest.TestCase):
             ],
             subtasks=[],
             examples=[],
+            format="icpc",
         )
         with self.assertRaises(ProblemMetaError) as ctx:
             render(problem)
@@ -198,6 +202,7 @@ class TestRender(unittest.TestCase):
             ],
             subtasks=[],
             examples=[],
+            format="icpc",
         )
         with self.assertRaises(ProblemMetaError) as ctx:
             render(problem)
@@ -227,6 +232,7 @@ class TestRender(unittest.TestCase):
                         constraints_text=[], depends_on=[]),
             ],
             examples=[],
+            format="icpc",
         )
         header = render(problem)
         self.assertIn("LEN_A_MIN", header)

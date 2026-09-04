@@ -163,8 +163,13 @@ class TestFormatField(unittest.TestCase):
             load(write(bad))
 
     def test_format_survives_on_the_loaded_problem_object(self):
-        problem = load(write(dict(VALID, format="icpc")))
-        self.assertEqual(problem.format, "icpc")
+        # Each explicit value is the opposite of what inference would
+        # produce for that subtask count, so this only passes if `load`
+        # actually threads the parsed value through.
+        one_group_explicit_oi = load(write(dict(self._single_subtask(), format="oi")))
+        self.assertEqual(one_group_explicit_oi.format, "oi")
+        two_groups_explicit_icpc = load(write(dict(VALID, format="icpc")))
+        self.assertEqual(two_groups_explicit_icpc.format, "icpc")
 
 
 class TestLoadWrapsEveryFailure(unittest.TestCase):
