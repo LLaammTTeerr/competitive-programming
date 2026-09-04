@@ -23,7 +23,7 @@ import re
 import unittest
 from pathlib import Path
 
-from tools import box_pool, run_matrix
+from tools import bootstrap_testlib, box_pool, run_matrix
 from tools.matrix_core import _SEVERITY
 from tools.package_status import PHASE_ORDER
 from tools.problem_meta import FORMAT_VALUES
@@ -796,6 +796,21 @@ class TestTestGenerationReference(unittest.TestCase):
                 f"byte-for-byte between preparing-tests and "
                 f"reviewing-problems; a third copy is held by nothing. "
                 f"Link to ../SKILL.md#reaching-check instead.")
+
+
+class TestBootstrapTestlibDocs(unittest.TestCase):
+    """The README's testlib paragraph promises two things a reader might
+    act on: that `CP_TESTLIB` skips cloning, and that `python3 -m
+    tools.bootstrap_testlib` is the portable entry point `bootstrap_testlib.
+    sh` wraps. Pinned against the module's own env-var constants rather than
+    copies of the strings, so a rename doesn't leave the README describing a
+    variable that no longer does anything.
+    """
+
+    def test_readme_documents_cp_testlib_and_the_portable_entry_point(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(bootstrap_testlib.CP_TESTLIB_ENV, readme)
+        self.assertIn("python3 -m tools.bootstrap_testlib", readme)
 
 
 if __name__ == "__main__":
