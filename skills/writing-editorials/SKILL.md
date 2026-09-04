@@ -114,12 +114,12 @@ heading is enough.
 
 ## The problem section
 
-Restate in normal language and strip the lore: setting, flavour,
-character names. A two-player game is players A and B, or First and
-Second, not the story's characters. Keep the rules, drop the story, keep a
-named object only when renaming it would make the task harder to follow.
-The order is fixed — Requirement is the last line of the restatement,
-immediately above Constraints, not after the subtask list:
+Restate the problem plainly, fiction stripped out: a merchant crossing
+cities becomes a walk in a graph, two named rivals become the first and
+second player. Every rule that can change an answer survives, nothing
+else does, and a name stays only when stripping it costs more than the
+fiction did. The order is fixed — Requirement is the last line of the
+restatement, immediately above Constraints, not after the subtask list:
 
 ```html
 <section id="statement">
@@ -144,9 +144,9 @@ problem has no subtasks, omit the list: **do not name the contest format**
 ## The tutorial is a derivation, not a summary
 
 The goal is not brevity. It is that a strong contestant who failed this
-problem can follow the reasoning, reconstruct the algorithm, and implement
-it without guessing at a step you left out. Write the way a contestant
-explains their own solution to another contestant: a continuous chain,
+problem can rebuild the algorithm from the page alone, with no step left
+for them to invent. Write the way a contestant explains their own
+solution to another contestant: a continuous chain,
 each link motivated by the one before it — what makes the problem hard →
 the observation → why it is true → what it lets us forget → the
 representation that suggests → the state → the transition → why that is
@@ -159,18 +159,18 @@ the explanation is not finished.
 standard …" are fine only when the reasoning they skip is genuinely
 trivial. Compare:
 
-> We notice that the minimum prefix is sufficient, so we use DP.
+> Each query is clearly a range maximum, so we use a segment tree.
 
 with
 
-> Suppose we have processed the first `i` elements. What information from
-> that prefix still affects the remaining choices? Not the arrangement of
-> the elements — only the smallest value the next element must clear. So
-> the prefix can be represented by that value, which gives the state
-> `dp[i][j]`.
+> A query asks for the best value over a contiguous block, and updates
+> touch one position at a time. So we need a structure that answers an
+> arbitrary block without rescanning it and absorbs a point change without
+> rebuilding: a tree over the array's halves does both, at a logarithmic
+> cost each.
 
-The second exposes the reasoning that produced the state; the first
-presents the state as a fact.
+The first hands the reader a conclusion; the second lays out the two
+demands that force it, so the reader could have reached it alone.
 
 The same rule holds for every piece the reader has to carry:
 
@@ -202,8 +202,8 @@ Calibrate depth to who still needs the editorial. A classical
 first-technique problem gets a few sentences introducing the structure
 itself; a ~1400–1900 problem gets a one-line reminder only when the twist
 is unusual; at 2000+ assume segment trees, DSU, binary lifting and
-standard DP and explain only what is specific to this problem. A longer
-writeup is not a harder problem.
+standard DP and explain only what is specific to this problem. Page length
+is not a measure of difficulty.
 
 ## What earns a card
 
@@ -240,8 +240,8 @@ Solution → Time complexity, plus Other solutions when there is one.
 
 Students read this, not the setter. State the mathematics and leave the
 setter's asides out: "do not apply observation \(k\) in this branch", "the
-old constraint made this unreachable". If a case is a formula, write the
-formula.
+old constraint made this unreachable". Where a case comes down to a closed
+form, the closed form is the whole explanation.
 
 **Avoid the writing signals that mark generated prose.** These are
 concrete, and each one is worth a pass over the draft:
@@ -264,9 +264,9 @@ concrete, and each one is worth a pass over the draft:
 
 Human is not the same as casual: no jokes, no filler, no anecdotes. The
 target is clear, precise, naturally connected prose that happens to be
-formal. Input identifiers keep the statement's spelling and case — \(N\)
-stays \(N\); names the editorial introduces may be either case, but pick
-one and hold to it.
+formal. Whatever the statement calls a variable, call it that, in that
+case: an input written \(N\) is never \(n\) here. Symbols the editorial
+invents may go either way, so long as the page does not switch halfway.
 
 ## Vietnamese pages
 
@@ -340,9 +340,9 @@ self-contained file at `$PROBLEM/sol-editorial.cpp`.
 - **No algorithm box.** No pseudocode, and do not paste `sol-main.cpp`
   into the page. A displayed recurrence or matrix is fine; the last step
   of the derivation should make the method obvious on its own.
-- No reveal.js, no slide deck, no pagination, no "next page". Keep the
-  print stylesheet as it is (`@page { margin: 0 }`, so PDF pages join and
-  the inset comes from `.page` padding).
+- One continuous scroll: no slide framework, no pager, no "next page"
+  control. Keep the print stylesheet as it is (`@page { margin: 0 }`, so
+  PDF pages join and the inset comes from `.page` padding).
 - The theme's tokens are a tribute; do not brand the page with them.
 
 ## Done

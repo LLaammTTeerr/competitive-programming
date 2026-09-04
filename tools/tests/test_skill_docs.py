@@ -19,6 +19,7 @@ module is that mechanism.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import unittest
 from pathlib import Path
@@ -31,6 +32,7 @@ from tools.scan_solutions import VERDICTS
 
 ROOT = Path(__file__).resolve().parents[2]
 SKILLS = ROOT / "skills"
+PLUGIN_DIR = ROOT / ".claude-plugin"
 
 # A fenced block, tagged with its language. Non-greedy so each match is one
 # complete fence rather than everything between the first and last one.
@@ -70,6 +72,24 @@ def bash_blocks(skill: str) -> list[str]:
     text = skill_text(skill)
     return [m.group("body") for m in _FENCE.finditer(text)
             if m.group("lang") == "bash"]
+
+
+def manifest_descriptions() -> dict[str, str]:
+    """The plugin `description` as each of the two manifests spells it.
+
+    `plugin.json` is what an installed plugin reports; `marketplace.json` is
+    what the listing shows before anyone installs it. They are two copies of
+    one sentence, with nothing between them.
+    """
+    plugin = json.loads((PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))
+    market = json.loads((PLUGIN_DIR / "marketplace.json").read_text(encoding="utf-8"))
+    entries = [p for p in market["plugins"] if p["name"] == plugin["name"]]
+    if len(entries) != 1:
+        raise AssertionError(
+            f"marketplace.json lists {len(entries)} entries named "
+            f"{plugin['name']!r}; expected exactly one")
+    return {"plugin.json": plugin["description"],
+            "marketplace.json": entries[0]["description"]}
 
 
 class TestFenceExtraction(unittest.TestCase):
@@ -938,6 +958,25 @@ class TestP5ProseFixesPin(unittest.TestCase):
             "entry strictly weaker than one already in the zoo")
 
 
+class TestManifestDescriptionsAgree(unittest.TestCase):
+    """The two manifests carry the same sentence, and nothing held them there.
+
+    This is the same failure this module was written for: two copies with no
+    mechanism between them, and the half that drifts is the one the next
+    editor did not have open. Here the half nobody opens is
+    `marketplace.json`, which is the copy every prospective user reads.
+    """
+
+    def test_both_manifests_spell_the_description_the_same_way(self):
+        described = manifest_descriptions()
+        self.assertGreater(len(described["plugin.json"]), 100,
+                           "plugin.json's description read back nearly empty")
+        self.assertEqual(described["plugin.json"], described["marketplace.json"],
+                         "plugin.json and marketplace.json describe the plugin "
+                         "differently; they are meant to be one sentence kept "
+                         "in two places")
+
+
 class TestWritingEditorialsSkill(unittest.TestCase):
     """`writing-editorials` is the one skill nothing in the pipeline calls.
 
@@ -1108,3 +1147,15 @@ class TestWritingEditorialsSkill(unittest.TestCase):
         self.assertIn("9 skills, 1 MCP server", readme,
                       "the README's `claude plugin details` expectation still "
                       "says 8 skills")
+
+    def test_the_manifest_description_counts_this_skill(self):
+        # The manifest description enumerates the plugin's capabilities one
+        # clause per skill, and it is what a marketplace listing shows — the
+        # externally visible twin of the README count above. It drifted
+        # silently when this skill was added because nothing read it.
+        for description in manifest_descriptions().values():
+            with self.subTest():
+                self.assertIn(
+                    "editorial", description,
+                    "the plugin description enumerates every skill but this "
+                    "one, so the marketplace listing undersells the plugin")
