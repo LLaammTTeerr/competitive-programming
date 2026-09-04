@@ -1,28 +1,20 @@
 #!/usr/bin/env bash
-# Clone or refresh the qhhoj/testlib checkout the pipeline compiles against, and
-# print its path. Reads docs/usage-guide.md and plan.md from here rather than
-# paraphrasing the API into a skill file, so the guidance always matches the
-# header actually being compiled.
+# Thin wrapper around `python3 -m tools.bootstrap_testlib` — the portable
+# entry point, reachable as a plain Python call anywhere `mv -T` and `bash`
+# itself are not guaranteed (e.g. Windows). Clones or refreshes the
+# qhhoj/testlib checkout the pipeline compiles against, and prints its path.
+#
+# Pinned to qhhoj/testlib, not the more commonly linked MikeMirzayanov/testlib:
+# qhhoj's checkout bundles docs/usage-guide.md and plan.md, which match the
+# header this repo actually compiles checkers and validators against, and
+# skills/preparing-tests/SKILL.md sends the model to read both files straight
+# out of the cache rather than a paraphrase baked into a skill.
 set -euo pipefail
 
-TESTLIB="${XDG_CACHE_HOME:-$HOME/.cache}/testlib"
-REPO=https://github.com/qhhoj/testlib.git
+# `cd` to the plugin root before invoking `-m tools.bootstrap_testlib`: that
+# module is only importable with the plugin root as the working directory,
+# and callers of this script run it from every directory imaginable.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
-if [ ! -d "$TESTLIB" ]; then
-    # Clone aside and move into place. Several problems can be prepared at once,
-    # and a bare `[ -d ] || git clone` lets the second caller find a directory
-    # that exists but is still half-populated, then build against it.
-    mkdir -p "$(dirname "$TESTLIB")"
-    staging="$(mktemp -d "$TESTLIB.XXXXXX")"
-    trap 'rm -rf "$staging"' EXIT
-    git clone --depth 1 -q "$REPO" "$staging/testlib"
-    mv -T "$staging/testlib" "$TESTLIB" 2>/dev/null || true   # first writer wins
-fi
-git -C "$TESTLIB" pull --ff-only -q 2>/dev/null || true       # offline, or lost a race
-
-if [ ! -f "$TESTLIB/testlib.h" ]; then
-    echo "bootstrap_testlib: $TESTLIB exists but has no testlib.h" >&2
-    exit 1
-fi
-
-echo "$TESTLIB"
+exec python3 -m tools.bootstrap_testlib "$@"

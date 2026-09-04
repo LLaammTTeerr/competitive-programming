@@ -39,7 +39,8 @@ competitive-programming/
 ├── tools/                    # Python pipeline the setting skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  box_pool.py
-│   ├── package_status.py  review_checks.py  bootstrap_testlib.sh
+│   ├── package_status.py  review_checks.py  bootstrap_testlib.py
+│   ├── bootstrap_testlib.sh   # thin wrapper: cd's to the plugin root, execs the .py
 │   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
     ├── pyproject.toml  uv.lock
@@ -233,6 +234,16 @@ testlib cache is missing: `run_matrix.py` is the one module with no fallback
 runner, so gating its tests on the presence of that same dependency meant a
 fresh clone printed a green `OK` over a driver it had never executed. Set
 `CP_ALLOW_SANDBOX_SKIP=1` to opt back into skipping them.
+
+That testlib cache is populated by `tools/bootstrap_testlib.sh`, which every
+skill's Bootstrap block and the tools suite itself shell out to. It clones or
+refreshes `qhhoj/testlib` into `$XDG_CACHE_HOME/testlib` (`~/.cache/testlib`
+if unset) and prints the path; set `CP_TESTLIB` to an existing directory
+containing `testlib.h` to skip that entirely — no network, no `git` needed.
+`python3 -m tools.bootstrap_testlib` is the portable entry point that
+actually does the work; the `.sh` is a thin `cd`-then-`exec` wrapper around
+it, kept so every existing caller's `bash tools/bootstrap_testlib.sh` keeps
+working unchanged.
 
 After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new session).
 
