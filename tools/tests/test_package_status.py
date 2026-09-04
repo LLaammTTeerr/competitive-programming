@@ -4,7 +4,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from tools import problem_meta
+from tools import polygon_ref, problem_meta
 from tools.package_status import (PHASE_ORDER, _matrix, main, newest_source_mtime,
                                   next_phase, status)
 
@@ -250,6 +250,30 @@ class MatrixFreshnessTest(unittest.TestCase):
         later = (d / "invocation.json").stat().st_mtime + 10
         os.utime(d / "problem.json", (later, later))
         self.assertFalse(_matrix(d, self._problem(d)).done)
+
+    def test_polygon_json_written_after_the_invocation_is_not_stale(self):
+        # `polygon.json` is `uploading-to-polygon`'s record of which Polygon
+        # problem this package owns. It sits beside `problem.json` at the
+        # package root, and it is written *after* both gates have passed —
+        # so if the staleness walk ever picked it up, the upload would
+        # invalidate the gate it had just cleared, and no later run could
+        # pass the gate again over a package nothing had changed. That is
+        # exactly why the record is not a `problem.json` key. The walk names
+        # its sources explicitly (`_MATRIX_SOURCES`, plus the custom checker);
+        # this holds it to that, in both directions a file can change.
+        d = self._package()
+        later = (d / "invocation.json").stat().st_mtime + 10
+        ref = polygon_ref.PolygonRef(id=123456, owner="setter",
+                                     url="https://example/p/123456")
+        path = polygon_ref.save(d, ref)
+        os.utime(path, (later, later))
+        self.assertTrue(_matrix(d, self._problem(d)).done, "creating it")
+
+        polygon_ref.save(d, polygon_ref.PolygonRef(
+            id=123456, owner="setter", url="https://example/p/123456",
+            committed_at="2026-09-04T11:22:33Z"))
+        os.utime(path, (later, later))
+        self.assertTrue(_matrix(d, self._problem(d)).done, "rewriting it")
 
     def test_staleness_is_reported_before_holes(self):
         # A stale artifact reporting zero holes must not read as "clean".

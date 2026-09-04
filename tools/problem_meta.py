@@ -39,30 +39,6 @@ class Subtask:
 
 
 @dataclass(frozen=True)
-class PolygonRef:
-    """Where this package lives on Polygon, once it has been uploaded there.
-
-    Written by `uploading-to-polygon` after the problem is created, and read
-    back by it on every later run: the block's *presence* is what turns a
-    second upload into a re-sync of one Polygon problem rather than a second
-    problem with the same name. `committed_at` is the epoch second of the
-    last revision that skill committed, and it is what a re-sync compares
-    file mtimes against to decide what still needs uploading — absent until
-    a commit has actually succeeded, so a create that never got as far as a
-    revision cannot be mistaken for one that did.
-
-    `url` is recorded rather than derived: `problem.create` returns `id`,
-    `owner`, `name` and access type and no address at all, so there is no
-    documented way to build a working Polygon link from the id.
-    """
-
-    id: int
-    owner: str
-    url: str
-    committed_at: int | None = None
-
-
-@dataclass(frozen=True)
 class Problem:
     name: str
     title: dict[str, str]
@@ -78,7 +54,6 @@ class Problem:
     subtasks: list[Subtask]
     examples: list[dict]
     format: str
-    polygon: PolygonRef | None = None
 
     def constraint(self, cid: str) -> Constraint:
         for c in self.constraints:
@@ -226,50 +201,6 @@ def _integer(value, path: Path, what: str, *, allow_none: bool = False):
             "non-integer is silently truncated by the C++ compiler — 2.9 "
             "becomes 2 and 0.5 becomes 0.")
     return value
-
-
-def _polygon(raw: dict, path: Path) -> PolygonRef | None:
-    """The optional `polygon` provenance block, or None when it is absent.
-
-    Absent means "not on Polygon yet" and is the ordinary state of every
-    package before the upload skill runs; `"polygon": null` is rejected
-    rather than read as absent, for the same reason `format` is — under
-    standing ruling R1 an emptied key is a typo, not a way to say "unset",
-    and the difference matters here more than anywhere else in this file:
-    reading `null` as absent would tell the upload skill to *create a second
-    Polygon problem* for a package that already has one.
-
-    `id` is bounded below because Polygon ids are positive and the value is
-    passed straight into every `problem_id` parameter of the upload; `0` or
-    a negative would be sent to the API to be rejected there, one round trip
-    and one confusing error message later.
-    """
-    if "polygon" not in raw:
-        return None
-    block = _object(raw["polygon"], path, "'polygon'")
-    for key in ("id", "owner", "url"):
-        if key not in block:
-            raise ProblemMetaError(
-                f"{path}: polygon.{key} is missing. The block is written whole "
-                f"by the upload skill after `problem.create` returns — a "
-                f"hand-edit that drops a key leaves a package that claims to "
-                f"be on Polygon without saying where.")
-    pid = _integer(block["id"], path, "polygon.id")
-    if pid <= 0:
-        raise ProblemMetaError(
-            f"{path}: polygon.id is {pid}, expected a positive Polygon problem id")
-    committed_at = _integer(block.get("committed_at"), path,
-                            "polygon.committed_at", allow_none=True)
-    if committed_at is not None and committed_at <= 0:
-        raise ProblemMetaError(
-            f"{path}: polygon.committed_at is {committed_at}, expected a "
-            f"positive epoch second")
-    return PolygonRef(
-        id=pid,
-        owner=_string(block["owner"], path, "polygon.owner"),
-        url=_string(block["url"], path, "polygon.url"),
-        committed_at=committed_at,
-    )
 
 
 def load(path: str | Path) -> Problem:
@@ -528,5 +459,4 @@ def load(path: str | Path) -> Problem:
         subtasks=subtasks,
         format=fmt,
         examples=[_object(e, path, f"examples[{i}]") for i, e in enumerate(_array(raw.get("examples", []), path, "'examples'"))],
-        polygon=_polygon(raw, path),
     )

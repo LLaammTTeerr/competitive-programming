@@ -49,6 +49,7 @@ competitive-programming/
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  box_pool.py
 │   ├── package_status.py  review_checks.py  bootstrap_testlib.py  preferences.py
+│   ├── polygon_ref.py          # polygon.json: which Polygon problem a package owns
 │   ├── bootstrap_testlib.sh   # thin wrapper: cd's to the plugin root, execs the .py
 │   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # both MCP servers (one Python project, two scripts)
