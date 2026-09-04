@@ -31,7 +31,7 @@ competitive-programming/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
 │   ├── running-contests/SKILL.md   (+ references/judges.md)
 │   ├── shaping-problems/SKILL.md
-│   ├── preparing-tests/SKILL.md
+│   ├── preparing-tests/SKILL.md  (+ references/test-generation.md)
 │   ├── validating-solutions/SKILL.md
 │   ├── writing-statements/SKILL.md
 │   ├── reviewing-problems/SKILL.md
