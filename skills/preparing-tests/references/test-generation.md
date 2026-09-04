@@ -76,7 +76,7 @@ therefore contain no genuinely large case at all.
 `rnd.wnext(from, to, type)` with `type > 0` returns the maximum of
 `type + 1` independent draws, so the chance a draw misses the top 10% of
 the range is `0.9^(type+1)`: `type = 4` still misses 59% of the time,
-`type = 20` misses 11%, `type = 40` misses 1.4%. Bias in the tens, not in
+`type = 20` misses 11%, `type = 40` misses 1.3%. Bias in the tens, not in
 the single digits, when the point of the file is to be large.
 
 **Saturation is not the reaching check.** A group where every file sits at
@@ -109,7 +109,7 @@ be a decisive kill rather than a coin flip on the next machine.
 | `O(N√N)` | `N ≥ 10^6` | — |
 | `O(N · Q)` per-query scan | `N·Q ≥ 10^9` | maximise **total asked range length**, not `N` and `Q` alone |
 | `O(N · maxA)` value DP | product `≥ 10^9` | large values, not many small ones |
-| `O(N · d(A))` divisor loop | total divisors `≥ 10^9 / N` | highly composite values (`735134400` has 1344 divisors) |
+| `O(Σ d(A_i))` divisor loop | `Σ d(A_i) ≥ 10^9` | `d(A) ≤ 1344` for `A ≤ 10^9` (`735134400`), so even with every value highly composite this needs `N ≳ 7.5·10^5` — below that, divisor count alone will not kill it |
 | `O(depth)` per tree query | bamboo, `N ≥ 2·10^5` | query pairs far apart; see the tree note below |
 
 ## Shape catalogue

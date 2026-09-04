@@ -596,24 +596,37 @@ class TestTestGenerationReference(unittest.TestCase):
                     f"of these is a correction over the doctrine as it was "
                     f"first written — fix the prose, do not relax this test.")
 
-    def test_the_reference_does_not_soften_the_reaching_check(self):
-        # The reaching check is mandatory and its recipe lives in SKILL.md,
-        # byte-pinned against `reviewing-problems` above. A reference that
-        # grew its own copy would drift out from under that pin; one that
-        # called the check optional would contradict SKILL.md's "Done means".
-        flat = flatten(self.body())
-        self.assertNotIn("--testOverviewLogFileName ", flat,
-                         "the reference grew its own copy of the "
-                         "reaching-check recipe; that recipe is pinned "
-                         "byte-for-byte between two SKILL.md files and must "
-                         "stay in exactly those two places")
-        for softener in ("optional", "if you have time", "nice to have"):
-            with self.subTest(phrase=softener):
-                self.assertTrue(
-                    softener not in flat.lower(),
-                    f"{self.REFERENCE.name} describes something as "
-                    f"{softener!r}; the reaching check and the per-group "
-                    f"validation are requirements, not suggestions")
+    def test_the_reference_reinforces_the_reaching_check(self):
+        # The doctrine this reference was adapted from downgraded the
+        # reaching check to optional. Pinned positively — the sentence that
+        # hands authority back to SKILL.md's loop — rather than as a
+        # blacklist of softening words: a substring guard that also fires on
+        # a future *true* sentence gets deleted rather than obeyed, which is
+        # the lesson RETIRED_CLAIMS above is annotated with.
+        self.assertIn(
+            "treat its output as the answer", flatten(self.body()),
+            f"{self.REFERENCE.name} no longer defers to SKILL.md's "
+            f"reaching-check loop as the authority on which bounds are "
+            f"reached. Saturation is a design target; the union of the "
+            f"per-test logs is the evidence, and the reference must not "
+            f"leave a reader thinking the first substitutes for the second.")
+
+    def test_the_reference_does_not_grow_its_own_copy_of_the_recipe(self):
+        # The recipe is pinned byte-for-byte between two SKILL.md files by
+        # TestReachingCheckRecipeDoesNotDrift. A third copy here would drift
+        # out from under that pin, since nothing would be holding it. Scoped
+        # to ```bash blocks — the same shape `recipe()` uses — so that prose
+        # naming the flag, which the reference legitimately does, is fine.
+        for block in [m.group("body")
+                      for m in _FENCE.finditer(self.body())
+                      if m.group("lang") == "bash"]:
+            self.assertNotIn(
+                "--testOverviewLogFileName", block,
+                f"{self.REFERENCE.name} carries a runnable copy of the "
+                f"reaching-check recipe. That recipe is pinned "
+                f"byte-for-byte between preparing-tests and "
+                f"reviewing-problems; a third copy is held by nothing. "
+                f"Link to ../SKILL.md#reaching-check instead.")
 
 
 if __name__ == "__main__":
