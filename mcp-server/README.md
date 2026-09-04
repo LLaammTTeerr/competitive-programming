@@ -180,7 +180,7 @@ cf_submit_solution(2000, "C", source_file="sol.cpp", language="GNU G++23")
 uv run --extra dev pytest -q
 ```
 
-131 tests, no network required — 56 for `cf-mcp` and 75 for `polygon-mcp`. On
+134 tests, no network required — 56 for `cf-mcp` and 78 for `polygon-mcp`. On
 the Codeforces side: AES against the NIST vectors, statement and status-table
 parsing, language resolution, and the whole submit flow against a fake
 Codeforces. On the Polygon side, see [its own test notes](#tests-1).
@@ -269,9 +269,11 @@ handed to a model, so it is fenced:
   collapsed — and refused unless the result is inside the equally-resolved
   root. A symlink pointing out of the root fails exactly the way
   `../../.ssh/id_rsa` does.
-- Files are read as UTF-8 text. Polygon takes uploads as form fields rather
-  than multipart parts, so a binary statement resource has to go through the
-  web interface.
+- Files are read as UTF-8 text, because this server sends uploads as form
+  fields, so a binary statement resource has to go through the web interface.
+- A file that passes the root check but cannot be read — wrong permissions, a
+  dangling mount — comes back as an `{"ok": false}` error like any other
+  failure, not as a traceback.
 
 The Codeforces server's `cf_submit_solution(source_file=…)` has no such guard.
 This one does, because it is a write API against an account that owns problems.
@@ -353,13 +355,14 @@ polygon_build_package(123456, verify=true)         → then poll polygon_package
 uv run --extra dev pytest -q tests/test_polygon_offline.py
 ```
 
-75 tests, no network: nothing leaves `httpx.MockTransport`, so the signature,
+78 tests, no network: nothing leaves `httpx.MockTransport`, so the signature,
 the verb split, the pacing and the retry are all the real code and only the
 socket is fake. They cover the signature against independently computed SHA-512
 hashes, the `FAILED` and HTTP-error mappings, the path guard (inside, outside,
-traversal, symlink, no root at all), one happy path per tool asserting the wire
-method and its parameters, and a grep of every tool's JSON — over the success
-path *and* four failure paths — for both halves of the credential.
+traversal, symlink, unreadable, no root at all), one happy path per tool
+asserting the wire method and its parameters, and a grep of every tool's JSON —
+over the success path *and* four failure paths — for both halves of the
+credential.
 
 ## Implementation notes
 
@@ -373,11 +376,16 @@ path *and* four failure paths — for both halves of the credential.
   `time` is more than five minutes off its clock, so the second attempt is
   signed from scratch. One retry, on 5xx and transport failures only — never on
   a 4xx, which would fail identically the second time.
-- **Uploads are form fields, not multipart.** A solution's whole source text is
-  one more `param=value` pair, which is why it participates in the signature.
+- **Uploads go as form fields, so they are signed.** A solution's whole source
+  text is one more `param=value` pair. The API documentation describes `file`
+  as an ordinary parameter ("file — file content") and never mentions
+  multipart, so this is what it appears to want; it has not been checked
+  against the live server.
 - **Reads go as GET, writes as POST.** The API documentation fixes no verb; a
   statement's legend does not fit in a query string, so writes are POSTed. This
-  split is the one Polygon's own clients use.
+  split is the one other Polygon clients use, but it is the one thing here that
+  no offline test can settle. If a method turns out to want the other verb, it
+  is one line in `WRITE_METHODS`.
 - **No httpx exception ever reaches a tool result.** httpx spells the request
   URL into the text of everything it raises, and a signed GET's URL carries
   `apiKey`. Every error message here is composed by hand instead.

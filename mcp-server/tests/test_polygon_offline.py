@@ -180,6 +180,27 @@ def test_a_different_secret_changes_the_signature():
     assert one["apiSig"] != two["apiSig"]
 
 
+def test_a_whole_numbered_float_is_sent_as_an_integer():
+    # `test_points: float | None` means an argument of 10 arrives as 10.0 once
+    # the tool call has been coerced to its annotated type.
+    signed = sign(
+        "problem.saveTest",
+        {"testPoints": 10.0, "testIndex": 1},
+        api_key="K", secret="S", rand="000000", now=1,
+    )
+    assert signed["testPoints"] == "10"
+    assert signed["testIndex"] == "1"
+
+
+def test_a_fractional_float_keeps_its_fraction():
+    signed = sign(
+        "problem.saveTest",
+        {"testPoints": 2.5},
+        api_key="K", secret="S", rand="000000", now=1,
+    )
+    assert signed["testPoints"] == "2.5"
+
+
 def test_booleans_are_signed_as_they_are_sent():
     signed = sign(
         "problem.enablePoints",
@@ -451,6 +472,27 @@ async def test_a_tool_refuses_a_path_outside_the_root(polygon, tmp_path: Path):
     assert fake.calls == []  # nothing was sent, and nothing was read
 
 
+async def test_an_unreadable_file_inside_the_root_is_a_failure_not_a_traceback(
+    polygon, tmp_path: Path, monkeypatch
+):
+    # Passing the root check is not permission to read. Running as root makes
+    # chmod 000 unenforceable, so the failure is injected at the read instead.
+    source = tmp_path / "sol.cpp"
+    source.write_text("int main(){}")
+
+    def refuse(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    fake = polygon(ok(None), root=tmp_path)
+    result = await server.polygon_save_solution(
+        problem_id=1, name="sol.cpp", tag="MA", path=str(source)
+    )
+    assert result["ok"] is False
+    assert "Permission denied" in result["error"]
+    assert fake.calls == []
+
+
 async def test_a_tool_refuses_content_and_path_together(polygon, tmp_path: Path):
     source = tmp_path / "sol.cpp"
     source.write_text("x")
@@ -687,7 +729,7 @@ TOOL_CASES: list[tuple[str, dict[str, Any], Any, str, dict[str, str]]] = [
             "test_index": 3,
             "test_input": "1 2\n",
             "test_group": "2",
-            "test_points": 10,
+            "test_points": 10.0,  # what pydantic hands a `float | None` given 10
             "use_in_statements": True,
         },
         None,

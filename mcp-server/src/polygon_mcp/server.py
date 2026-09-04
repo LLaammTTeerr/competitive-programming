@@ -32,9 +32,12 @@ FEEDBACK_POLICIES = ("NONE", "POINTS", "ICPC", "COMPLETE")
 def _fail(error: Exception, method: str) -> dict[str, Any]:
     """The single failure shape every tool returns.
 
-    `str(error)` is safe here only because nothing in this package ever puts an
-    httpx exception in a `PolygonError` — httpx spells the request URL into its
-    messages, and a signed GET's URL carries `apiKey`.
+    Every tool catches `Exception`, not just `PolygonError`: a traceback out of
+    a tool reaches the model as a protocol-level error rather than as something
+    it can read and correct. `str(error)` is safe here only because nothing in
+    this package ever puts an httpx exception into the message — httpx spells
+    the request URL into everything it raises, and a signed GET's URL carries
+    `apiKey`.
     """
     return {
         "ok": False,
@@ -50,8 +53,9 @@ def _read_source(
 
     A path is honoured only inside `POLYGON_MCP_ROOT`; see
     `config.resolve_local_path` for why the guard is there at all. Files are
-    read as UTF-8 text, which is what Polygon takes — every uploadable artifact
-    is source, statement prose or test data.
+    read as UTF-8 text, because this server sends uploads as form fields —
+    which covers every artifact the upload flow needs: source, statement prose,
+    test data.
 
     `required=False` returns None when neither was given, for the methods whose
     edit mode means "change the metadata, leave the body alone".
@@ -64,9 +68,17 @@ def _read_source(
             return resolved.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             raise PolygonError(
-                f"{resolved} is not UTF-8 text. Polygon takes source, "
-                "statements and test data as text; binary resources have to be "
-                "uploaded through the web interface."
+                f"{resolved} is not UTF-8 text. This server sends uploads as "
+                "form fields, so source, statements and test data go as text; "
+                "binary resources have to be uploaded through the web "
+                "interface."
+            ) from None
+        except OSError as error:
+            # Passing the root check is not permission to read: the file can be
+            # mode 000, or a dangling mount. Without this the tool would raise
+            # instead of returning the {"ok": false} shape every other one does.
+            raise PolygonError(
+                f"Could not read {resolved}: {error.strerror or error}"
             ) from None
     if content:
         return content
@@ -109,7 +121,7 @@ async def polygon_whoami() -> dict[str, Any]:
         }
     try:
         problems = await api.call("problems.list") or []
-    except PolygonError as error:
+    except Exception as error:
         return {**status, **_fail(error, "problems.list")}
     return {
         **status,
@@ -146,7 +158,7 @@ async def polygon_problems_list(
             },
         )
         return {"ok": True, "count": len(result or []), "problems": result or []}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problems.list")
 
 
@@ -159,7 +171,7 @@ async def polygon_problem_create(name: str) -> dict[str, Any]:
     """
     try:
         return {"ok": True, "problem": await api.call("problem.create", {"name": name})}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.create")
 
 
@@ -175,7 +187,7 @@ async def polygon_problem_info(problem_id: int) -> dict[str, Any]:
             "ok": True,
             "info": await api.call("problem.info", {"problemId": problem_id}),
         }
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.info")
 
 
@@ -210,7 +222,7 @@ async def polygon_problem_update_info(
             },
         )
         return {"ok": True, "updated": True}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.updateInfo")
 
 
@@ -231,7 +243,7 @@ async def polygon_statements(problem_id: int) -> dict[str, Any]:
             "languages": sorted((result or {}).keys()),
             "statements": result or {},
         }
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.statements")
 
 
@@ -275,7 +287,7 @@ async def polygon_save_statement(
             },
         )
         return {"ok": True, "saved": True, "lang": lang}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveStatement")
 
 
@@ -295,7 +307,7 @@ async def polygon_save_statement_resource(
             {"problemId": problem_id, "name": name, "file": _read_source(content, path)},
         )
         return {"ok": True, "saved": True, "name": name}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveStatementResource")
 
 
@@ -315,7 +327,7 @@ async def polygon_files(problem_id: int) -> dict[str, Any]:
             "ok": True,
             "files": await api.call("problem.files", {"problemId": problem_id}),
         }
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.files")
 
 
@@ -349,7 +361,7 @@ async def polygon_save_file(
             },
         )
         return {"ok": True, "saved": True, "name": name, "type": file_type}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveFile")
 
 
@@ -366,7 +378,7 @@ async def polygon_set_validator(problem_id: int, name: str) -> dict[str, Any]:
             "problem.setValidator", {"problemId": problem_id, "validator": name}
         )
         return {"ok": True, "validator": name}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.setValidator")
 
 
@@ -384,7 +396,7 @@ async def polygon_set_checker(problem_id: int, name: str) -> dict[str, Any]:
     try:
         await api.call("problem.setChecker", {"problemId": problem_id, "checker": name})
         return {"ok": True, "checker": name}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.setChecker")
 
 
@@ -401,7 +413,7 @@ async def polygon_set_interactor(problem_id: int, name: str) -> dict[str, Any]:
             "problem.setInteractor", {"problemId": problem_id, "interactor": name}
         )
         return {"ok": True, "interactor": name}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.setInteractor")
 
 
@@ -418,7 +430,7 @@ async def polygon_solutions(problem_id: int) -> dict[str, Any]:
     try:
         result = await api.call("problem.solutions", {"problemId": problem_id})
         return {"ok": True, "count": len(result or []), "solutions": result or []}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.solutions")
 
 
@@ -454,7 +466,7 @@ async def polygon_save_solution(
             },
         )
         return {"ok": True, "saved": True, "name": name, "tag": tag}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveSolution")
 
 
@@ -476,7 +488,7 @@ async def polygon_script(problem_id: int, testset: str = "tests") -> dict[str, A
                 "problem.script", {"problemId": problem_id, "testset": testset}
             ),
         }
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.script")
 
 
@@ -496,7 +508,7 @@ async def polygon_save_script(
             {"problemId": problem_id, "testset": testset, "source": source},
         )
         return {"ok": True, "saved": True, "testset": testset}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveScript")
 
 
@@ -526,7 +538,7 @@ async def polygon_tests(
             "count": len(result or []),
             "tests": result or [],
         }
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.tests")
 
 
@@ -579,7 +591,7 @@ async def polygon_save_test(
             },
         )
         return {"ok": True, "saved": True, "testset": testset, "test_index": test_index}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveTest")
 
 
@@ -601,7 +613,7 @@ async def polygon_enable_groups(
             {"problemId": problem_id, "testset": testset, "enable": enable},
         )
         return {"ok": True, "testset": testset, "groups_enabled": enable}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.enableGroups")
 
 
@@ -617,7 +629,7 @@ async def polygon_enable_points(problem_id: int, enable: bool) -> dict[str, Any]
             "problem.enablePoints", {"problemId": problem_id, "enable": enable}
         )
         return {"ok": True, "points_enabled": enable}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.enablePoints")
 
 
@@ -641,7 +653,7 @@ async def polygon_test_groups(
             "count": len(result or []),
             "groups": result or [],
         }
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.viewTestGroup")
 
 
@@ -686,7 +698,7 @@ async def polygon_save_test_group(
             },
         )
         return {"ok": True, "saved": True, "testset": testset, "group": group}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveTestGroup")
 
 
@@ -699,7 +711,7 @@ async def polygon_tags(problem_id: int) -> dict[str, Any]:
     try:
         result = await api.call("problem.viewTags", {"problemId": problem_id})
         return {"ok": True, "tags": result or []}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.viewTags")
 
 
@@ -716,7 +728,7 @@ async def polygon_save_tags(problem_id: int, tags: list[str]) -> dict[str, Any]:
             {"problemId": problem_id, "tags": ",".join(tags)},
         )
         return {"ok": True, "saved": True, "tags": tags}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveTags")
 
 
@@ -731,7 +743,7 @@ async def polygon_general_description(problem_id: int) -> dict[str, Any]:
             "problem.viewGeneralDescription", {"problemId": problem_id}
         )
         return {"ok": True, "description": result or ""}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.viewGeneralDescription")
 
 
@@ -749,7 +761,7 @@ async def polygon_save_general_description(
             {"problemId": problem_id, "description": description},
         )
         return {"ok": True, "saved": True}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.saveGeneralDescription")
 
 
@@ -776,7 +788,7 @@ async def polygon_commit(
             },
         )
         return {"ok": True, "committed": True}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.commitChanges")
 
 
@@ -799,7 +811,7 @@ async def polygon_build_package(
             {"problemId": problem_id, "full": full, "verify": verify},
         )
         return {"ok": True, "build_started": True, "full": full, "verify": verify}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.buildPackage")
 
 
@@ -815,7 +827,7 @@ async def polygon_packages(problem_id: int) -> dict[str, Any]:
     try:
         result = await api.call("problem.packages", {"problemId": problem_id})
         return {"ok": True, "count": len(result or []), "packages": result or []}
-    except PolygonError as error:
+    except Exception as error:
         return _fail(error, "problem.packages")
 
 

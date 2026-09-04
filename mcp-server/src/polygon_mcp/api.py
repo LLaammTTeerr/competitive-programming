@@ -79,9 +79,16 @@ def wire_value(value: Any) -> str:
     The signature is computed over these strings, so booleans have to be
     lowercased here and not by whatever the HTTP layer would have done —
     otherwise the hash covers `True` and the request carries `true`.
+
+    A whole-numbered float is rendered as an integer. Tool arguments are
+    coerced to their annotated type before they arrive, so `test_points=10`
+    reaches this as `10.0`, and `testPoints=10.0` is not obviously what Polygon
+    wants when it means ten points.
     """
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value)
 
 

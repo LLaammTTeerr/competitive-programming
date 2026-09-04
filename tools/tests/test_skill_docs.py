@@ -1317,6 +1317,59 @@ class TestPolygonServerEnvTableMatchesConfig(TestServerEnvTableMatchesConfig):
     _NAME = r"POLYGON_[A-Z_]+"
 
 
+class TestPolygonToolTableMatchesTheServer(unittest.TestCase):
+    """The Polygon README's tool table is thirty claims about `server.py`.
+
+    Each tool's docstring names the one API method it wraps, and the README
+    repeats that mapping in a table a reader consults instead of reading the
+    code. Two copies with nothing holding them together drift, and the half
+    that drifts is the one the next editor did not have open — the same
+    argument this module opens with. Read as text rather than imported:
+    `tools/` is stdlib-only and `polygon_mcp` needs `mcp` and `httpx`.
+    """
+
+    SOURCE = (
+        ROOT / "mcp-server" / "src" / "polygon_mcp" / "server.py"
+    ).read_text(encoding="utf-8")
+    README = (ROOT / "mcp-server" / "README.md").read_text(encoding="utf-8")
+
+    # Every tool, paired with the method its own docstring points at.
+    _TOOL = re.compile(r"^async def (polygon_\w+)\(", re.MULTILINE)
+    _METHOD = re.compile(r"→ `([\w.]+)`")
+
+    def _declared(self) -> dict[str, str]:
+        starts = [(m.group(1), m.start()) for m in self._TOOL.finditer(self.SOURCE)]
+        self.assertTrue(starts, "no tools found in polygon_mcp/server.py")
+        pairs = {}
+        for i, (name, start) in enumerate(starts):
+            end = starts[i + 1][1] if i + 1 < len(starts) else len(self.SOURCE)
+            found = self._METHOD.search(self.SOURCE, start, end)
+            self.assertIsNotNone(
+                found, f"{name}'s docstring names no `→ <method>`"
+            )
+            pairs[name] = found.group(1)
+        return pairs
+
+    def test_every_tool_has_a_row_naming_the_method_it_wraps(self):
+        for tool, method in self._declared().items():
+            row = [line for line in self.README.splitlines()
+                   if line.startswith(f"| `{tool}(")]
+            self.assertEqual(len(row), 1,
+                             f"README has {len(row)} table rows for {tool}")
+            self.assertIn(f"`{method}`", row[0],
+                          f"README says {tool} wraps something other than {method}")
+
+    def test_the_table_names_no_tool_the_server_does_not_have(self):
+        rows = set(re.findall(r"^\| `(polygon_\w+)\(", self.README, re.MULTILINE))
+        ghosts = sorted(rows - set(self._declared()))
+        self.assertEqual(ghosts, [], f"README documents tools that do not exist: {ghosts}")
+
+    def test_the_readme_counts_the_tools_it_lists(self):
+        # "thirty tools" in the prose, and a row apiece in the table.
+        self.assertEqual(len(self._declared()), 30)
+        self.assertIn("thirty tools", self.README)
+
+
 class TestMcpJsonRegistersBothServers(unittest.TestCase):
     """`.mcp.json` is what actually launches the servers, and the root README
     tells the reader what to expect from it. Three claims that can drift apart:
