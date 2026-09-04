@@ -5,7 +5,11 @@ constraint and subtask design, testlib generators/validator/checker, a zoo of
 deliberately-wrong solutions used to measure test strength, an end-to-end
 review, and an umbrella that sequences them.
 
-Status: **design approved, not implemented.**
+Status: **shipped** — Stage 1 (PR #3) and Stage 2 (PR #4) implemented it;
+file-based IO followed in PR #5. This is the design as approved on 2026-07-30,
+kept as a historical record and not updated since: where it disagrees with the
+code (the plugin version it names, for one), the code wins — see
+[`../decisions/README.md`](../decisions/README.md).
 
 ---
 

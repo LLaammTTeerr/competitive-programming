@@ -15,10 +15,15 @@ challenge and the `csrf_token` handling that requires.
 
 ## Install
 
+Nothing to install by hand. The plugin's `.mcp.json` launches the server with
+[`uvx`](https://docs.astral.sh/uv/), which builds it from this directory and
+resolves its dependencies on its own:
+
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e .
+uvx --from /path/to/competitive-programming/mcp-server cf-mcp
 ```
+
+That is also the standalone command, for any MCP client outside the plugin.
 
 ## Configure
 
@@ -54,17 +59,29 @@ when it does, `cf_whoami` reports `logged_in: false` and you repeat the steps.
 | `CODEFORCES_API_SECRET` | as above | |
 | `CF_MCP_DEFAULT_LANGUAGE` | optional | default `GNU G++23` |
 | `CF_MCP_STATE_DIR` | optional | cookie cache, default `~/.cache/cf-mcp` |
+| `CF_MCP_TIMEOUT` | optional | HTTP timeout in seconds, default `30` |
+
+The five `CODEFORCES_*` names also answer to a `CF_*` shorthand (`CF_HANDLE`,
+`CF_PASSWORD`, `CF_COOKIE`, `CF_API_KEY`, `CF_API_SECRET`), and the cookie to
+`CODEFORCES_JSESSIONID`; the primary names above are the ones to use in new
+config.
 
 The session is cached (mode `0600`) under the state dir, so the server is not
 re-authenticating on every call.
 
 ### Register with Claude Code
 
+Inside the plugin there is nothing to register: `.mcp.json` at the repository
+root already declares the server, reading both variables from the environment
+of the shell that launches Claude Code. Registering by hand is only for using
+the server outside the plugin — and if you did register one by hand earlier,
+remove it, or the two definitions of `codeforces` collide.
+
 ```bash
 claude mcp add codeforces \
   --env CODEFORCES_HANDLE=your_handle \
   --env CODEFORCES_COOKIE=JSESSIONID=your_cookie_value \
-  -- /home/lam_n/Projects/CF_Solver/.venv/bin/python -m cf_mcp
+  -- uvx --from /path/to/competitive-programming/mcp-server cf-mcp
 ```
 
 Or in `claude_desktop_config.json` / `.mcp.json`:
@@ -73,8 +90,8 @@ Or in `claude_desktop_config.json` / `.mcp.json`:
 {
   "mcpServers": {
     "codeforces": {
-      "command": "/home/lam_n/Projects/CF_Solver/.venv/bin/python",
-      "args": ["-m", "cf_mcp"],
+      "command": "uvx",
+      "args": ["--from", "/path/to/competitive-programming/mcp-server", "cf-mcp"],
       "env": {
         "CODEFORCES_HANDLE": "your_handle",
         "CODEFORCES_COOKIE": "JSESSIONID=your_cookie_value"
@@ -85,6 +102,11 @@ Or in `claude_desktop_config.json` / `.mcp.json`:
 ```
 
 ## Tools
+
+### `cf_whoami()`
+Which account the server is configured for, how it authenticates (cookie or
+password), and whether the login actually works right now — `logged_in` goes
+`false` when the cookie has expired. Call it first when a submit fails.
 
 ### `cf_list_contest_problems(contest_id, gym=False, group_id="")`
 Contest metadata plus every problem's index, name, rating, tags and points.
@@ -148,7 +170,7 @@ cf_submit_solution(2000, "C", source_file="sol.cpp", language="GNU G++23")
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run --extra dev pytest -q
 ```
 
 56 tests, no network required: AES against the NIST vectors, statement and
