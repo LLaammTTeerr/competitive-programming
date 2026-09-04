@@ -53,7 +53,18 @@ PLUGIN_ROOT="$BASE/../.."
 PROBLEM="<absolute path to the problem directory you are preparing>"
 TESTLIB="$(bash "$PLUGIN_ROOT/tools/bootstrap_testlib.sh")"
 cd "$PLUGIN_ROOT"
+PREFS="$(python3 -m tools.preferences)"
 ```
+
+`$PREFS` is the effective `preferences.toml` as JSON — the standing answers
+to the questions this pipeline would otherwise put to a human on every
+problem. Read it before asking anything it already answers, and treat a
+value of `"ask"` as the file declining to decide: that one is genuinely
+open, so ask it. Anything said in this conversation still wins over the
+file, for this problem only.
+
+The keys this skill reads: `tests.files_per_group` and
+`multi_test.oi_default_t_max`.
 
 Every `python3 -m tools.*` command below is a module inside `tools/`, which
 is only importable with `PLUGIN_ROOT` as the working directory — `cd` there

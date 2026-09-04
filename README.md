@@ -29,6 +29,7 @@ competitive-programming/
 │   ├── plugin.json           # plugin manifest ("skills": ["./skills"])
 │   └── marketplace.json      # lets this repo be installed as a marketplace
 ├── .mcp.json                 # registers the bundled codeforces server
+├── preferences.toml          # standing answers the setting skills read first
 ├── skills/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
 │   ├── running-contests/SKILL.md   (+ references/judges.md)
@@ -43,7 +44,7 @@ competitive-programming/
 ├── tools/                    # Python pipeline the setting skills drive
 │   ├── problem_meta.py  flags.py  gen_constraints_header.py  drift_check.py
 │   ├── scan_solutions.py  matrix_core.py  run_matrix.py  box_pool.py
-│   ├── package_status.py  review_checks.py  bootstrap_testlib.py
+│   ├── package_status.py  review_checks.py  bootstrap_testlib.py  preferences.py
 │   ├── bootstrap_testlib.sh   # thin wrapper: cd's to the plugin root, execs the .py
 │   └── tests/                # unittest suite, see Checks below
 └── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
@@ -117,6 +118,25 @@ outcome is the verdict `NO_OUTPUT`: a solution that exits cleanly and never
 creates `io.output`, almost always because it wrote the wrong filename. Like
 `FAIL`, it is discovered by the harness and can never be declared in a
 solution's `@expect`.
+
+**Preferences.** The judgement calls the setting pipeline would otherwise ask
+about on every problem — OI or ICPC, who proposes the subtask ladder, how many
+files a test group gets, how many stress rounds — have standing answers in
+`preferences.toml` at the repository root. The six setting skills read it
+before asking anything it already answers; a value of `"ask"` means the file
+declines to decide and the question is put to you. One file is used **whole**,
+with no layering: `$CP_PREFERENCES` if set (an explicit path, and an error if
+it does not load), else
+`$XDG_CONFIG_HOME/competitive-programming/preferences.toml` (default
+`~/.config/…`), else the shipped file. So a copy you put in your config
+directory has to keep every key. `tools/preferences.py` is the only parser —
+an unknown section or key, a wrong type, or a value outside the closed set is
+an error naming the file, the `section.key` and what was allowed, rather than
+a silent default:
+
+```bash
+python3 -m tools.preferences          # the effective config as JSON, plus "source"
+```
 
 ## Installing
 

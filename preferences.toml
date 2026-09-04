@@ -1,0 +1,70 @@
+# Standing answers for the setting pipeline.
+#
+# The setter skills read this file before asking anything it already
+# answers. Anything you say in the conversation still wins, for that problem
+# only — this file is the default, not a lock.
+#
+# One file is used whole: `$CP_PREFERENCES`, else
+# `$XDG_CONFIG_HOME/competitive-programming/preferences.toml` (default
+# `~/.config/...`), else this one. There is no layering, so a copy you put in
+# your config directory must keep every key below. `tools/preferences.py`
+# refuses anything off-schema rather than quietly defaulting it:
+#
+#     python3 -m tools.preferences
+
+[format]
+# What `creating-problems` assumes at G1 when nobody says: "oi" | "icpc" |
+# "ask". "oi" scores each subtask on its own, "icpc" is all-or-nothing over a
+# single group. "ask" puts the question to you once per problem.
+default = "ask"
+
+[subtasks]
+# Who writes the ladder: "suggest" | "user" | "none" | "ask".
+#   suggest — the skill proposes rungs and a point split, then waits
+#   user    — the skill waits for your ladder before doing anything
+#   none    — one full-score group (legal OI, and rare)
+#   ask     — decide per problem
+policy = "suggest"
+
+[tests]
+# Target number of test files in each group. Groups are sized from this, not
+# from a whole-problem budget, so a ladder with more rungs gets more files.
+files_per_group = 12
+
+[multi_test]
+# Whether the input carries a leading `T` and several cases per file:
+# "ask" | "never" | "always".
+policy = "ask"
+# When multi-test is on and the format is OI, the largest `T` the statement
+# admits unless the problem argues for another number.
+oi_default_t_max = 5
+# Whether to add summed bounds (ΣN, ΣQ, ...) on top of the per-case maxima:
+# "ask" | "never". "never" leaves each case free to reach its own maximum.
+sum_constraints = "ask"
+
+[stress]
+# Main-versus-brute iterations per stress run. Spread the sizes: tiny inputs
+# find the off-by-ones, and the largest input the oracle still finishes finds
+# the rest.
+rounds = 300
+
+[zoo]
+# How many *additional* accepted solutions to write beyond the model one.
+# Per-rung solutions and the brute oracle are required separately and do not
+# count against this.
+max_accepted = 2
+# Whether the zoo includes a solution that is right but prints its answer
+# wrongly, and one that is wrong in a way no contestant would submit. Both
+# are off by default: they cost a compile each and test almost nothing.
+include_presentation_error = false
+include_obviously_wrong = false
+
+[polygon]
+# Defaults for the Polygon upload. The upload only runs when you ask for it.
+# Which language the statement is written in on Polygon.
+statement_language = "vietnamese"
+# Whether committing a revision emails the problem's watchers.
+notify_on_commit = false
+# Whether to share the problem with the `codeforces` login (read access)
+# after a commit, via `problem.setAccess`.
+grant_codeforces_read = true

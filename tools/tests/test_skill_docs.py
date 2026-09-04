@@ -21,10 +21,11 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import tomllib
 import unittest
 from pathlib import Path
 
-from tools import bootstrap_testlib, box_pool, problem_meta, run_matrix
+from tools import bootstrap_testlib, box_pool, preferences, problem_meta, run_matrix
 from tools.matrix_core import _SEVERITY
 from tools.package_status import PHASE_ORDER
 from tools.problem_meta import FORMAT_VALUES
@@ -1159,3 +1160,141 @@ class TestWritingEditorialsSkill(unittest.TestCase):
                     "editorial", description,
                     "the plugin description enumerates every skill but this "
                     "one, so the marketplace listing undersells the plugin")
+
+
+class TestPreferencesDocs(unittest.TestCase):
+    """`preferences.toml` and the skills that read it, held together.
+
+    The fork this file's key inventory came from accumulated dead entries —
+    keys nobody read, still sitting in the shipped file looking authoritative.
+    Nothing there was watching, so the drift ran both ways: a key could be
+    documented and unread, or read under a name the file never had. Both
+    directions are checked here, against the file parsed with `tomllib` rather
+    than against a list retyped in this module.
+    """
+
+    # The skills that carry a Bootstrap block. `writing-statements` is the
+    # sixth setter skill and has no such block at all — it neither `cd`s to
+    # `$PLUGIN_ROOT` nor runs a `tools/` module — so there is nothing there to
+    # add the line to, and inventing a block for it is not this pin's call.
+    BOOTSTRAP_SKILLS = ("creating-problems", "shaping-problems",
+                        "preparing-tests", "reviewing-problems",
+                        "validating-solutions")
+
+    PREFS_LINE = 'PREFS="$(python3 -m tools.preferences)"'
+
+    # `[polygon]` ships complete but is consumed by the Polygon upload work,
+    # which is a later PR: no skill reads these yet. They are exempt from the
+    # no-dead-keys check below, and asserted *absent* from the skills, so
+    # whoever wires the upload has to shrink this set rather than silently
+    # inherit an exemption.
+    RESERVED_FOR_LATER_PR = frozenset({
+        "polygon.statement_language",
+        "polygon.notify_on_commit",
+        "polygon.grant_codeforces_read",
+    })
+
+    def shipped(self) -> dict:
+        path = ROOT / "preferences.toml"
+        self.assertTrue(path.is_file(), f"{path} is missing")
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+
+    def shipped_keys(self) -> set[str]:
+        return {f"{section}.{key}"
+                for section, table in self.shipped().items()
+                for key in table}
+
+    def mentions(self) -> dict[str, set[str]]:
+        """Every backticked `section.key` in every skill, by skill.
+
+        The section names come from the parsed file, so the pattern cannot
+        match `tools.package_status` or `problem_meta.FORMAT_VALUES` — only a
+        dotted name whose left half is an actual section of the file.
+        """
+        sections = "|".join(sorted(self.shipped()))
+        pattern = re.compile(rf"`({sections})\.([a-z_]+)`")
+        return {skill: {f"{m[0]}.{m[1]}"
+                        for m in pattern.findall(skill_text(skill))}
+                for skill in sorted(skill_dirs())}
+
+    def test_the_shipped_file_parses_and_has_keys(self):
+        # Vacuity guard: an unparseable or empty file would make both
+        # directions below trivially pass.
+        self.assertGreaterEqual(len(self.shipped_keys()), 13)
+
+    def test_every_key_a_skill_names_exists_in_the_shipped_file(self):
+        shipped = self.shipped_keys()
+        for skill, named in self.mentions().items():
+            for key in sorted(named):
+                with self.subTest(skill=skill, key=key):
+                    self.assertIn(
+                        key, shipped,
+                        f"{skill} tells a reader to consult `{key}`, which is "
+                        f"not a key in preferences.toml. Keys: "
+                        f"{sorted(shipped)}")
+
+    def test_every_shipped_key_is_read_by_at_least_one_skill(self):
+        named = set().union(*self.mentions().values())
+        dead = sorted(self.shipped_keys() - named - self.RESERVED_FOR_LATER_PR)
+        self.assertEqual(
+            dead, [],
+            f"preferences.toml ships keys no skill reads: {dead}. A default "
+            f"nothing consults is drift wearing a config file's clothes — "
+            f"either name it in the skill that should honour it, or delete it "
+            f"from the file.")
+
+    def test_the_reserved_keys_are_still_reserved(self):
+        shipped = self.shipped_keys()
+        named = set().union(*self.mentions().values())
+        for key in sorted(self.RESERVED_FOR_LATER_PR):
+            with self.subTest(key=key):
+                self.assertIn(key, shipped,
+                              f"{key} left preferences.toml; drop it from "
+                              f"RESERVED_FOR_LATER_PR too")
+                self.assertNotIn(
+                    key, named,
+                    f"a skill now reads `{key}` — the exemption that let it "
+                    f"ship unread has served its purpose. Remove it from "
+                    f"RESERVED_FOR_LATER_PR so the no-dead-keys check covers "
+                    f"it.")
+
+    def test_the_bootstrap_block_reads_preferences_the_same_way_everywhere(self):
+        for skill in self.BOOTSTRAP_SKILLS:
+            with self.subTest(skill=skill):
+                blocks = [b for b in bash_blocks(skill) if "PREFS=" in b]
+                self.assertEqual(
+                    len(blocks), 1,
+                    f"{skill}: expected exactly one ```bash block setting "
+                    f"PREFS, found {len(blocks)}")
+                lines = blocks[0].splitlines()
+                self.assertIn(
+                    self.PREFS_LINE, lines,
+                    f"{skill}'s Bootstrap block sets PREFS differently from "
+                    f"its siblings. The line is duplicated on purpose — skills "
+                    f"load independently — so the fix is to copy one over the "
+                    f"others.")
+                # After the `cd`, not before: `python3 -m tools.preferences`
+                # is a `tools/` module and is only importable with
+                # `$PLUGIN_ROOT` as the working directory, exactly as every
+                # Bootstrap block's own prose says.
+                self.assertLess(
+                    lines.index('cd "$PLUGIN_ROOT"'),
+                    lines.index(self.PREFS_LINE),
+                    f"{skill}: PREFS is read before the `cd` to $PLUGIN_ROOT, "
+                    f"so the command fails with ModuleNotFoundError")
+
+    def test_writing_statements_has_no_bootstrap_block_to_add_it_to(self):
+        # The exemption above, checked rather than assumed: the moment
+        # `writing-statements` grows a Bootstrap block, it joins the five.
+        self.assertNotIn("## Bootstrap", skill_text("writing-statements"),
+                         "writing-statements now has a Bootstrap block — add "
+                         "it to BOOTSTRAP_SKILLS and give it the PREFS line")
+
+    def test_the_readme_documents_the_lookup_order(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for fragment in ("preferences.toml", "tools.preferences",
+                         preferences.PREFS_ENV, preferences.XDG_ENV):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, readme,
+                              f"the README's Preferences paragraph no longer "
+                              f"names {fragment}")
