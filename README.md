@@ -161,6 +161,8 @@ python3 -m tools.preferences          # the effective config as JSON, plus "sour
 
 ## Installing
 
+See `CHANGELOG.md` for what changed since the last version you had.
+
 **Same machine** — clone into `~/.claude/skills/`. Anything there with a
 `.claude-plugin/plugin.json` auto-loads as `<name>@skills-dir`; no install step:
 
