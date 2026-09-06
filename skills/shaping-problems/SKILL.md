@@ -55,11 +55,22 @@ BASE="<the path from this skill's own 'Base directory for this skill' line>"
 PLUGIN_ROOT="$BASE/../.."
 PROBLEM="<absolute path to the problem directory you are shaping>"
 cd "$PLUGIN_ROOT"
+PREFS="$(python3 -m tools.preferences)"
 ```
 
-The only `tools/` command this skill runs is `python3 -m tools.package_status`
-(Done means, below), and every `python3 -m tools.*` module is only importable
-with `PLUGIN_ROOT` as the working directory — `cd` there first, or it fails
+`$PREFS` is the effective `preferences.toml` as JSON — the standing answers
+to the questions this pipeline would otherwise put to a human on every
+problem. Read it before asking anything it already answers, and treat a
+value of `"ask"` as the file declining to decide: that one is genuinely
+open, so ask it. Anything said in this conversation still wins over the
+file, for this problem only.
+
+The keys this skill reads: `format.default` and `subtasks.policy`.
+
+The only `tools/` commands this skill runs are the `tools.preferences` read
+above and `python3 -m tools.package_status` (Done means, below), and every
+`python3 -m tools.*` module is only importable with `PLUGIN_ROOT` as the
+working directory — `cd` there first, or it fails
 with `ModuleNotFoundError: No module named 'tools'` before it does anything.
 **The working directory stays `$PLUGIN_ROOT` for the rest of this skill.**
 `$PROBLEM` is passed as an argument, never `cd`'d into.
