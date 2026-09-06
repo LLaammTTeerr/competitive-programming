@@ -17,15 +17,16 @@ of that series; it fixes how memory-limit verdicts are judged.
 ### Added
 
 - **`writing-editorials` skill** (#15): writes a standalone HTML editorial for
-  a solved problem into `$PROBLEM/editorial/editorial.html`. Opt-in: it runs
-  only when you explicitly ask for an editorial, writeup, or tutorial page; it
-  never runs at the end of `creating-problems`. Try it: invoke
-  `competitive-programming:writing-editorials`.
+  a solved problem into `$PROBLEM/editorial/editorial.html`, or for a whole
+  contest into `$CONTEST/editorial/editorial.html` with one section per
+  problem. Opt-in: it runs only when you explicitly ask for an editorial,
+  writeup, or tutorial page; it never runs at the end of `creating-problems`.
+  Try it: invoke `competitive-programming:writing-editorials`.
 - **`uploading-to-polygon` skill** (#19): publishes a reviewed package to
-  Codeforces Polygon through the bundled `polygon` MCP server: problem
-  create, limits, statement, sources, solutions, script and tests, groups and
-  points, commit, and read access for coordinators. Opt-in: it runs only when
-  asked, never automatically. Try it: invoke
+  Codeforces Polygon through the bundled `polygon` MCP server. It uploads the
+  problem, limits, statement, sources, solutions, script and tests, groups
+  and points, then commits and grants coordinators read access. Opt-in: it
+  runs only when asked, never automatically. Try it: invoke
   `competitive-programming:uploading-to-polygon`.
 - **Bundled `polygon` MCP server** (#18): our own code wrapping the
   Codeforces Polygon API, not a third-party package, so no third-party server
@@ -34,59 +35,66 @@ of that series; it fixes how memory-limit verdicts are judged.
   too if a tool needs to read a local file; without it, any local path is
   refused. See `mcp-server/README.md` and `mcp-server/.env.example` for setup.
 - **`preferences.toml` + `tools/preferences.py`** (#16): a user-editable
-  defaults file for judgement calls the setting skills otherwise ask about
-  every time (problem format, subtask policy, multi-test policy, stress
-  rounds, zoo composition, Polygon defaults). The shipped file lives at the
-  plugin root. Override it with `$CP_PREFERENCES` pointing at your own file.
-  Or drop one at `$XDG_CONFIG_HOME/competitive-programming/preferences.toml`
+  defaults file for the judgement calls the setting skills otherwise ask
+  about every time. It covers problem format, subtask policy, how many
+  files a test group gets, multi-test policy, stress rounds, zoo
+  composition, and Polygon defaults. The shipped file lives at the plugin
+  root. Override it with `$CP_PREFERENCES` pointing at your own file, or
+  drop one at `$XDG_CONFIG_HOME/competitive-programming/preferences.toml`
   (default `~/.config/competitive-programming/preferences.toml`). The first
-  file found wins whole. Try it: run `python3 -m tools.preferences` to print
-  the effective config as JSON.
+  file found wins whole. Try it: from the plugin root, run
+  `python3 -m tools.preferences` to print the effective config as JSON.
 - **`format` field in `problem.json`** (#13): an optional top-level
   `"format": "oi"` or `"format": "icpc"` that records whether a problem scores
   by subtasks or all-or-nothing. If you omit it, it is inferred: `oi` when
   more than one subtask is declared, else `icpc`. Try it: add `"format": "oi"`
   (or `"icpc"`) to a problem's `problem.json`.
-- **Test-generation reference** (#14): a new
-  `skills/preparing-tests/references/test-generation.md` covering kill policy
-  by format, subtask separation, parameter saturation, a brute-kill size
-  table, a shape catalogue, corner cases, and multi-test `T` policy. Read
-  automatically by `preparing-tests`: nothing to invoke separately.
-- **Python `tools/bootstrap_testlib.py`** (#12): a portable, Windows-safe
-  replacement for the shell logic that fetches and caches the `testlib.h`
-  checkout; `tools/bootstrap_testlib.sh` is now a thin wrapper around it. Try
-  it: set `CP_TESTLIB=<dir>` to point at your own `testlib.h` checkout instead
-  of the cached clone.
+- **`preparing-tests` now designs test families from a written doctrine**
+  (#14). The new `skills/preparing-tests/references/test-generation.md`
+  covers kill policy by format, subtask separation, parameter saturation, a
+  brute-kill size table, a shape catalogue, corner cases, and multi-test `T`
+  policy. It is read automatically; nothing to invoke separately.
+- **The testlib bootstrap now works on Windows** (#12): fetching and caching
+  the `testlib.h` checkout is portable stdlib Python
+  (`tools/bootstrap_testlib.py`) instead of shell. Try it: set
+  `CP_TESTLIB=<dir>` to point at your own `testlib.h` checkout instead of the
+  cached clone.
 
 ### Changed
 
 - **Multi-test `T` protocol and kill policy by format** (#17): `shaping-problems`
-  now records a maximum `T` (test cases per file) as a judged constraint, and
-  `creating-problems`' zoo expectations differ by format: every wrong
-  solution must fail somewhere under `icpc`, but under `oi` a solution correct
+  now records a maximum `T` (test cases per file) as a judged constraint.
+  `creating-problems`' zoo expectations also differ by format: every wrong
+  solution must fail somewhere under `icpc`. Under `oi`, a solution correct
   through subtask k is expected to pass up to k and fail on stronger groups.
   No new command; this changes what the setting skills ask and expect.
-- **Three setter-prose fixes** (#11): `preparing-tests` now tells you to keep
-  a validator's accepted group-name spellings identical to Polygon's;
-  `writing-statements` keeps sample explanations from arguing why an
-  alternative is worse (that is editorial content); `validating-solutions`
-  requires each zoo entry to be the strongest wrong solution of its kind. No
-  new command; read the updated `SKILL.md` files for the exact wording.
+- **Three setter-prose fixes** (#11): `preparing-tests` now tells you to make
+  a validator accept both the `g1` and the bare-number spelling of a group,
+  and to keep the package's Polygon group names identical to
+  `problem.json`'s. `writing-statements` keeps sample explanations from
+  arguing why an alternative is worse: that is editorial content leaking
+  into the statement. `validating-solutions` requires each new zoo entry to
+  be the strongest wrong solution of its kind, not a weaker duplicate. Try
+  it: read the validator section in `skills/preparing-tests/SKILL.md` the
+  next time you write a group check, and the zoo rules in
+  `skills/validating-solutions/SKILL.md` before adding a wrong solution.
 
 ### Fixed
 
-- **Memory-limit verdicts judged from peak RSS instead of the cgroup memory
-  counter** (#10): on cgroup v2, a solution that wrote output faster than the
-  disk flusher could drain it was being OOM-killed on dirty page-cache
-  charges, even with a tiny real memory footprint. That produced a false ML
-  verdict. `run_matrix` now judges ML from isolate's `max-rss` (which
-  excludes page cache) or an actual cgroup OOM kill, and sizes the cgroup cap
-  with slack for permitted output size. No user action needed; existing
-  invocations benefit automatically.
+- **Memory-limit verdicts now judged from peak RSS** (#10): the old cgroup
+  memory counter also charges dirty page-cache pages. On cgroup v2, a
+  solution that wrote output faster than the disk flusher could drain it was
+  being OOM-killed even with a tiny real memory footprint. That produced a
+  false ML verdict. `run_matrix` now judges ML from isolate's `max-rss`
+  (which excludes page cache) or an actual cgroup OOM kill, and sizes the
+  cgroup cap with slack for permitted output size. No user action needed;
+  existing invocations benefit automatically.
 - A flaky `test_package_status` exit-code test that depended on all evidence
   files landing in the same mtime tick (#10).
-- Stale `flight` references removed from `shaping-problems`,
-  `preparing-tests`, and `reviewing-problems` (#10).
+- Example problem citations that implied a `flight` package on disk
+  retargeted to `tools/tests/fixtures/mini` or reworded as illustrative, in
+  `shaping-problems`, `preparing-tests`, `reviewing-problems` and
+  `validating-solutions` (#10).
 
 ## [0.6.0]
 
