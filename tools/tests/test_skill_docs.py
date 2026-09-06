@@ -977,6 +977,22 @@ class TestManifestDescriptionsAgree(unittest.TestCase):
                          "differently; they are meant to be one sentence kept "
                          "in two places")
 
+    def test_both_manifests_mention_polygon(self):
+        # The plugin bundles two MCP servers now, not one; the description
+        # must say so or the marketplace listing undersells the Polygon
+        # server the same way it once undersold the editorial skill. Match
+        # the two-servers clause specifically ("one for Polygon"), not a
+        # bare "Polygon" substring — that already appeared in the stale
+        # description via "Polygon-ready package" and would never catch
+        # regressing back to "the bundled Codeforces MCP server".
+        described = manifest_descriptions()
+        for manifest, description in described.items():
+            with self.subTest(manifest=manifest):
+                self.assertIn(
+                    "one for Polygon", description,
+                    f"{manifest}'s description no longer says one of the "
+                    "bundled MCP servers is for Polygon")
+
 
 class TestWritingEditorialsSkill(unittest.TestCase):
     """`writing-editorials` is the one skill nothing in the pipeline calls.
@@ -1145,7 +1161,7 @@ class TestWritingEditorialsSkill(unittest.TestCase):
                       "the README component table has no row for this skill")
         self.assertIn("nine skills", readme,
                       "the README intro still counts the skills without this one")
-        self.assertIn("9 skills, 1 MCP server", readme,
+        self.assertIn("9 skills, 2 MCP servers", readme,
                       "the README's `claude plugin details` expectation still "
                       "says 8 skills")
 
@@ -1298,3 +1314,114 @@ class TestPreferencesDocs(unittest.TestCase):
                 self.assertIn(fragment, readme,
                               f"the README's Preferences paragraph no longer "
                               f"names {fragment}")
+
+
+class TestPolygonServerEnvTableMatchesConfig(TestServerEnvTableMatchesConfig):
+    """The same three-way check for the second server.
+
+    `TestServerEnvTableMatchesConfig` is keyed to the `CODEFORCES_*`/`CF_*`
+    namespace and reads `cf_mcp/config.py`; widening its regex would make every
+    Polygon row a ghost, since `cf_mcp` reads none of them. So the Polygon
+    server gets its own three-way pin over its own config module.
+    """
+
+    CONFIG = (
+        TestServerEnvTableMatchesConfig.SERVER
+        / "src" / "polygon_mcp" / "config.py"
+    ).read_text(encoding="utf-8")
+
+    _NAME = r"POLYGON_[A-Z_]+"
+
+
+class TestPolygonToolTableMatchesTheServer(unittest.TestCase):
+    """The Polygon README's tool table is thirty-five claims about `server.py`.
+
+    Each tool's docstring names the one API method it wraps, and the README
+    repeats that mapping in a table a reader consults instead of reading the
+    code. Two copies with nothing holding them together drift, and the half
+    that drifts is the one the next editor did not have open — the same
+    argument this module opens with. Read as text rather than imported:
+    `tools/` is stdlib-only and `polygon_mcp` needs `mcp` and `httpx`.
+    """
+
+    SOURCE = (
+        ROOT / "mcp-server" / "src" / "polygon_mcp" / "server.py"
+    ).read_text(encoding="utf-8")
+    README = (ROOT / "mcp-server" / "README.md").read_text(encoding="utf-8")
+
+    # Every tool, paired with the method its own docstring points at.
+    _TOOL = re.compile(r"^async def (polygon_\w+)\(", re.MULTILINE)
+    _METHOD = re.compile(r"→ `([\w.]+)`")
+
+    def _declared(self) -> dict[str, str]:
+        starts = [(m.group(1), m.start()) for m in self._TOOL.finditer(self.SOURCE)]
+        self.assertTrue(starts, "no tools found in polygon_mcp/server.py")
+        pairs = {}
+        for i, (name, start) in enumerate(starts):
+            end = starts[i + 1][1] if i + 1 < len(starts) else len(self.SOURCE)
+            found = self._METHOD.search(self.SOURCE, start, end)
+            self.assertIsNotNone(
+                found, f"{name}'s docstring names no `→ <method>`"
+            )
+            pairs[name] = found.group(1)
+        return pairs
+
+    def test_every_tool_has_a_row_naming_the_method_it_wraps(self):
+        for tool, method in self._declared().items():
+            row = [line for line in self.README.splitlines()
+                   if line.startswith(f"| `{tool}(")]
+            self.assertEqual(len(row), 1,
+                             f"README has {len(row)} table rows for {tool}")
+            self.assertIn(f"`{method}`", row[0],
+                          f"README says {tool} wraps something other than {method}")
+
+    def test_the_table_names_no_tool_the_server_does_not_have(self):
+        rows = set(re.findall(r"^\| `(polygon_\w+)\(", self.README, re.MULTILINE))
+        ghosts = sorted(rows - set(self._declared()))
+        self.assertEqual(ghosts, [], f"README documents tools that do not exist: {ghosts}")
+
+    def test_the_readme_counts_the_tools_it_lists(self):
+        # "thirty-five tools" in the prose, and a row apiece in the table.
+        self.assertEqual(len(self._declared()), 35)
+        self.assertIn("thirty-five tools", self.README)
+
+
+class TestMcpJsonRegistersBothServers(unittest.TestCase):
+    """`.mcp.json` is what actually launches the servers, and the root README
+    tells the reader what to expect from it. Three claims that can drift apart:
+    the console script each server is launched with, the credentials passed
+    through to it, and the inventory line naming how many servers there are.
+    """
+
+    MCP_JSON = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+    README = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def test_both_servers_are_registered(self):
+        self.assertEqual(sorted(self.MCP_JSON), ["codeforces", "polygon"])
+
+    def test_each_server_is_launched_with_its_own_console_script(self):
+        scripts = (ROOT / "mcp-server" / "pyproject.toml").read_text(encoding="utf-8")
+        for server, script in (("codeforces", "cf-mcp"), ("polygon", "polygon-mcp")):
+            self.assertEqual(self.MCP_JSON[server]["args"][-1], script)
+            self.assertIn(f"{script} = ", scripts,
+                          f"pyproject.toml declares no {script} console script")
+
+    def test_the_polygon_server_is_handed_the_variables_it_needs(self):
+        # Credentials plus the path guard's root: a `path=` argument is refused
+        # outright when POLYGON_MCP_ROOT never reaches the server's environment.
+        env = self.MCP_JSON["polygon"]["env"]
+        self.assertEqual(
+            sorted(env),
+            ["POLYGON_API_KEY", "POLYGON_API_SECRET", "POLYGON_MCP_ROOT"],
+        )
+        for name, reference in env.items():
+            self.assertEqual(reference, "${%s}" % name,
+                             "a literal value here would put a secret in the repo")
+
+    def test_the_readme_inventory_line_counts_both_servers(self):
+        self.assertIn("2 MCP servers", self.README)
+        self.assertIn("MCP server `polygon`", self.README)
+
+    def test_the_handshake_probe_is_run_against_both_servers(self):
+        for script in ("cf-mcp", "polygon-mcp"):
+            self.assertIn(f"uvx --from ./mcp-server {script}", self.README)

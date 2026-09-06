@@ -1,4 +1,11 @@
-# cf-mcp — a Codeforces MCP server
+# Two MCP servers: `cf-mcp` for Codeforces, `polygon-mcp` for Polygon
+
+One Python project, two console scripts, two independent servers. They share
+nothing but the packaging: separate credentials, separate transports, separate
+tool namespaces (`cf_*` and `polygon_*`). Read [the Polygon
+section](#polygon-mcp--a-polygon-mcp-server) for the second one.
+
+## `cf-mcp` — a Codeforces MCP server
 
 Gives an MCP client (Claude Code, Claude Desktop, …) four things:
 
@@ -173,9 +180,10 @@ cf_submit_solution(2000, "C", source_file="sol.cpp", language="GNU G++23")
 uv run --extra dev pytest -q
 ```
 
-56 tests, no network required: AES against the NIST vectors, statement and
-status-table parsing, language resolution, and the whole submit flow against a
-fake Codeforces.
+148 tests, no network required — 56 for `cf-mcp` and 92 for `polygon-mcp`. On
+the Codeforces side: AES against the NIST vectors, statement and status-table
+parsing, language resolution, and the whole submit flow against a fake
+Codeforces. On the Polygon side, see [its own test notes](#tests-1).
 
 ## Implementation notes
 
@@ -200,3 +208,215 @@ Things that are non-obvious about Codeforces and are handled here:
 - Submitting identical source twice is rejected by Codeforces ("You have
   submitted exactly the same code before"); that error is passed through.
 - Polling backs off from 2s to 10s, to be considerate to the judge.
+
+---
+
+# `polygon-mcp` — a Polygon MCP server
+
+The other half of the loop. Codeforces is where problems are *solved*;
+[Polygon](https://polygon.codeforces.com) is where they are *prepared*, and it
+has a real API — no cookies, no scraping, no anti-bot challenge. This server
+wraps that API in thirty-five tools, so a package can be uploaded from the working
+directory the setting skills built it in: statement, sources, solutions with
+their expected verdicts, tests and groups, then commit and build.
+
+## Why this is written here rather than installed
+
+Third-party Polygon MCP servers exist. Handing one an API key means handing
+unreviewed code write access to every problem the account can open — and a
+Polygon key is not scoped per problem, nor read-only. So the credential-holding
+code lives in this repository, where it can be read.
+
+## Configure
+
+Generate a key pair at **Polygon → Settings → API keys**. Each key has a `key`
+half and a `secret` half; both are needed. The secret is used to sign requests
+and is never transmitted, never logged, never written to disk, and never
+present in anything a tool returns — [there is a test for that](#tests-1).
+
+| Variable | Required for | Notes |
+| --- | --- | --- |
+| `POLYGON_API_KEY` | everything | the `key` half from Polygon → Settings → API keys |
+| `POLYGON_API_SECRET` | everything | the `secret` half; used only to sign, never sent |
+| `POLYGON_MCP_ROOT` | passing `path=` to a tool | the only directory a tool may read a file from; unset means every path is refused |
+| `POLYGON_BASE_URL` | optional | default `https://polygon.codeforces.com/api/` |
+| `POLYGON_TIMEOUT` | optional | HTTP timeout in seconds, default `30` |
+| `POLYGON_MIN_INTERVAL` | optional | floor on the gap between two requests in seconds, default `0.5` |
+
+```bash
+export POLYGON_API_KEY=your_key
+export POLYGON_API_SECRET=your_secret
+export POLYGON_MCP_ROOT=/path/to/the/problem/you/are/uploading
+```
+
+The plugin's `.mcp.json` already declares the server and reads all three from
+the environment of the shell that launches Claude Code, so no secret is stored
+in this repository. Standalone, it is:
+
+```bash
+uvx --from /path/to/competitive-programming/mcp-server polygon-mcp
+```
+
+## The path guard
+
+Every tool that uploads a file takes either `content=` (the text inline) or
+`path=` (a local file to read). The `path=` form is a file-read primitive
+handed to a model, so it is fenced:
+
+- With `POLYGON_MCP_ROOT` **unset**, every `path=` is refused and content has
+  to be passed inline. That is the default.
+- With it set, the path is resolved in full — symlinks followed, `..`
+  collapsed — and refused unless the result is inside the equally-resolved
+  root. A symlink pointing out of the root fails exactly the way
+  `../../.ssh/id_rsa` does.
+- Files are read as UTF-8 text, because this server sends uploads as form
+  fields, so a binary statement resource has to go through the web interface.
+- A file that passes the root check but cannot be read — wrong permissions, a
+  dangling mount — comes back as an `{"ok": false}` error like any other
+  failure, not as a traceback.
+
+The Codeforces server's `cf_submit_solution(source_file=…)` has no such guard.
+This one does, because it is a write API against an account that owns problems.
+
+## Tools
+
+Each tool wraps exactly one Polygon API method and returns a dict carrying
+`ok`. A failure comes back as `{"ok": false, "error": "<Polygon's comment>",
+"method": "<the API method>"}` rather than as an exception, so the model reads
+what went wrong and corrects itself.
+
+| Tool | Polygon method |
+| --- | --- |
+| `polygon_whoami()` | `problems.list`, as a credential check |
+| `polygon_problems_list(show_deleted, problem_id, name, owner)` | `problems.list` |
+| `polygon_problem_create(name)` | `problem.create` |
+| `polygon_problem_info(problem_id)` | `problem.info` |
+| `polygon_problem_update_info(problem_id, input_file, output_file, interactive, well_formed, time_limit_ms, memory_limit_mb)` | `problem.updateInfo` |
+| `polygon_accesses(problem_id)` | `problem.accesses` |
+| `polygon_set_access(problem_id, login, access)` | `problem.setAccess` |
+| `polygon_statements(problem_id)` | `problem.statements` |
+| `polygon_save_statement(problem_id, lang, encoding, name, legend, input, output, scoring, interaction, notes, tutorial)` | `problem.saveStatement` |
+| `polygon_save_statement_resource(problem_id, name, content\|path)` | `problem.saveStatementResource` |
+| `polygon_files(problem_id)` | `problem.files` |
+| `polygon_save_file(problem_id, file_type, name, content\|path, source_type)` | `problem.saveFile` |
+| `polygon_set_validator(problem_id, name)` | `problem.setValidator` |
+| `polygon_set_checker(problem_id, name)` | `problem.setChecker` |
+| `polygon_set_interactor(problem_id, name)` | `problem.setInteractor` |
+| `polygon_solutions(problem_id)` | `problem.solutions` |
+| `polygon_save_solution(problem_id, name, tag, content\|path, source_type)` | `problem.saveSolution` |
+| `polygon_script(problem_id, testset)` | `problem.script` |
+| `polygon_save_script(problem_id, testset, source)` | `problem.saveScript` |
+| `polygon_tests(problem_id, testset, no_inputs)` | `problem.tests` |
+| `polygon_save_test(problem_id, testset, test_index, test_input\|path, test_group, test_points, test_description, use_in_statements, input_for_statements, output_for_statements, verify_for_statements)` | `problem.saveTest` |
+| `polygon_delete_test(problem_id, testset, test_index)` | `problem.deleteTest` |
+| `polygon_enable_groups(problem_id, testset, enable)` | `problem.enableGroups` |
+| `polygon_enable_points(problem_id, enable)` | `problem.enablePoints` |
+| `polygon_test_groups(problem_id, testset, group)` | `problem.viewTestGroup` |
+| `polygon_save_test_group(problem_id, testset, group, points_policy, feedback_policy, dependencies)` | `problem.saveTestGroup` |
+| `polygon_tags(problem_id)` | `problem.viewTags` |
+| `polygon_save_tags(problem_id, tags)` | `problem.saveTags` |
+| `polygon_general_description(problem_id)` | `problem.viewGeneralDescription` |
+| `polygon_save_general_description(problem_id, description)` | `problem.saveGeneralDescription` |
+| `polygon_update_working_copy(problem_id)` | `problem.updateWorkingCopy` |
+| `polygon_discard_working_copy(problem_id)` | `problem.discardWorkingCopy` |
+| `polygon_commit(problem_id, minor_changes, message)` | `problem.commitChanges` |
+| `polygon_build_package(problem_id, full, verify)` | `problem.buildPackage` |
+| `polygon_packages(problem_id)` | `problem.packages` |
+
+`file_type` is the API's `type`, renamed only to keep the parameter from
+shadowing a Python builtin; the value goes over the wire unchanged.
+`polygon_set_checker` passes its name through untouched, so Polygon's standard
+checkers work under their own names — `std::wcmp.cpp` for token sequences,
+`std::ncmp.cpp` for int64 sequences, `std::rcmp6.cpp` for doubles to 1e-6,
+`std::lcmp.cpp` and `std::fcmp.cpp` for line-oriented output.
+
+`polygon_set_access` takes `READ`, `WRITE` or `NONE` — Polygon does not let the
+API assign `OWNER`, and `NONE` removes only the *direct* entry, leaving
+whatever the user gets through a group. Access changes take effect at once and
+need no commit.
+
+Read `polygon_commit`'s `committed`, not its `ok`. A commit with nothing to
+commit is a *successful* call reporting `committed: false` and the message
+`No changes`, and a working copy that fell behind the repository comes back
+with `conflict_occurred: true` — run `polygon_update_working_copy` and commit
+again.
+
+`polygon_delete_test` deletes one test per call. Polygon checks before it
+deletes, so a refusal changes nothing and the failure carries
+`details.failures`, each naming a test `index` and a `reason` of `DUPLICATE`,
+`NOT_FOUND`, `FREEMARKER_SCRIPT_TEST` or `DELETE_FAILED`.
+
+## Typical upload loop
+
+```
+polygon_whoami()                                   → the key works
+polygon_problem_create("candy-shop")               → id 123456
+polygon_problem_update_info(123456, time_limit_ms=2000, memory_limit_mb=256)
+polygon_save_file(123456, "source", "validator.cpp", path="validator.cpp")
+polygon_set_validator(123456, "validator.cpp")
+polygon_set_checker(123456, "std::wcmp.cpp")
+polygon_save_solution(123456, "sol.cpp", "MA", path="solutions/sol.cpp")
+polygon_save_solution(123456, "brute.cpp", "TL", path="solutions/brute.cpp")
+polygon_save_script(123456, "tests", "gen_random 1000 1 > $\n…")
+polygon_enable_groups(123456, "tests", true)
+polygon_enable_points(123456, true)
+polygon_save_test_group(123456, "tests", "2", "COMPLETE_GROUP", "ICPC", ["1"])
+polygon_save_statement(123456, "english", name="Candy Shop", legend="…")
+polygon_commit(123456, message="initial package")
+polygon_build_package(123456, verify=true)         → then poll polygon_packages
+polygon_set_access(123456, "codeforces", "READ")   → hand it over
+```
+
+`polygon_build_package` returns as soon as the build is *queued*. Poll
+`polygon_packages` and watch `state` go `PENDING` → `RUNNING` → `READY`, or
+`FAILED` with a `comment` saying why.
+
+## Tests
+
+```bash
+uv run --extra dev pytest -q tests/test_polygon_offline.py
+```
+
+92 tests, no network: nothing leaves `httpx.MockTransport`, so the signature,
+the verb split, the pacing and the retry are all the real code and only the
+socket is fake. They cover the signature against independently computed SHA-512
+hashes, the `FAILED` and HTTP-error mappings, the path guard (inside, outside,
+traversal, symlink, unreadable, no root at all), one happy path per tool
+asserting the wire method and its parameters, every write proving it went out
+as a POST, the three `CommitResult` shapes (committed, "No changes",
+conflict), a `400`-with-a-`FAILED`-envelope reaching the caller as Polygon's
+comment rather than as "HTTP 400", the structured deletion failures surviving
+into `details`, and a grep of every tool's JSON — over the success path *and*
+four failure paths — for both halves of the credential.
+
+## Implementation notes
+
+- **The signature is over raw values.** `apiSig` is six arbitrary characters
+  followed by the SHA-512 of `<rand>/<method>?k=v&…#<secret>` over every
+  parameter including `apiKey` and `time`, sorted by name then value. Polygon
+  percent-decodes before it verifies, so signing the *encoded* form would fail
+  for any value containing `&`, `=` or a newline — which is to say for every
+  statement and every source file.
+- **A retry is re-signed, not replayed.** Polygon refuses a request whose
+  `time` is more than five minutes off its clock, so the second attempt is
+  signed from scratch. One retry, on 5xx and transport failures only — never on
+  a 4xx, which would fail identically the second time.
+- **Uploads go as form fields, so they are signed.** A solution's whole source
+  text is one more `param=value` pair. The API documentation describes `file`
+  as an ordinary parameter ("file — file content") and never mentions
+  multipart, so this is what it appears to want; it has not been checked
+  against the live server.
+- **Reads go as GET, writes as POST.** The API documentation fixes no verb; a
+  statement's legend does not fit in a query string, so writes are POSTed. This
+  split is the one other Polygon clients use, but it is the one thing here that
+  no offline test can settle. If a method turns out to want the other verb, it
+  is one line in `WRITE_METHODS`.
+- **No httpx exception ever reaches a tool result.** httpx spells the request
+  URL into the text of everything it raises, and a signed GET's URL carries
+  `apiKey`. Every error message here is composed by hand instead.
+- **Absent means "leave alone".** `problem.updateInfo`, and the edit mode of
+  `problem.saveTest` and `problem.saveSolution`, treat an omitted parameter as
+  "keep the old value", so `None` parameters are dropped rather than sent
+  empty — otherwise setting a time limit would silently clear `interactive`.
+- **Pin-protected problems are not supported.** Polygon takes an extra `pin`
+  parameter for those; no tool here sends one.

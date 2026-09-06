@@ -7,5 +7,15 @@
       "CODEFORCES_HANDLE": "${CODEFORCES_HANDLE}",
       "CODEFORCES_COOKIE": "${CODEFORCES_COOKIE}"
     }
+  },
+  "polygon": {
+    "type": "stdio",
+    "command": "uvx",
+    "args": ["--from", "${CLAUDE_PLUGIN_ROOT}/mcp-server", "polygon-mcp"],
+    "env": {
+      "POLYGON_API_KEY": "${POLYGON_API_KEY}",
+      "POLYGON_API_SECRET": "${POLYGON_API_SECRET}",
+      "POLYGON_MCP_ROOT": "${POLYGON_MCP_ROOT}"
+    }
   }
 }

@@ -4,9 +4,9 @@ Claude Code plugin for competitive programming: nine skills — two for solving
 (one problem, one whole contest), six for setting one (shaping the constraints,
 test data, solution validation, statement, package review, and end-to-end
 orchestration), and one optional writeup skill that explains a finished problem
-to the contestants who could not solve it — plus the bundled Codeforces MCP
-server. This repository is also a **marketplace**, so it can be used in place
-or installed on another machine.
+to the contestants who could not solve it — plus two bundled MCP servers, one
+for Codeforces and one for Polygon. This repository is also a **marketplace**,
+so it can be used in place or installed on another machine.
 
 | Component | Invoked as | What it does |
 |---|---|---|
@@ -20,6 +20,7 @@ or installed on another machine.
 | Skill `creating-problems` | `competitive-programming:creating-problems` | The umbrella over the other five setting skills: drives a problem from an idea, finished or half-formed, to a Polygon-ready package end to end, gated phase by phase with machine-readable evidence from `tools/package_status.py` |
 | Skill `writing-editorials` | `competitive-programming:writing-editorials` | Writes a standalone HTML editorial for a solved problem — lore-stripped restatement, the derivation that reaches the intended solution, time complexity — into `$PROBLEM/editorial/editorial.html`. Opt-in and detached from the pipeline: it runs only when a conversation explicitly asks for one |
 | MCP server `codeforces` | tools `cf_*` | Browse contest problems, read statements, submit solutions, poll verdicts |
+| MCP server `polygon` | tools `polygon_*` | Upload a finished package to Polygon: statement and resources, sources, solutions with their expected verdicts, script and manual tests, groups and points, commit and build, then grant a coordinator access to it |
 
 ## Layout
 
@@ -28,7 +29,7 @@ competitive-programming/
 ├── .claude-plugin/
 │   ├── plugin.json           # plugin manifest ("skills": ["./skills"])
 │   └── marketplace.json      # lets this repo be installed as a marketplace
-├── .mcp.json                 # registers the bundled codeforces server
+├── .mcp.json                 # registers the bundled codeforces and polygon servers
 ├── preferences.toml          # standing answers the setting skills read first
 ├── skills/
 │   ├── solving-problems/SKILL.md  (+ references/black-magic.md)
@@ -47,36 +48,51 @@ competitive-programming/
 │   ├── package_status.py  review_checks.py  bootstrap_testlib.py  preferences.py
 │   ├── bootstrap_testlib.sh   # thin wrapper: cd's to the plugin root, execs the .py
 │   └── tests/                # unittest suite, see Checks below
-└── mcp-server/               # the Codeforces MCP server (Python, package cf-mcp)
+└── mcp-server/               # both MCP servers (one Python project, two scripts)
     ├── pyproject.toml  uv.lock
-    ├── src/cf_mcp/
+    ├── src/cf_mcp/           # the Codeforces server, launched as cf-mcp
+    ├── src/polygon_mcp/      # the Polygon server, launched as polygon-mcp
     └── tests/
 ```
 
 ## Setup
 
-**Prerequisite:** [`uv`](https://docs.astral.sh/uv/) — the server is launched with
-`uvx`, which builds it from `mcp-server/` and resolves dependencies on its own, so
-there is no virtualenv to manage:
+**Prerequisite:** [`uv`](https://docs.astral.sh/uv/) — both servers are launched
+with `uvx`, which builds them from `mcp-server/` and resolves dependencies on its
+own, so there is no virtualenv to manage:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**Credentials.** Codeforces guards its login with a Cloudflare challenge, so the
-server authenticates with a session cookie rather than a password. Sign in at
-codeforces.com, then DevTools → Application → Cookies → copy `JSESSIONID`. Export
-both variables in the shell that launches Claude Code (`.mcp.json` reads them via
-`${…}`, so **no secret is ever stored in this repo**):
+**Codeforces credentials.** Codeforces guards its login with a Cloudflare
+challenge, so the server authenticates with a session cookie rather than a
+password. Sign in at codeforces.com, then DevTools → Application → Cookies →
+copy `JSESSIONID`. Export both variables in the shell that launches Claude Code
+(`.mcp.json` reads them via `${…}`, so **no secret is ever stored in this
+repo**):
 
 ```bash
 export CODEFORCES_HANDLE=your_handle
 export CODEFORCES_COOKIE=JSESSIONID=your_cookie_value
 ```
 
-Every other variable the server reads — API key, default language, state dir —
-is documented in [`mcp-server/README.md`](mcp-server/README.md), which owns
-that table; `mcp-server/.env.example` mirrors it as a fill-in template.
+**Polygon credentials.** Polygon has a real API, so no cookie is involved:
+generate a key pair at Polygon → Settings → API keys and export both halves.
+`POLYGON_MCP_ROOT` is the one directory the Polygon server may read a file from
+when a tool is called with `path=` instead of inline content; leave it unset and
+every path is refused, which is the safe default:
+
+```bash
+export POLYGON_API_KEY=your_key
+export POLYGON_API_SECRET=your_secret
+export POLYGON_MCP_ROOT=/path/to/the/problem/you/are/uploading
+```
+
+Every other variable either server reads — Codeforces API key, default language,
+state dir; Polygon base URL, timeout, pacing — is documented in
+[`mcp-server/README.md`](mcp-server/README.md), which owns those tables;
+`mcp-server/.env.example` mirrors them as a fill-in template.
 
 **Prerequisite:** [`ioi/isolate`](https://github.com/ioi/isolate) —
 `tools/run_matrix.py` runs every *solution* sandboxed under isolate, never a bare
@@ -183,14 +199,16 @@ directory is not importable`.
 ```bash
 cd <this repo>
 claude plugin validate . --strict                 # manifests
-claude plugin details competitive-programming     # inventory: 9 skills, 1 MCP server
+claude plugin details competitive-programming     # inventory: 9 skills, 2 MCP servers
 
 python3 -m unittest discover -s tools/tests -t . -v    # tools suite (repo root)
 (cd mcp-server && uv run --extra dev pytest -q)        # server suite (subshell)
 
-# end-to-end: the server should answer an MCP handshake
+# end-to-end: each server should answer an MCP handshake
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
   | uvx --from ./mcp-server cf-mcp
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  | uvx --from ./mcp-server polygon-mcp
 ```
 
 **The tools suite is parallel-safe.** `run_matrix.py` leases every isolate
@@ -272,9 +290,9 @@ working unchanged.
 
 After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new session).
 
-> **Note on the `mcp` pin.** `pyproject.toml` requires `mcp>=1.2,<2`. The server uses
-> `mcp.server.fastmcp`, which 2.0 removed — an unpinned `>=1.2.0` resolves to 2.0 and
-> fails at import. Keep the upper bound until the server is ported.
+> **Note on the `mcp` pin.** `pyproject.toml` requires `mcp>=1.2,<2`. Both servers
+> use `mcp.server.fastmcp`, which 2.0 removed — an unpinned `>=1.2.0` resolves to
+> 2.0 and fails at import. Keep the upper bound until they are ported.
 
 > **Note on `flags.json.lock`.** `tools/flags.py` takes an advisory `flock` on a
 > separate lock file beside every problem package's `flags.json`, so concurrent
