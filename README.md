@@ -331,4 +331,4 @@ LamTer <lamtercqh@gmail.com>
 
 ## License
 
-MIT; see `LICENSE`.
+MIT; see `LICENSE`. `NOTICE` credits the space-dark editorial theme.

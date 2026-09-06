@@ -8,6 +8,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `LICENSE` (MIT). The plugin and marketplace manifests and the MCP server's `pyproject.toml` now declare it too.
+- `NOTICE`, crediting the space-dark editorial theme to nudetiger.
 
 ## [0.7.0] - 2026-09-06
 

@@ -1,0 +1,12 @@
+This project is licensed under the MIT License (see LICENSE).
+
+Third-party material
+--------------------
+
+skills/writing-editorials/references/themes/space-dark.html
+
+  The "space-dark" editorial theme is derived from the theme of the same name
+  by nudetiger, published in
+  https://github.com/nudetiger/competitive-programming-problem-preparer
+  (commit 2b310b2, 2026-09-03), and is included here with the author's
+  knowledge. Local edits are limited to small styling adjustments.
