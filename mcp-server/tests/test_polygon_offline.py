@@ -587,6 +587,32 @@ async def test_tags_and_dependencies_are_comma_joined(polygon):
     assert fake.last.params["pointsPolicy"] == "COMPLETE_GROUP"
 
 
+async def test_set_test_group_sends_one_comma_separated_index_list(polygon):
+    # The API's alternative to repeating `testIndex`, which a signed request
+    # built from a parameter mapping cannot express — the same form
+    # `polygon_delete_test` already uses.
+    fake = polygon(ok(None))
+    await server.polygon_set_test_group(
+        problem_id=1, testset="tests", test_group="g1", test_indices=[7]
+    )
+    assert fake.last.params["testIndices"] == "7"
+    assert fake.last.params["testGroup"] == "g1"
+    # It names a group and indices and nothing else: there is no way for it
+    # to disturb a script-generated test's input, which is the whole reason
+    # the upload skill assigns groups with this rather than with `saveTest`.
+    assert "testInput" not in fake.last.params
+
+
+async def test_set_test_group_refuses_an_empty_index_list_before_the_request(polygon):
+    fake = polygon(ok(None))
+    result = await server.polygon_set_test_group(
+        problem_id=1, testset="tests", test_group="g1", test_indices=[]
+    )
+    assert result["ok"] is False
+    assert "at least one test" in result["error"]
+    assert fake.calls == []
+
+
 async def test_a_standard_checker_name_is_passed_through_untouched(polygon):
     fake = polygon(ok(None))
     await server.polygon_set_checker(problem_id=1, name="std::rcmp6.cpp")
@@ -896,6 +922,18 @@ TOOL_CASES: list[tuple[str, dict[str, Any], Any, str, dict[str, str]]] = [
         None,
         "problem.enablePoints",
         {"enable": "true"},
+    ),
+    (
+        "polygon_set_test_group",
+        {
+            "problem_id": 7,
+            "testset": "tests",
+            "test_group": "g2",
+            "test_indices": [3, 4, 5],
+        },
+        None,
+        "problem.setTestGroup",
+        {"testset": "tests", "testGroup": "g2", "testIndices": "3,4,5"},
     ),
     (
         "polygon_test_groups",
