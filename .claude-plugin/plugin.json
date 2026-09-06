@@ -7,6 +7,7 @@
     "name": "LamTer",
     "email": "lamtercqh@gmail.com"
   },
+  "license": "MIT",
   "skills": [
     "./skills"
   ]

@@ -328,3 +328,7 @@ After editing a skill or `.mcp.json`, run `/reload-plugins` (or start a new sess
 ## Author
 
 LamTer <lamtercqh@gmail.com>
+
+## License
+
+MIT; see `LICENSE`.

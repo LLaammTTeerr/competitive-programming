@@ -14,7 +14,8 @@
       "author": {
         "name": "LamTer",
         "email": "lamtercqh@gmail.com"
-      }
+      },
+      "license": "MIT"
     }
   ]
 }
